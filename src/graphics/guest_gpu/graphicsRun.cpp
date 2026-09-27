@@ -132,6 +132,7 @@ void GuestGpu::Shutdown() {
 		m_accepting = false;
 		m_stopping  = true;
 		m_work_available.SignalAll();
+		m_suspend_point_done.SignalAll();
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
@@ -232,6 +233,41 @@ void GuestGpu::Done() {
 	if (!IsGpuThread()) {
 		WaitForIdle();
 	}
+	m_graphics_done = true;
+	m_done_num++;
+}
+
+// sceAgcSuspendPoint inserts a drain of the graphics pipe into the graphics queue and blocks the
+// caller only while the previous suspend point has not executed; async compute keeps running
+// (agc/baselayer.h, suspendPoint()). Done() waits for every queue to go idle while holding the
+// submission mutex: the submit thread cannot overlap the GPU, and a compute queue parked on a CPU
+// write never lets it return. KYTY_SUSPEND_POINT_WAITS_IDLE=1 restores Done().
+void GuestGpu::SuspendPoint() {
+	static const bool waits_idle = std::getenv("KYTY_SUSPEND_POINT_WAITS_IDLE") != nullptr;
+	if (waits_idle || IsGpuThread()) {
+		Done();
+		return;
+	}
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		while (m_suspend_points_done < m_suspend_points_issued && !m_stopping) {
+			m_suspend_point_done.Wait(&m_queue_mutex);
+		}
+		if (m_stopping) {
+			return;
+		}
+	}
+	GpuMutexLock lock(m_submission_mutex);
+	Submission   submission;
+	submission.type            = SubmissionType::SuspendPoint;
+	submission.queue_id        = 0;
+	submission.reset_processor = m_graphics_done;
+	{
+		Common::LockGuard queue_lock(m_queue_mutex);
+		m_suspend_points_issued++;
+	}
+	Enqueue(std::move(submission));
+	// The graphics state is reset after the drain: the next graphics submission resets it.
 	m_graphics_done = true;
 	m_done_num++;
 }
@@ -530,6 +566,7 @@ void GuestGpu::ThreadRun(void* data) {
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
+				gpu->m_suspend_point_done.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
@@ -688,6 +725,14 @@ bool GuestGpu::Process(Submission& submission) {
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
+		case SubmissionType::SuspendPoint: {
+			// Everything recorded before the marker goes to the GPU; the marker has executed.
+			cp.BufferFlush();
+			Common::LockGuard lock(m_queue_mutex);
+			m_suspend_points_done++;
+			m_suspend_point_done.SignalAll();
+			break;
+		}
 	}
 
 	return complete;

@@ -37,6 +37,8 @@ public:
 	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void              SubmitFlipPreparation(uint64_t request_id);
 	void              Done();
+	// sceAgcSuspendPoint: a graphics-queue marker; blocks only while the previous one is pending.
+	void              SuspendPoint();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -48,7 +50,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -80,6 +82,9 @@ private:
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
+	Common::CondVar                                m_suspend_point_done;
+	uint64_t                                       m_suspend_points_issued = 0;
+	uint64_t                                       m_suspend_points_done   = 0;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
