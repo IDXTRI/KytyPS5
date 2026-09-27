@@ -299,8 +299,10 @@ public:
 			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
 				plan.handle->SetArg(dword, plan.key);
 			}
-			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
+			for (uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+				if (!plan.kept[dword]) {
+					m_program.memory_info[plan.memory[dword]].planning_only = true;
+				}
 			}
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -335,6 +337,8 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		// Reads other code also consumes: they stay real loads instead of planning-only.
+		std::array<bool, 8>        kept {};
 	};
 
 	// A non-fatal compile gives the shader up instead: the failure unwinds to TrackResources,
@@ -1517,15 +1521,14 @@ private:
 			}
 			table_handle = current_handle;
 			// Samples of the same texture share the (deduplicated) descriptor reads; each image
-			// handle gets its own plan over them. Any other user needs the descriptor's value.
+			// handle gets its own plan over them. A read with any other user (a pixel shader that
+			// turns the depth field, dword 4, into an array layer) stays a real load of the table.
 			const bool image_users_only =
 			    !read->Uses().empty() && std::ranges::all_of(read->Uses(), [](const Use& use) {
 				    return use.user->GetOpcode() == ValueOpcode::GetImageResource ||
 				           FeedsOnlyDeadPhis(*use.user);
 			    });
-			if (!image_users_only) {
-				return RejectIndirect(handle, __LINE__);
-			}
+			plan.kept[dword] = !image_users_only;
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
 		}
@@ -1663,7 +1666,12 @@ private:
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
+			for (uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+				if (plan.memory[dword] == index && !plan.kept[dword]) {
+					return true;
+				}
+			}
+			return false;
 		});
 	}
 

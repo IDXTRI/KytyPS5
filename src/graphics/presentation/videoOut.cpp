@@ -1814,6 +1814,47 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
+	// Called every frame with only the handle set; the guest treats a nonzero result as an error.
+	// Log the first call only.
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("VideoOutAllowOutputResolutionWqhdDetection(): handle = %d\n", handle);
+	}
+
+	// VideoOutGetOutputStatus never reports a WQHD resolution, so there is nothing to enable.
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+
+	// The guest's call sites pass (handle, 0, 0) and ignore the result. The meaning of the other
+	// two arguments is unknown, so they are only logged.
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("\t handle = %d\n"
+		     "\t arg1   = 0x%016" PRIx64 "\n"
+		     "\t arg2   = 0x%016" PRIx64 "\n",
+		     handle, arg1, arg2);
+	}
+
+	// Kyty always presents at a fixed refresh rate.
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
+	PRINT_NAME();
+
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("\t handle = %d\n", handle);
+	}
+
+	// Kyty does not negotiate VRR, so the output stays at a fixed refresh rate.
+	return OK;
+}
+
 static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options,
                                 void* reserved_ptr, uint64_t reserved) {
 	if (!DriverState().IsOpened(handle)) {

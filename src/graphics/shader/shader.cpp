@@ -144,6 +144,10 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	return hash;
 }
 
+uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
+	return GetDeclaredShaderHash(shader_addr);
+}
+
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
@@ -807,6 +811,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
 	const auto& group = user_config.GetGeControl();
+
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
@@ -819,14 +824,20 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives       = group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	// NGG can export indexed primitives independently of the output vertex count.
+	// In particular, meshlet shaders can emit more triangles than vertices - 2.
+	const auto primitive_amplification = sh.m_geNggSubgrpCntl & 0x1ffu;
+	mesh.max_primitives = group.primitive_group_size *
+	                      std::max(sh.m_vgtGsMaxVertOut - 2u, primitive_amplification);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
+	const auto explicit_threads = (sh.m_geNggSubgrpCntl >> 9u) & 0x1ffu;
+	const auto output_threads = std::max({mesh.max_vertices, mesh.max_primitives, explicit_threads});
 	mesh.threads_num[0] =
-	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+	    ((output_threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
 }

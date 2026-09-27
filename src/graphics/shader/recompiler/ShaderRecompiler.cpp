@@ -24,6 +24,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <mutex>
@@ -37,6 +39,23 @@ namespace {
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
+
+const char* StageName(ShaderType stage);
+
+// KYTY_DUMP_GAVE_UP=<folder>: write the guest code of every shader that gives up to
+// <folder>/<stage>_<hash>.bin, so it can be disassembled offline (llvm-mc -triple=amdgcn).
+void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> code) {
+	const char* folder = std::getenv("KYTY_DUMP_GAVE_UP");
+	if (folder == nullptr || code.empty()) {
+		return;
+	}
+	const auto path = fmt::format("{}/{}_{:016x}.bin", folder, StageName(options.stage),
+	                              options.shader_hash);
+	if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
@@ -542,6 +561,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 		return {.skip_dispatch = true};
 	}
+	// KYTY_DUMP_SHADER_HASHES="hash,hash,...": dump these shaders' code too (into
+	// KYTY_DUMP_GAVE_UP), for shaders that compile but are skipped later.
+	if (const char* list = std::getenv("KYTY_DUMP_SHADER_HASHES");
+	    list != nullptr &&
+	    std::string_view(list).find(fmt::format("{:016x}", options.shader_hash)) !=
+	        std::string_view::npos) {
+		DumpGaveUpCode(options, code);
+	}
 
 	std::string decoded_dump;
 	if (options.dump_ir) {
@@ -555,6 +582,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
 	if (options.non_fatal && native_cfg.unsupported && !native_cfg.irreducible) {
+		DumpGaveUpCode(options, code);
 		LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", GetDumpLabel(options), options.shader_hash,
 		     native_cfg.unsupported_reason.c_str());
 		TranslateResult unsupported_result;
@@ -618,6 +646,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	if (options.non_fatal && Frontend::TranslationUnsupported()) {
+		DumpGaveUpCode(options, code);
 		LOGF("%s gave up hash=0x%016" PRIx64 ": no IR translation for an instruction\n",
 		     GetDumpLabel(options), options.shader_hash);
 		TranslateResult unsupported_result;
@@ -661,6 +690,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	ir.bindless_images = options.bindless_images;
 	if (!IR::TrackResources(ir, decoded, native_cfg) && options.non_fatal) {
+		DumpGaveUpCode(options, code);
 		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
 		     options.shader_hash);
 		TranslateResult unsupported_result;
