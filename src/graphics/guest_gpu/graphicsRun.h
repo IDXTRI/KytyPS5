@@ -85,6 +85,7 @@ private:
 	Common::CondVar                                m_suspend_point_done;
 	uint64_t                                       m_suspend_points_issued = 0;
 	uint64_t                                       m_suspend_points_done   = 0;
+	uint64_t                                       m_suspend_point_gpu_tick = 0;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;

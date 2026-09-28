@@ -238,7 +238,7 @@ void GuestGpu::Done() {
 }
 
 // sceAgcSuspendPoint inserts a drain of the graphics pipe into the graphics queue and blocks the
-// caller only while the previous suspend point has not executed; async compute keeps running
+// caller only while the previous suspend point has not executed on the GPU; async compute keeps running
 // (agc/baselayer.h, suspendPoint()). Done() waits for every queue to go idle while holding the
 // submission mutex: the submit thread cannot overlap the GPU, and a compute queue parked on a CPU
 // write never lets it return. KYTY_SUSPEND_POINT_WAITS_IDLE=1 restores Done().
@@ -248,6 +248,7 @@ void GuestGpu::SuspendPoint() {
 		Done();
 		return;
 	}
+	uint64_t gpu_tick = 0;
 	{
 		Common::LockGuard lock(m_queue_mutex);
 		while (m_suspend_points_done < m_suspend_points_issued && !m_stopping) {
@@ -256,6 +257,13 @@ void GuestGpu::SuspendPoint() {
 		if (m_stopping) {
 			return;
 		}
+		gpu_tick = m_suspend_point_gpu_tick;
+	}
+	// The previous drain must also have executed on the GPU, as on the console. Without this the
+	// guest runs arbitrarily far ahead, and the uploads recorded for it pile up until an
+	// allocation fails. The tick is already submitted, so this never waits on guest work.
+	if (gpu_tick != 0) {
+		m_renderer.GetCommandScheduler().GetMasterSemaphore().Wait(gpu_tick);
 	}
 	GpuMutexLock lock(m_submission_mutex);
 	Submission   submission;
@@ -726,9 +734,12 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::SuspendPoint: {
-			// Everything recorded before the marker goes to the GPU; the marker has executed.
+			// Everything recorded before the marker goes to the GPU. The next suspend point waits
+			// for that submission, so the guest runs at most one drain ahead of the GPU.
 			cp.BufferFlush();
+			const auto        tick = m_renderer.GetCommandScheduler().CurrentTick() - 1;
 			Common::LockGuard lock(m_queue_mutex);
+			m_suspend_point_gpu_tick = tick;
 			m_suspend_points_done++;
 			m_suspend_point_done.SignalAll();
 			break;
