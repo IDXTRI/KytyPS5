@@ -254,10 +254,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	ShaderProgram compute_program;
+	{
+		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		compute_program =
+		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		ResetBindings();
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -268,14 +272,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
-		ResetBindings();
-		return;
-	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
-		ResetBindings();
-		return;
+	{
+		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
+		if (TryConsumeComputeMetaClear(input_info, buffer)) {
+			ResetBindings();
+			return;
+		}
+		if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+		                                thread_group_z, mode)) {
+			ResetBindings();
+			return;
+		}
 	}
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
@@ -370,6 +377,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -379,6 +387,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	KYTY_PROFILER_BLOCK("Dispatch::Record");
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -418,7 +427,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		ResetBindings();
 		return;
 	}
 	buffer.EndRendering();
