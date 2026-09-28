@@ -973,6 +973,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	// Uniform buffer reads the host evaluates: like a masked image's material reads, they read
+	// memory the shader may write.
+	const bool uniform_buffer_reads = std::ranges::any_of(plan.value_storage, [](const Inst& inst) {
+		return inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	});
 	plan.control_flow = ResourceControlFlow(program);
 	for (auto& block: plan.control_flow) {
 		block.condition = Clone(block.condition);
@@ -995,7 +1000,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
-	if (masked_image) {
+	if (masked_image || uniform_buffer_reads) {
 		plan.resource_tracking_complete &= !program.has_address_writes &&
 		    !std::ranges::any_of(plan.info.images, &ImageResource::written);
 		plan.capture_specialization_reads =
