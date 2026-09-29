@@ -439,8 +439,12 @@ struct ImageRemap {
 		}
 	}
 
-	uint32_t operator[](uint32_t index) const {
-		EXIT_IF(index >= source_count);
+	// what names the use, for the fatal message.
+	uint32_t operator()(uint32_t index, const char* what) const {
+		if (index >= source_count) {
+			EXIT("image remap: %s refers to image %u, but the shader has %u\n", what, index,
+			     source_count);
+		}
 		return indices[index];
 	}
 
@@ -1391,29 +1395,40 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
-				inst.SetFlags(image_remap[inst.Flags<uint32_t>()]);
+				inst.SetFlags(image_remap(inst.Flags<uint32_t>(), "GetImageResource"));
 			}
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
-			memory.resource = image_remap[memory.resource];
+	// Tracking gives an image index only to the accesses that survived its dead-code pass; an
+	// access it removed keeps its T# register from translation, which need not be an image index.
+	std::vector<bool> live_image_access(memory_info.size());
+	for (auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access != ImageAccess::None) {
+				live_image_access[inst.Flags<MemoryFlags>().index] = true;
+			}
+		}
+	}
+	for (uint32_t index = 0; index < memory_info.size(); index++) {
+		auto& memory = memory_info[index];
+		if (live_image_access[index] && memory.kind == ResourceKind::Image && !memory.planning_only) {
+			memory.resource = image_remap(memory.resource, "image access");
 		}
 	}
 	for (auto& buffer: buffers) {
 		if (buffer.image_alias != BufferResource::NoImageAlias) {
-			buffer.image_alias = image_remap[buffer.image_alias];
+			buffer.image_alias = image_remap(buffer.image_alias, "buffer image alias");
 		}
 	}
 	for (auto& pair: sampled_pairs) {
-		pair.image = image_remap[pair.image];
+		pair.image = image_remap(pair.image, "sampled pair");
 	}
 	for (auto& image: images) {
 		if (image.indirect_root != ImageResource::NoIndirectImage) {
-			image.indirect_root = image_remap[image.indirect_root];
+			image.indirect_root = image_remap(image.indirect_root, "indirect root");
 		}
 		for (auto& resource: image.indirect_resources) {
-			resource = image_remap[resource];
+			resource = image_remap(resource, "indirect resource");
 		}
 	}
 	image_remap.Apply(images);
