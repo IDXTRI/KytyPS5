@@ -213,7 +213,8 @@ struct VopcOpcodeInfo {
 };
 
 constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
-    {0x22u, Opcode::V_CMP_EQ_F64, false},
+    {0x22u, Opcode::V_CMP_EQ_F64, false},  {0x23u, Opcode::V_CMP_LE_F64, false},
+    {0x33u, Opcode::V_CMPX_LE_F64, false}, {0x36u, Opcode::V_CMPX_GE_F64, false},
     {0x00u, Opcode::V_CMP_F_F32},          {0x01u, Opcode::V_CMP_LT_F32},
     {0x02u, Opcode::V_CMP_EQ_F32},         {0x03u, Opcode::V_CMP_LE_F32},
     {0x04u, Opcode::V_CMP_GT_F32},         {0x05u, Opcode::V_CMP_LG_F32},
@@ -287,6 +288,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x147u, Opcode::V_CUBEMA_F32},
     {0x14bu, Opcode::V_FMA_F32},
     {0x14cu, Opcode::V_FMA_F64},
+    {0x164u, Opcode::V_ADD_F64},
     {0x165u, Opcode::V_MUL_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
@@ -834,6 +836,9 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 bool IsVopcFloatCompareOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_CMP_EQ_F64:
+		case Opcode::V_CMP_LE_F64:
+		case Opcode::V_CMPX_LE_F64:
+		case Opcode::V_CMPX_GE_F64:
 		case Opcode::V_CMP_F_F32:
 		case Opcode::V_CMP_LT_F32:
 		case Opcode::V_CMP_EQ_F32:
@@ -1150,7 +1155,9 @@ VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
 }
 
 bool SupportsVopcSdwa(Opcode opcode) {
-	return opcode != Opcode::UNSUPPORTED && opcode != Opcode::V_CMP_EQ_F64;
+	return opcode != Opcode::UNSUPPORTED && opcode != Opcode::V_CMP_EQ_F64 &&
+	       opcode != Opcode::V_CMP_LE_F64 && opcode != Opcode::V_CMPX_LE_F64 &&
+	       opcode != Opcode::V_CMPX_GE_F64;
 }
 
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
@@ -1215,6 +1222,7 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 
 uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
@@ -1366,6 +1374,7 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAX_F32:
 		case Opcode::V_MAC_F32:
 		case Opcode::V_MAD_F32:
+		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
 		case Opcode::V_FMA_F64:
 		case Opcode::V_FMA_F32:
@@ -1471,6 +1480,8 @@ void ApplyNativeVop3SourceModifiers(Instruction& inst, uint32_t abs, uint32_t ne
 
 bool IsVopcCompareExec(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_CMPX_LE_F64:
+		case Opcode::V_CMPX_GE_F64:
 		case Opcode::V_CMPX_LT_F32:
 		case Opcode::V_CMPX_EQ_F32:
 		case Opcode::V_CMPX_LE_F32:
