@@ -449,6 +449,9 @@ struct PipelineCache::ProgramCache {
 	struct MemoSlot {
 		std::vector<uint32_t>                        user_data;
 		uint64_t                                     shader_base = 0;
+		// Compute dispatch size: bounds the written extent of each written buffer.
+		std::array<uint32_t, 3>                      workgroup_count {};
+		std::array<uint32_t, 3>                      workgroup_size {};
 		ShaderReadChunks::ReadLog                    log;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -484,6 +487,8 @@ struct PipelineCache::ProgramCache {
 		memo_clock++;
 		for (auto& slot: entry.memo) {
 			if (slot.shader_base == runtime.shader_base &&
+			    slot.workgroup_count == runtime.workgroup_count &&
+			    slot.workgroup_size == runtime.workgroup_size &&
 			    std::ranges::equal(slot.user_data, runtime.user_data) &&
 			    ReadsUnchanged(slot.log, reads)) {
 				entry.resources      = slot.resources;
@@ -512,6 +517,8 @@ struct PipelineCache::ProgramCache {
 			}
 			slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 			slot->shader_base    = runtime.shader_base;
+			slot->workgroup_count = runtime.workgroup_count;
+			slot->workgroup_size  = runtime.workgroup_size;
 			slot->log            = std::move(log);
 			slot->resources      = entry.resources;
 			slot->specialization = entry.specialization;
@@ -648,8 +655,8 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		ShaderReadChunks                       read_chunks(ShaderReadChunks::Enabled());
-		const ShaderRecompiler::IR::SrtRuntime runtime {
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Enabled());
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryRaw,
@@ -657,6 +664,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
+				runtime.workgroup_size[axis]  = input_info.threads_num[axis];
+			}
+		}
 		if (entry != programs.end()) {
 			bool materialized = false;
 			{
