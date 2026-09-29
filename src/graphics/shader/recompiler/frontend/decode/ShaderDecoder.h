@@ -607,6 +607,9 @@ enum class Opcode {
 	S_CBRANCH_EXECZ,
 	S_CBRANCH_EXECNZ,
 	S_CBRANCH_CDBGSYS,
+	S_CBRANCH_CDBGUSER,
+	S_CBRANCH_CDBGSYS_OR_USER,
+	S_CBRANCH_CDBGSYS_AND_USER,
 	S_SENDMSG,
 	S_SETREG_B32,
 	S_SLEEP,
@@ -635,6 +638,9 @@ enum class OperandKind {
 	PopsExitingWaveId,
 	Null,
 	Vgpr,
+	// A special register the recompiler does not model;
+	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
+	Unsupported,
 };
 
 enum ImageSampleFlag : uint32_t {
