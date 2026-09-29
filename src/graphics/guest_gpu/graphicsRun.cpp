@@ -111,6 +111,7 @@ void GuestGpu::Shutdown() {
 		m_accepting = false;
 		m_stopping  = true;
 		m_work_available.SignalAll();
+		m_suspend_point_done.SignalAll();
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
@@ -276,6 +277,50 @@ void GuestGpu::Done() {
 	if (!IsGpuThread()) {
 		WaitForIdle();
 	}
+	m_graphics_done = true;
+	m_done_num++;
+}
+
+// Research: sceAgcSuspendPoint inserts a drain of the graphics pipe into the graphics queue and
+// blocks the caller only while the previous suspend point has not executed on the GPU; async
+// compute keeps running (agc/baselayer.h, suspendPoint()). Done() waited for every queue to go
+// idle while holding the submission mutex: the submit thread could not overlap the GPU, and a
+// compute queue parked on a CPU write would never let it return. KYTY_SUSPEND_POINT_WAITS_IDLE=1
+// restores it.
+void GuestGpu::SuspendPoint() {
+	static const bool waits_idle = std::getenv("KYTY_SUSPEND_POINT_WAITS_IDLE") != nullptr;
+	if (waits_idle || IsGpuThread()) {
+		Done();
+		return;
+	}
+	uint64_t gpu_tick = 0;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		while (m_suspend_points_done < m_suspend_points_issued && !m_stopping) {
+			m_suspend_point_done.Wait(&m_queue_mutex);
+		}
+		if (m_stopping) {
+			return;
+		}
+		gpu_tick = m_suspend_point_gpu_tick;
+	}
+	// The previous drain must also have executed on the GPU, as on the console. Without this the
+	// guest runs arbitrarily far ahead, and the uploads recorded for it pile up until an
+	// allocation fails. The tick is already submitted, so this never waits on guest work.
+	if (gpu_tick != 0) {
+		m_renderer.GetCommandScheduler().GetMasterSemaphore().Wait(gpu_tick);
+	}
+	GpuMutexLock lock(m_submission_mutex);
+	Submission   submission;
+	submission.type            = SubmissionType::SuspendPoint;
+	submission.queue_id        = 0;
+	submission.reset_processor = m_graphics_done;
+	{
+		Common::LockGuard queue_lock(m_queue_mutex);
+		m_suspend_points_issued++;
+	}
+	Enqueue(std::move(submission));
+	// The graphics state is reset after the drain: the next graphics submission resets it.
 	m_graphics_done = true;
 	m_done_num++;
 }
@@ -584,6 +629,7 @@ void GuestGpu::ThreadRun(void* data) {
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
+				gpu->m_suspend_point_done.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
@@ -742,6 +788,17 @@ bool GuestGpu::Process(Submission& submission) {
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
+		case SubmissionType::SuspendPoint: {
+			// Everything recorded before the marker goes to the GPU. The next suspend point waits
+			// for that submission, so the guest runs at most one drain ahead of the GPU.
+			cp.BufferFlush();
+			const auto        tick = m_renderer.GetCommandScheduler().CurrentTick() - 1;
+			Common::LockGuard lock(m_queue_mutex);
+			m_suspend_point_gpu_tick = tick;
+			m_suspend_points_done++;
+			m_suspend_point_done.SignalAll();
+			break;
+		}
 	}
 
 	return complete;
