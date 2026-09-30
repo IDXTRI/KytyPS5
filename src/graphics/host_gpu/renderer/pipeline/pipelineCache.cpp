@@ -143,6 +143,7 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
 bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
 	if (values.empty()) {
 		return false;
 	}
@@ -176,6 +177,7 @@ std::vector<uint32_t> ReadShaderCode(uint64_t address) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
 	if (values.empty()) {
 		return false;
 	}
@@ -416,28 +418,36 @@ struct PipelineCache::ProgramCache {
 			return ShaderProgram {};
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		// Research: a program with inlined calls is valid only for the same call targets.
-		if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
-			for (const auto index: found->second) {
-				lookup_key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
+		{
+			KYTY_PROFILER_BLOCK("ProgramCache::BuildKey");
+			lookup_key.stage           = stage;
+			lookup_key.hash            = params.hash;
+			lookup_key.user_data_count = params.user_data_count;
+			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+			BuildStageStaticKey(input_info, lookup_key.static_state);
+			// Research: a program with inlined calls is valid only for the same call targets.
+			if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
+				for (const auto index: found->second) {
+					lookup_key.static_state.push_back(index < user_data.size() ? user_data[index]
+					                                                           : 0u);
+				}
+			}
+			// Research: ShaderFunctions expands calls first; the calls it refuses reach the
+			// recompiler's own inliner.
+			lookup_key.function_code.clear();
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				ExpandShaderFunctions(params, user_data, input_info.wave_size,
+				                      lookup_key.function_code);
 			}
 		}
-		// Research: ShaderFunctions expands calls first; the calls it refuses reach the
-		// recompiler's own inliner.
-		lookup_key.function_code.clear();
-		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			ExpandShaderFunctions(params, user_data, input_info.wave_size,
-			                      lookup_key.function_code);
+		auto entry = programs.end();
+		{
+			KYTY_PROFILER_BLOCK("ProgramCache::Lookup");
+			if (unsupported.contains(lookup_key)) {
+				return ShaderProgram {};
+			}
+			entry = programs.find(lookup_key);
 		}
-		if (unsupported.contains(lookup_key)) {
-			return ShaderProgram {};
-		}
-		auto                                         entry = programs.find(lookup_key);
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
@@ -449,9 +459,14 @@ struct PipelineCache::ProgramCache {
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
 		if (entry != programs.end()) {
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
+			bool materialized = false;
+			{
+				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
+				materialized = ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization);
+			}
+			if (!materialized) {
 				// A descriptor source that cannot be read right now (memory the guest has not
 				// mapped or filled yet) skips this draw rather than the session; the next one
 				// re-evaluates from scratch.
@@ -467,15 +482,19 @@ struct PipelineCache::ProgramCache {
 				}
 				return ShaderProgram {};
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			auto permutation = entry->second.permutations.end();
+			{
+				KYTY_PROFILER_BLOCK("ProgramCache::FindPermutation");
+				permutation = std::ranges::find_if(
+				    entry->second.permutations, [&](const Permutation& candidate) {
+					    const auto& layout = candidate.program.bindings;
+					    return layout.push_data_start_dword ==
+					               ShaderRecompiler::IR::PushData::StartFor(
+					                   push_data_cursor, layout.ShaderDataDwords()) &&
+					           candidate.specialization == entry->second.specialization;
+				    });
+			}
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -835,6 +854,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return {};
 		}
 	} else {
+		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(VS)");
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
@@ -865,6 +885,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(PS)");
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.

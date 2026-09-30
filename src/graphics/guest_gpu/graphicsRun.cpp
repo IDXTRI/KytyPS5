@@ -213,6 +213,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		KYTY_PROFILER_BLOCK("GuestGpu::ProcessCommands(command)");
 		command();
 	}
 }
@@ -407,6 +408,7 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
+		KYTY_PROFILER_BLOCK("Pm4Suspend::WaitCe");
 		SuspendPm4();
 	}
 }
@@ -414,12 +416,14 @@ void CommandProcessor::WaitCe() {
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
+		KYTY_PROFILER_BLOCK("Pm4Suspend::WaitDeDiff");
 		SuspendPm4();
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
+		KYTY_PROFILER_BLOCK("Pm4Suspend::WaitForRewind");
 		SuspendPm4();
 	}
 }
@@ -473,6 +477,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+		KYTY_PROFILER_BLOCK("Pm4Suspend::WaitRegMem");
 		SuspendPm4();
 	}
 }
@@ -1010,6 +1015,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						KYTY_PROFILER_BLOCK("Pm4Suspend::Predication");
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;

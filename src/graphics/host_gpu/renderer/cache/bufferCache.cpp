@@ -422,6 +422,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(GPU thread)");
 		ReadbackStats::Scope stats(vaddr, is_write);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
