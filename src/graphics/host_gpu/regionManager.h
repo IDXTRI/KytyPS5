@@ -2,11 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
-#include <cstdlib>
 #include <immintrin.h>
 #include <mutex>
 #include <thread>
@@ -65,10 +65,10 @@ public:
 private:
 	static constexpr uint32_t SpinsBeforeYield = 64;
 
-	// KYTY_TRACKER_LOCK_SPIN=1 restores the old busy wait (for A/B measurements).
+	// KYTY_TRACKER_LOCK_SPIN=1 restores the old busy wait (a live switch, for A/B measurements).
 	static bool PureSpin() noexcept {
-		static const bool pure_spin = std::getenv("KYTY_TRACKER_LOCK_SPIN") != nullptr;
-		return pure_spin;
+		static auto& pure_spin = Common::LiveSwitches::Get("KYTY_TRACKER_LOCK_SPIN", 0);
+		return pure_spin.load(std::memory_order_relaxed) != 0;
 	}
 
 	static uint32_t CurrentThread() noexcept {

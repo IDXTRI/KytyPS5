@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -77,9 +78,9 @@ public:
 
 private:
 	static ReadbackStats* Get() {
-		static const bool    enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		static auto&         enabled = Common::LiveSwitches::Get("KYTY_READBACK_STATS", 0);
 		static ReadbackStats stats;
-		return enabled ? &stats : nullptr;
+		return enabled.load(std::memory_order_relaxed) != 0 ? &stats : nullptr;
 	}
 
 	void Record(uint64_t buffer_begin, uint64_t buffer_size, uint64_t vaddr, bool is_write,
@@ -138,22 +139,17 @@ private:
 };
 
 // A guest fault on GPU-written memory downloads an aligned window around the faulting bytes, so
-// nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a power of two, at least the
-// tracker page) changes its width for A/B measurements; the default is 512 KiB.
+// nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a live switch; a power of two,
+// at least the tracker page) changes its width for A/B measurements; the default is 512 KiB.
 uint64_t ReadbackWindowSize() {
-	constexpr uint64_t Default = 512 * 1024;
-	const char*        value   = std::getenv("KYTY_READBACK_WINDOW_KB");
-	if (value == nullptr) {
-		return Default;
+	constexpr int64_t DefaultKib = 512;
+	static auto&      kib        = Common::LiveSwitches::Get("KYTY_READBACK_WINDOW_KB", DefaultKib);
+	const auto        value      = kib.load(std::memory_order_relaxed);
+	const auto        bytes      = static_cast<uint64_t>(value) * 1024;
+	if (value <= 0 || value > 1024 * 1024 || bytes < TRACKER_PAGE_SIZE ||
+	    (bytes & (bytes - 1)) != 0) {
+		return static_cast<uint64_t>(DefaultKib) * 1024;
 	}
-	const uint64_t bytes = std::strtoull(value, nullptr, 10) * 1024;
-	if (bytes < TRACKER_PAGE_SIZE || (bytes & (bytes - 1)) != 0) {
-		::printf("KYTY_READBACK_WINDOW_KB=%s is not a power of two >= %" PRIu64
-		         " KiB; using %" PRIu64 " KiB\n",
-		         value, TRACKER_PAGE_SIZE / 1024, Default / 1024);
-		return Default;
-	}
-	::printf("Readback window: %" PRIu64 " KiB\n", bytes / 1024);
 	return bytes;
 }
 
@@ -474,11 +470,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
-		static const uint64_t WindowSize   = ReadbackWindowSize();
-		const auto            buffer_begin = buffer.CpuAddress();
-		const auto            buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+		const uint64_t WindowSize   = ReadbackWindowSize();
+		const auto     buffer_begin = buffer.CpuAddress();
+		const auto     buffer_end   = buffer_begin + buffer.Size();
+		const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+		const auto     window_end =
+		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (stats.Enabled()) {
 			uint64_t         dirty_bytes = 0;
