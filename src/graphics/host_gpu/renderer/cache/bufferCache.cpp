@@ -15,11 +15,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,6 +33,103 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// KYTY_READBACK_STATS=1: every 5 s, print the buffers whose guest page faults were handed to the
+// GPU thread (BufferCache::ReadMemory) and how each one ended. Only the GPU thread records.
+class ReadbackStats {
+public:
+	enum Outcome : uint32_t { Unregistered, Unmarked, Downloaded, NothingToDownload, OutcomeCount };
+
+	class Scope {
+	public:
+		Scope(uint64_t vaddr, bool is_write)
+		    : m_stats(Get()), m_vaddr(vaddr), m_is_write(is_write),
+		      m_start(m_stats != nullptr ? std::chrono::steady_clock::now()
+		                                 : std::chrono::steady_clock::time_point {}) {}
+		~Scope() {
+			if (m_stats != nullptr) {
+				const auto elapsed = std::chrono::steady_clock::now() - m_start;
+				m_stats->Record(m_buffer_begin, m_buffer_size, m_vaddr, m_is_write, m_outcome,
+				                std::chrono::duration<double, std::micro>(elapsed).count());
+			}
+		}
+		KYTY_CLASS_NO_COPY(Scope);
+
+		void SetBuffer(uint64_t begin, uint64_t size) {
+			m_buffer_begin = begin;
+			m_buffer_size  = size;
+		}
+		void SetOutcome(Outcome outcome) { m_outcome = outcome; }
+
+	private:
+		ReadbackStats*                        m_stats;
+		uint64_t                              m_vaddr;
+		bool                                  m_is_write;
+		std::chrono::steady_clock::time_point m_start;
+		uint64_t                              m_buffer_begin = 0;
+		uint64_t                              m_buffer_size  = 0;
+		Outcome                               m_outcome      = Unregistered;
+	};
+
+private:
+	static ReadbackStats* Get() {
+		static const bool    enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		static ReadbackStats stats;
+		return enabled ? &stats : nullptr;
+	}
+
+	void Record(uint64_t buffer_begin, uint64_t buffer_size, uint64_t vaddr, bool is_write,
+	            Outcome outcome, double micros) {
+		auto& entry = m_entries[buffer_begin];
+		entry.size  = buffer_size;
+		(is_write ? entry.writes : entry.reads)++;
+		entry.outcomes[outcome]++;
+		entry.micros += micros;
+		entry.pages.insert(vaddr >> 12u);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_last >= std::chrono::seconds(5)) {
+			Print();
+			m_entries.clear();
+			m_last = now;
+		}
+	}
+
+	void Print() const {
+		std::vector<std::pair<uint64_t, const Entry*>> sorted;
+		double                                         total = 0;
+		for (const auto& [begin, entry]: m_entries) {
+			sorted.emplace_back(begin, &entry);
+			total += entry.micros;
+		}
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+			return a.second->micros > b.second->micros;
+		});
+		::printf("Readback stats (5 s): %zu buffers, %.1f ms on the GPU thread\n", sorted.size(),
+		         total / 1000.0);
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
+			const auto& [begin, e] = sorted[i];
+			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
+			         " reads %" PRIu64 ", unregistered %" PRIu64 " unmarked %" PRIu64
+			         " downloaded %" PRIu64 " nothing-to-download %" PRIu64
+			         ", %zu pages, %.1f ms\n",
+			         begin, e->size / 1024, e->writes, e->reads, e->outcomes[Unregistered],
+			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->outcomes[NothingToDownload],
+			         e->pages.size(), e->micros / 1000.0);
+		}
+		std::fflush(stdout);
+	}
+
+	struct Entry {
+		uint64_t                     size   = 0;
+		uint64_t                     writes = 0;
+		uint64_t                     reads  = 0;
+		uint64_t                     outcomes[OutcomeCount] {};
+		double                       micros = 0;
+		std::unordered_set<uint64_t> pages;
+	};
+	std::unordered_map<uint64_t, Entry>   m_entries;
+	std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
+};
 
 } // namespace
 
@@ -321,10 +422,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		ReadbackStats::Scope stats(vaddr, is_write);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		stats.SetBuffer(buffer.CpuAddress(), buffer.Size());
 
 		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
 		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
@@ -339,6 +442,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
+			stats.SetOutcome(ReadbackStats::Unmarked);
 			return;
 		}
 
@@ -350,10 +454,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			stats.SetOutcome(ReadbackStats::Downloaded);
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		} else {
+			stats.SetOutcome(ReadbackStats::NothingToDownload);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
