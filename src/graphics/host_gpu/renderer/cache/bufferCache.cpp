@@ -138,6 +138,11 @@ private:
 	std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
 };
 
+bool AsyncWriteReadbackEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_WRITE_READBACK", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
 // A guest fault on GPU-written memory downloads an aligned window around the faulting bytes, so
 // nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a live switch; a power of two,
 // at least the tracker page) changes its width for A/B measurements; the default is 512 KiB.
@@ -443,60 +448,191 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(GPU thread)");
-		ReadbackStats::Scope stats(vaddr, is_write);
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		stats.SetBuffer(buffer.CpuAddress(), buffer.Size());
-
-		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
-		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
-		// page. The page is current, so lift its protection. Downloading the window instead drained
-		// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
-		// labels.
-		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
-		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
-			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	auto& gpu = m_scheduler.Context().GetGpu();
+	// KYTY_ASYNC_WRITE_READBACK=1 (a live switch, off by default): a guest write to GPU-written
+	// memory no longer drains the GPU on the GPU thread. The GPU thread records the window's
+	// download and submits it; the faulting guest thread waits for that submission, and a second
+	// command lifts the window's GPU ownership, or resolves the fault synchronously if the GPU
+	// wrote there again in the meantime.
+	if (is_write && !GuestGpu::IsGpuThread() && AsyncWriteReadbackEnabled()) {
+		uint64_t tick         = 0;
+		uint64_t window_begin = 0;
+		uint64_t window_end   = 0;
+		gpu.SendCommandSync(
+		    [&] { tick = BeginWriteReadback(vaddr, size, window_begin, window_end); });
+		if (tick != 0) {
+			{
+				KYTY_PROFILER_BLOCK("BufferCache::WaitWriteReadback");
+				// Submitted by BeginWriteReadback, so this waits without submitting.
+				EXIT_IF(tick >= m_scheduler.CurrentTick());
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
 			}
-			stats.SetOutcome(ReadbackStats::Unmarked);
-			return;
+			gpu.SendCommandSync(
+			    [&] { FinishWriteReadback(vaddr, size, window_begin, window_end, tick); });
 		}
+		return;
+	}
+	gpu.SendCommandSync([this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+}
 
-		// Widen nearby CPU reads so they share one GPU drain.
-		const uint64_t WindowSize   = ReadbackWindowSize();
-		const auto     buffer_begin = buffer.CpuAddress();
-		const auto     buffer_end   = buffer_begin + buffer.Size();
-		const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto     window_end =
-		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(GPU thread)");
+	ReadbackStats::Scope stats(vaddr, is_write);
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	stats.SetBuffer(buffer.CpuAddress(), buffer.Size());
 
-		if (stats.Enabled()) {
-			uint64_t         dirty_bytes = 0;
-			std::shared_lock lock(m_dirty_ranges_mutex);
-			m_gpu_modified_ranges.ForEachInRange(
-			    window_begin, window_end - window_begin,
-			    [&](uint64_t start, uint64_t end) { dirty_bytes += end - start; });
-			stats.SetDownloadBytes(dirty_bytes);
-		}
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			stats.SetOutcome(ReadbackStats::Downloaded);
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-		} else {
-			stats.SetOutcome(ReadbackStats::NothingToDownload);
-		}
+	// The page is protected as GPU-written, but none of its bytes are waiting for a download:
+	// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
+	// page. The page is current, so lift its protection. Downloading the window instead drained
+	// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
+	// labels.
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	// Pages of an asynchronous write readback stay GPU-owned until its download is
+	// published.
+	CompletePendingWriteReadbacks(page_begin, page_end);
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
+		stats.SetOutcome(ReadbackStats::Unmarked);
+		return;
+	}
+
+	// Widen nearby CPU reads so they share one GPU drain.
+	const uint64_t WindowSize   = ReadbackWindowSize();
+	const auto     buffer_begin = buffer.CpuAddress();
+	const auto     buffer_end   = buffer_begin + buffer.Size();
+	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+
+	if (stats.Enabled()) {
+		uint64_t         dirty_bytes = 0;
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		m_gpu_modified_ranges.ForEachInRange(
+		    window_begin, window_end - window_begin,
+		    [&](uint64_t start, uint64_t end) { dirty_bytes += end - start; });
+		stats.SetDownloadBytes(dirty_bytes);
+	}
+	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		stats.SetOutcome(ReadbackStats::Downloaded);
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+	} else {
+		stats.SetOutcome(ReadbackStats::NothingToDownload);
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+}
+
+// GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
+uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t& window_begin,
+                                         uint64_t& window_end) {
+	KYTY_PROFILER_FUNCTION();
+	ReadbackStats::Scope stats(vaddr, true);
+	if (!IsRegionRegistered(vaddr, size)) {
+		return 0;
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	// Another guest's readback of this page is still landing: wait for the same download.
+	for (const auto& pending: m_pending_write_readbacks) {
+		if (pending.begin < page_end && page_begin < pending.end) {
+			window_begin = pending.begin;
+			window_end   = pending.end;
+			return pending.tick;
+		}
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	stats.SetBuffer(buffer.CpuAddress(), buffer.Size());
+
+	// As in ReadMemoryOnGpu: a GPU-owned page without bytes to download only needs unprotecting.
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		stats.SetOutcome(ReadbackStats::Unmarked);
+		return 0;
+	}
+
+	const uint64_t WindowSize   = ReadbackWindowSize();
+	const auto     buffer_begin = buffer.CpuAddress();
+	const auto     buffer_end   = buffer_begin + buffer.Size();
+	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		stats.SetOutcome(ReadbackStats::NothingToDownload);
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return 0;
+	}
+	stats.SetOutcome(ReadbackStats::Downloaded);
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Flush();
+	m_pending_write_readbacks.push_back({window_begin, window_end, tick});
+	return tick;
+}
+
+// GPU thread, after the guest waited for the readback's tick and its publication.
+void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin,
+                                      uint64_t window_end, uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
+	for (size_t i = 0; i < m_pending_write_readbacks.size(); i++) {
+		const auto& pending = m_pending_write_readbacks[i];
+		if (pending.begin == window_begin && pending.end == window_end && pending.tick == tick) {
+			CompletePendingWriteReadback(i);
+			break;
+		}
+	}
+	if (!IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+		// The GPU wrote the window again while the download was landing, or another readback
+		// still covers the page: resolve this fault the synchronous way.
+		ReadMemoryOnGpu(vaddr, size, true);
+		return;
+	}
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+}
+
+// GPU thread: waits for a pending readback's publication and, unless the GPU wrote its window
+// again, lifts the window's GPU ownership as the synchronous path does after its download.
+void BufferCache::CompletePendingWriteReadback(size_t index) {
+	const auto pending = m_pending_write_readbacks[index];
+	m_pending_write_readbacks.erase(m_pending_write_readbacks.begin() +
+	                                static_cast<std::ptrdiff_t>(index));
+	m_scheduler.Wait(pending.tick);
+	m_scheduler.WaitPriorityOperations(pending.tick);
+	if (!HasGpuDirtyBytes(pending.begin, pending.end - pending.begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(pending.begin, pending.end - pending.begin);
+	}
+}
+
+void BufferCache::CompletePendingWriteReadbacks(uint64_t begin, uint64_t end) {
+	for (size_t i = 0; i < m_pending_write_readbacks.size();) {
+		const auto& pending = m_pending_write_readbacks[i];
+		if (pending.begin < end && begin < pending.end) {
+			CompletePendingWriteReadback(i);
+		} else {
+			i++;
+		}
+	}
+}
+
+bool BufferCache::OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const {
+	return std::ranges::any_of(m_pending_write_readbacks, [&](const PendingWriteReadback& pending) {
+		return pending.begin < end && begin < pending.end;
 	});
 }
 
@@ -845,7 +981,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Bytes of a pending asynchronous write readback are GPU-owned until published.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       OverlapsPendingWriteReadback(vaddr, vaddr + size);
 }
 
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
@@ -890,6 +1028,12 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
+			return false;
+		}
+		if (OverlapsPendingWriteReadback(buffer.CpuAddress(),
+		                                 buffer.CpuAddress() + buffer.Size())) {
+			// A guest write's readback is still landing: its pages are GPU-owned without dirty
+			// bytes, which the download below would reject. Collect the buffer later.
 			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),

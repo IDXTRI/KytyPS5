@@ -144,6 +144,24 @@ private:
 	void               DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                                        uint64_t total_size);
 
+	// GPU thread: a guest fault on GPU-written memory, resolved synchronously.
+	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	// KYTY_ASYNC_WRITE_READBACK (see ReadMemory). A window whose download is submitted but not
+	// yet published to guest memory; its pages stay GPU-owned until the readback is completed.
+	// Only the GPU thread touches the list.
+	struct PendingWriteReadback {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	[[nodiscard]] uint64_t BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t& window_begin,
+	                                          uint64_t& window_end);
+	void                   FinishWriteReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin,
+	                                           uint64_t window_end, uint64_t tick);
+	void                   CompletePendingWriteReadback(size_t index);
+	void                   CompletePendingWriteReadbacks(uint64_t begin, uint64_t end);
+	[[nodiscard]] bool     OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const;
+
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
@@ -159,6 +177,7 @@ private:
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
+	std::vector<PendingWriteReadback>                  m_pending_write_readbacks;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	StreamBuffer                                       m_stream_buffer;
