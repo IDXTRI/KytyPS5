@@ -454,6 +454,12 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(live_switches_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LiveSwitchesTests.cpp"
+)
+target_link_libraries(live_switches_tests common)
+target_include_directories(live_switches_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -625,6 +631,7 @@ if(BUILD_TESTING)
 	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME live_switches COMMAND $<TARGET_FILE:live_switches_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -698,6 +705,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
+		live_switches_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
