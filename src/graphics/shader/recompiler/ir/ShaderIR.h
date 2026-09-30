@@ -568,6 +568,8 @@ struct UniformFillPlan {
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
+class SrtNativeCode;
+
 struct ResourcePlan {
 	struct EvaluationContext {
 		struct Entry {
@@ -618,6 +620,10 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// The plan compiled into x86-64 code (SrtNative.h) once it is refreshed often enough.
+	mutable std::shared_ptr<const SrtNativeCode> native_code;
+	mutable uint32_t                             native_uses      = 0;
+	mutable bool                                 native_attempted = false;
 };
 
 struct Program: ResourcePlan {
