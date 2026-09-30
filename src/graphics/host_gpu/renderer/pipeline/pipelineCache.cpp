@@ -83,6 +83,30 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+// KYTY_PIPELINE_CACHE_ANY_REVISION=1 keeps a cache written by another emulator revision, so
+// A/B builds of one title don't start cold. The device, driver and UUID must still match, and
+// the driver validates every entry itself; entries for pipelines a build no longer creates are
+// simply never looked up.
+bool DriverCacheSignatureMatches(std::string_view cached, std::string_view current) {
+	if (cached == current) {
+		return true;
+	}
+	static const bool any_revision = std::getenv("KYTY_PIPELINE_CACHE_ANY_REVISION") != nullptr;
+	if (!any_revision) {
+		return false;
+	}
+	// "KytyPC1:<revision>:<vendor>:..." -> ":<vendor>:..."
+	const auto without_revision = [](std::string_view signature) -> std::string_view {
+		const auto first = signature.find(':');
+		const auto second =
+		    first == std::string_view::npos ? first : signature.find(':', first + 1);
+		return second == std::string_view::npos ? std::string_view {} : signature.substr(second);
+	};
+	const auto cached_rest = without_revision(cached);
+	return !cached_rest.empty() && cached.starts_with("KytyPC1:") &&
+	       cached_rest == without_revision(current);
+}
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
@@ -696,12 +720,16 @@ void PipelineCache::InitializeDriverCache() {
 			          &payload_read);
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
+			    payload_read != initial_data.size() ||
+			    !DriverCacheSignatureMatches(cached_signature, signature) ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
 				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
 				    path);
+			} else if (cached_signature != signature) {
+				PipelineCacheLog("Vulkan pipeline cache: keeping {} from another emulator revision",
+				                 path);
 			}
 		} else {
 			file.Close();
