@@ -50,16 +50,19 @@ public:
 			if (m_stats != nullptr) {
 				const auto elapsed = std::chrono::steady_clock::now() - m_start;
 				m_stats->Record(m_buffer_begin, m_buffer_size, m_vaddr, m_is_write, m_outcome,
+				                m_download_bytes,
 				                std::chrono::duration<double, std::micro>(elapsed).count());
 			}
 		}
 		KYTY_CLASS_NO_COPY(Scope);
 
-		void SetBuffer(uint64_t begin, uint64_t size) {
-			m_buffer_begin = begin;
-			m_buffer_size  = size;
+		[[nodiscard]] bool Enabled() const { return m_stats != nullptr; }
+		void               SetBuffer(uint64_t begin, uint64_t size) {
+            m_buffer_begin = begin;
+            m_buffer_size  = size;
 		}
 		void SetOutcome(Outcome outcome) { m_outcome = outcome; }
+		void SetDownloadBytes(uint64_t bytes) { m_download_bytes = bytes; }
 
 	private:
 		ReadbackStats*                        m_stats;
@@ -69,6 +72,7 @@ public:
 		uint64_t                              m_buffer_begin = 0;
 		uint64_t                              m_buffer_size  = 0;
 		Outcome                               m_outcome      = Unregistered;
+		uint64_t                              m_download_bytes = 0;
 	};
 
 private:
@@ -79,11 +83,12 @@ private:
 	}
 
 	void Record(uint64_t buffer_begin, uint64_t buffer_size, uint64_t vaddr, bool is_write,
-	            Outcome outcome, double micros) {
+	            Outcome outcome, uint64_t download_bytes, double micros) {
 		auto& entry = m_entries[buffer_begin];
 		entry.size  = buffer_size;
 		(is_write ? entry.writes : entry.reads)++;
 		entry.outcomes[outcome]++;
+		entry.download_bytes += download_bytes;
 		entry.micros += micros;
 		entry.pages.insert(vaddr >> 12u);
 		const auto now = std::chrono::steady_clock::now();
@@ -110,11 +115,11 @@ private:
 			const auto& [begin, e] = sorted[i];
 			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
 			         " reads %" PRIu64 ", unregistered %" PRIu64 " unmarked %" PRIu64
-			         " downloaded %" PRIu64 " nothing-to-download %" PRIu64
+			         " downloaded %" PRIu64 " (%" PRIu64 " KiB) nothing-to-download %" PRIu64
 			         ", %zu pages, %.1f ms\n",
 			         begin, e->size / 1024, e->writes, e->reads, e->outcomes[Unregistered],
-			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->outcomes[NothingToDownload],
-			         e->pages.size(), e->micros / 1000.0);
+			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->download_bytes / 1024,
+			         e->outcomes[NothingToDownload], e->pages.size(), e->micros / 1000.0);
 		}
 		std::fflush(stdout);
 	}
@@ -124,12 +129,33 @@ private:
 		uint64_t                     writes = 0;
 		uint64_t                     reads  = 0;
 		uint64_t                     outcomes[OutcomeCount] {};
-		double                       micros = 0;
+		uint64_t                     download_bytes = 0;
+		double                       micros         = 0;
 		std::unordered_set<uint64_t> pages;
 	};
 	std::unordered_map<uint64_t, Entry>   m_entries;
 	std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
 };
+
+// A guest fault on GPU-written memory downloads an aligned window around the faulting bytes, so
+// nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a power of two, at least the
+// tracker page) changes its width for A/B measurements; the default is 512 KiB.
+uint64_t ReadbackWindowSize() {
+	constexpr uint64_t Default = 512 * 1024;
+	const char*        value   = std::getenv("KYTY_READBACK_WINDOW_KB");
+	if (value == nullptr) {
+		return Default;
+	}
+	const uint64_t bytes = std::strtoull(value, nullptr, 10) * 1024;
+	if (bytes < TRACKER_PAGE_SIZE || (bytes & (bytes - 1)) != 0) {
+		::printf("KYTY_READBACK_WINDOW_KB=%s is not a power of two >= %" PRIu64
+		         " KiB; using %" PRIu64 " KiB\n",
+		         value, TRACKER_PAGE_SIZE / 1024, Default / 1024);
+		return Default;
+	}
+	::printf("Readback window: %" PRIu64 " KiB\n", bytes / 1024);
+	return bytes;
+}
 
 } // namespace
 
@@ -448,12 +474,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
-		const auto         buffer_begin = buffer.CpuAddress();
-		const auto         buffer_end   = buffer_begin + buffer.Size();
+		static const uint64_t WindowSize   = ReadbackWindowSize();
+		const auto            buffer_begin = buffer.CpuAddress();
+		const auto            buffer_end   = buffer_begin + buffer.Size();
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		if (stats.Enabled()) {
+			uint64_t         dirty_bytes = 0;
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			m_gpu_modified_ranges.ForEachInRange(
+			    window_begin, window_end - window_begin,
+			    [&](uint64_t start, uint64_t end) { dirty_bytes += end - start; });
+			stats.SetDownloadBytes(dirty_bytes);
+		}
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			stats.SetOutcome(ReadbackStats::Downloaded);
 			const auto tick = m_scheduler.CurrentTick();
