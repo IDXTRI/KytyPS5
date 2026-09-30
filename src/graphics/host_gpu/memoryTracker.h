@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -50,7 +51,11 @@ public:
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
-				std::scoped_lock lock(manager->lock);
+				{
+					KYTY_PROFILER_BLOCK("MemoryTracker::FaultLockWait");
+					manager->lock.lock();
+				}
+				std::scoped_lock lock(std::adopt_lock, manager->lock);
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
@@ -106,7 +111,14 @@ public:
 				manager->lock.unlock();
 			}
 		});
-		upload_func();
+		if (is_written) {
+			// The region locks stay held until the GPU-modified marks below.
+			KYTY_PROFILER_BLOCK("MemoryTracker::UploadHoldingRegionLocks");
+			upload_func();
+		} else {
+			KYTY_PROFILER_BLOCK("MemoryTracker::Upload");
+			upload_func();
+		}
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

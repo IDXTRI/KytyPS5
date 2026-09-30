@@ -3603,6 +3603,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	KYTY_PROFILER_BLOCK("Guest::PthreadYield");
 	SchedulerBackoffOnce();
 }
 
@@ -3834,6 +3835,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	KYTY_PROFILER_BLOCK("Guest::KernelUsleep");
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3844,6 +3846,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	KYTY_PROFILER_BLOCK("Guest::KernelNanosleep");
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
