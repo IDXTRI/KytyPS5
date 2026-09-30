@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -139,13 +140,72 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	return false;
 }
 
+// The resource walker reads guest memory one dword per scalar load, and every read pays the
+// GPU-ownership checks and the address-space lock. With KYTY_SHADER_READ_CHUNKS=1 (a live
+// switch, off by default) one program lookup reads each aligned 256-byte chunk once and serves
+// its dwords from that copy. A chunk with any GPU-owned byte, or one that is not all mapped,
+// is refused and its reads take the per-read path, so the values are the ones read before.
+// The copies live for one lookup only: descriptors change between draws.
+class ShaderReadChunks {
+public:
+	// Returns false when the chunk cannot serve the read; the caller reads as before.
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		const auto base = address & ~(ChunkSize - 1);
+		if (values.size_bytes() > ChunkSize || address + values.size_bytes() > base + ChunkSize) {
+			return false;
+		}
+		auto* slot = Find(base);
+		if (slot == nullptr) {
+			slot        = &m_slots[m_next++ % m_slots.size()];
+			slot->base  = base;
+			slot->clean = Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, slot->words.data(),
+			                                                              ChunkSize);
+		}
+		if (!slot->clean) {
+			return false;
+		}
+		std::memcpy(values.data(), slot->words.data() + (address - base) / sizeof(uint32_t),
+		            values.size_bytes());
+		return true;
+	}
+
+	static bool Enabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_SHADER_READ_CHUNKS", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
+private:
+	static constexpr uint64_t ChunkSize = 256;
+
+	struct Slot {
+		uint64_t                                           base  = UINT64_MAX;
+		bool                                               clean = false;
+		std::array<uint32_t, ChunkSize / sizeof(uint32_t)> words;
+	};
+
+	Slot* Find(uint64_t base) {
+		for (auto& slot: m_slots) {
+			if (slot.base == base) {
+				return &slot;
+			}
+		}
+		return nullptr;
+	}
+
+	std::array<Slot, 8> m_slots;
+	size_t              m_next = 0;
+};
+
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
-bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
 	if (values.empty()) {
 		return false;
+	}
+	if (userdata != nullptr && static_cast<ShaderReadChunks*>(userdata)->Read(address, values)) {
+		return true;
 	}
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
@@ -176,10 +236,13 @@ std::vector<uint32_t> ReadShaderCode(uint64_t address) {
 	return words;
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
 	if (values.empty()) {
 		return false;
+	}
+	if (userdata != nullptr && static_cast<ShaderReadChunks*>(userdata)->Read(address, values)) {
+		return true;
 	}
 	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
 	                                                    values.size_bytes())) {
@@ -451,10 +514,12 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		ShaderReadChunks                       read_chunks;
+		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = ShaderReadChunks::Enabled() ? &read_chunks : nullptr,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
