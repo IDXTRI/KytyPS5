@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -779,6 +780,13 @@ struct PipelineCache::ProgramCache {
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
 				materialized = Materialize(entry->second, runtime, read_chunks);
+				if (ShaderRecompiler::IR::SrtNativeStats stats;
+				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
+					::printf("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
+					     " instructions, %" PRIu64 " through the interpreter\n",
+					     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
+					     stats.interpreted);
+				}
 			}
 			if (!materialized) {
 				// A descriptor source that cannot be read right now (memory the guest has not

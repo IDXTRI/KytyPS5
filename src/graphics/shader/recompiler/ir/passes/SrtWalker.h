@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 
 #include <array>
 #include <cstdint>
@@ -75,6 +76,13 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	friend struct SrtNativeHelpers;
+
+	// Binds this walker to the plan's native code when the configuration is one it was compiled
+	// for (SrtNative.h), compiling it once the plan is refreshed often enough.
+	void BindNative();
+	bool VerifyNative(Value value, bool native_ok, uint64_t native_result);
+
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
@@ -104,6 +112,9 @@ private:
 	const CompiledSrt*       m_compiled = nullptr;
 	const CompiledSrt::Node* m_node     = nullptr;
 	bool                     m_compare  = false;
+	const SrtNativeCode*            m_native      = nullptr;
+	SrtNativeMode                   m_native_mode = SrtNativeMode::Self;
+	SrtNativeFrame                  m_native_frame;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
 	uint64_t    m_read_failure_address = 0;
