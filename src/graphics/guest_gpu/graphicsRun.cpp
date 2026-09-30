@@ -753,6 +753,9 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 	} end_mark {submission};
 
+	if (first_slice) {
+		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
 	}
