@@ -305,15 +305,25 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
+		// A device can be reported and still fail to open (another program holds it, or a
+		// virtual pad goes away while connecting). Skip it and keep the other controllers.
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
+		if (pad == nullptr) {
+			const char* name = SDL_GetGamepadNameForID(f.id);
+			LOGF("Controller %d (%s) can't be opened, ignoring it: %s\n", f.id,
+			     name != nullptr ? name : "unknown", SDL_GetError());
+		} else {
+			int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+			Controller::Connect(id);
+		}
 	}
 
+	// Only controllers that were opened above were connected.
 	if (f.removed) {
-		Controller::Disconnect(f.id);
-		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
+		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			Controller::Disconnect(f.id);
+			SDL_CloseGamepad(pad);
+		}
 	}
 
 	if (f.down || f.up) {
