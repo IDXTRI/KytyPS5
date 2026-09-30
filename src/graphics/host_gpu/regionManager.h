@@ -6,7 +6,10 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <immintrin.h>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -33,9 +36,19 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
+			}
+			// The GPU thread can hold a region lock for a whole upload while guest threads fault
+			// on its pages. Spin briefly with the pause hint, which also leaves the SMT sibling
+			// its execution resources, then give the core away instead of burning it.
+			if (PureSpin() || spins < SpinsBeforeYield) {
+				spins++;
+				_mm_pause();
+			} else {
+				std::this_thread::yield();
 			}
 			std::atomic_signal_fence(std::memory_order_seq_cst);
 		}
@@ -50,6 +63,14 @@ public:
 	}
 
 private:
+	static constexpr uint32_t SpinsBeforeYield = 64;
+
+	// KYTY_TRACKER_LOCK_SPIN=1 restores the old busy wait (for A/B measurements).
+	static bool PureSpin() noexcept {
+		static const bool pure_spin = std::getenv("KYTY_TRACKER_LOCK_SPIN") != nullptr;
+		return pure_spin;
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
