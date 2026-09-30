@@ -41,6 +41,8 @@ public:
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
+	// Locks GetMutex() inside a profiler zone, so time spent waiting for it is visible.
+	[[nodiscard]] Common::LockGuard LockMutexProfiled();
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }

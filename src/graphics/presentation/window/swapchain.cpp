@@ -965,6 +965,7 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_FRAME();
 	window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();

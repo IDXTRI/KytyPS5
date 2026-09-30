@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -142,7 +143,13 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+Common::LockGuard RenderContext::LockMutexProfiled() {
+	KYTY_PROFILER_BLOCK("RenderContext::WaitMutex");
+	return Common::LockGuard(m_mutex);
+}
+
 void RenderContext::RunGarbageCollector() {
+	KYTY_PROFILER_FUNCTION();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
