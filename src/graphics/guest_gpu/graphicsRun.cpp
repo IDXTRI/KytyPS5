@@ -723,6 +723,9 @@ bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
 
+	if (first_slice) {
+		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
 	}
