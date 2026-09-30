@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -1555,6 +1556,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 
 int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
+	KYTY_PROFILER_BLOCK("Guest::AgcSuspendPoint");
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SuspendPoint();
@@ -4203,6 +4205,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	PRINT_NAME();
+	KYTY_PROFILER_BLOCK("Guest::AgcDriverSubmitDcb");
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 
