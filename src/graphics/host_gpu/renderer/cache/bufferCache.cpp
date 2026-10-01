@@ -945,6 +945,34 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// KYTY_SYNC_STATS=1 (live): every 5 s, synchronizations and the bytes they walked, split by
+	// read and written ranges (a written range is locked and marked GPU-modified page by page).
+	static auto& stats = Common::LiveSwitches::Get("KYTY_SYNC_STATS", 0);
+	if (stats.load(std::memory_order_relaxed) != 0) {
+		static uint64_t calls[2]   = {};
+		static uint64_t bytes[2]   = {};
+		static uint64_t largest[2] = {};
+		static auto     report     = std::chrono::steady_clock::now();
+
+		const size_t kind = is_written ? 1 : 0;
+		calls[kind]++;
+		bytes[kind] += size;
+		largest[kind] = std::max(largest[kind], size);
+
+		const auto now = std::chrono::steady_clock::now();
+		if (now - report >= std::chrono::seconds(5)) {
+			report               = now;
+			constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+			::printf("Buffer sync (5 s): read %" PRIu64 " calls %.1f GiB (largest %.1f MiB), "
+			         "written %" PRIu64 " calls %.1f GiB (largest %.1f MiB)\n",
+			         calls[0], static_cast<double>(bytes[0]) / GiB,
+			         static_cast<double>(largest[0]) / 1048576.0, calls[1],
+			         static_cast<double>(bytes[1]) / GiB,
+			         static_cast<double>(largest[1]) / 1048576.0);
+			std::fflush(stdout);
+			calls[0] = calls[1] = bytes[0] = bytes[1] = largest[0] = largest[1] = 0;
+		}
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
