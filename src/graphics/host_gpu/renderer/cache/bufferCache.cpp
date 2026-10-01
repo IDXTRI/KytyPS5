@@ -1482,10 +1482,12 @@ void BufferCache::RunGarbageCollector() {
 	};
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
-	// KYTY_BUFFER_GC_AGE (live, frames, default 4): the age below the critical mark. Wolverine
-	// sits between the marks (7.7 of 5.2/8.4 GiB with the images): at 4 the collector ran on every
-	// submission and retired ~170 small buffers/s that came back at once (~340 created/s, run 28).
-	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 4);
+	// KYTY_BUFFER_GC_AGE (live, frames, default 120; 4 before): the age below the critical mark.
+	// Wolverine sits between the marks (7.7 of 5.2/8.4 GiB with the images): at 4 the collector ran
+	// on every submission and retired ~170 small buffers/s that came back at once (~340 created/s,
+	// run 28). Run 29 A/B 4/120: buffers created 1500 -> 15 per 5 s, same memory use, median 83.1
+	// -> 66.8 ms, mean 76.7 -> 72.5 ms. Above the critical mark the age stays 2 frames.
+	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 120);
 	const uint64_t relaxed_age =
 	    static_cast<uint64_t>(std::max<int64_t>(2, gc_age.load(std::memory_order_relaxed)));
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : relaxed_age, clock);
