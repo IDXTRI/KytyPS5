@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -112,11 +113,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 }
 
 // A/B switch for bounded buffer writes (KYTY_BOUNDED_BUFFER_WRITES=0 marks every written buffer's
-// whole range GPU-written, as before).
-static const bool g_bounded_buffer_writes = [] {
-	const char* value = std::getenv("KYTY_BOUNDED_BUFFER_WRITES");
-	return value == nullptr || value[0] != '0';
-}();
+// whole range GPU-written, as before). A live switch.
+static bool BoundedBufferWrites() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_BOUNDED_BUFFER_WRITES", 1);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
 
 // Diagnostics: names the shader whose bindings are prepared, for KYTY_WATCH_GPU_WRITE.
 struct DiagShaderScope {
@@ -142,8 +143,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	// The stores' addresses bound the bytes this draw or dispatch writes: only those become
 	// GPU-written, so the guest's accesses elsewhere in the range do not drain the GPU.
-	const bool bounded_write = resource.written && extent != nullptr && extent->valid &&
-	                           g_bounded_buffer_writes;
+	const bool bounded_write =
+	    resource.written && extent != nullptr && extent->valid && BoundedBufferWrites();
 	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
 	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
 	auto [buffer, offset] =
