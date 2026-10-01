@@ -1057,6 +1057,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	m_buffers_created++;
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
@@ -1445,15 +1446,48 @@ void BufferCache::RunGarbageCollector() {
 	if (used < m_trigger_gc_memory) {
 		return;
 	}
-
 	const bool aggressive = used >= m_critical_gc_memory;
+	// KYTY_BUFFER_STATS=1 (live): every 5 s, the collections and what they freed, and the
+	// buffers created meanwhile, to see whether the collector churns buffers still in use.
+	static auto& churn_stats = Common::LiveSwitches::Get("KYTY_BUFFER_STATS", 0);
+	struct GcReport {
+		uint64_t runs = 0, deleted = 0, downloaded = 0, deleted_bytes = 0;
+		uint64_t created_seen                    = 0;
+		std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+	};
+	static GcReport gc_report;
+	const auto      report_gc = [&](size_t deleted, size_t downloaded, uint64_t bytes) {
+        if (churn_stats.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        gc_report.runs++;
+        gc_report.deleted += deleted;
+        gc_report.downloaded += downloaded;
+        gc_report.deleted_bytes += bytes;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - gc_report.at >= std::chrono::seconds(5)) {
+            ::printf("Buffer GC (5 s): %" PRIu64
+			              " runs (used %.2f GiB, trigger %.2f, critical %.2f%s), "
+			                   "%" PRIu64 " deleted (%.1f MiB), %" PRIu64 " downloaded first; %" PRIu64
+			              " buffers created\n",
+			              gc_report.runs, static_cast<double>(used) / (1u << 30u),
+			              static_cast<double>(m_trigger_gc_memory) / (1u << 30u),
+			              static_cast<double>(m_critical_gc_memory) / (1u << 30u),
+                     aggressive ? ", aggressive" : "", gc_report.deleted,
+			              static_cast<double>(gc_report.deleted_bytes) / (1u << 20u),
+			              gc_report.downloaded, m_buffers_created - gc_report.created_seen);
+            gc_report              = {};
+            gc_report.created_seen = m_buffers_created;
+        }
+	};
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
-	size_t                retire_count = 0;
+	size_t                retire_count  = 0;
+	uint64_t              retired_bytes = 0;
 	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
@@ -1479,10 +1513,12 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			retired_bytes += buffer.Size();
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;
 	});
+	report_gc(retire_count, dirty_buffers.size(), retired_bytes);
 	if (dirty_buffers.empty()) {
 		return;
 	}

@@ -217,6 +217,8 @@ private:
 	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	// Buffers CreateBuffer made so far (KYTY_BUFFER_STATS).
+	uint64_t               m_buffers_created    = 0;
 	uint64_t m_gc_tick            = 0;
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 };
