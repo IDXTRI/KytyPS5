@@ -103,6 +103,8 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// KYTY_READBACK_STATS: the shader whose resources are bound next (GPU thread).
+	static void SetReadbackStatsShader(uint64_t hash);
 
 private:
 	friend struct BufferCacheTestAccess;

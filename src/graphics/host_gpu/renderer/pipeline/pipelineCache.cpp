@@ -480,6 +480,7 @@ struct PipelineCache::ProgramCache {
 		if (SkipShaderRequested(params.hash)) {
 			return ShaderProgram {};
 		}
+		BufferCache::SetReadbackStatsShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		{
 			KYTY_PROFILER_BLOCK("ProgramCache::BuildKey");

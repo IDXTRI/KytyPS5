@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -36,10 +37,22 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 // KYTY_READBACK_STATS=1: every 5 s, print the buffers whose guest page faults were handed to the
-// GPU thread (BufferCache::ReadMemory) and how each one ended. Only the GPU thread records.
+// GPU thread (BufferCache::ReadMemory) and how each one ended. For downloads it also reports the
+// written binding that last marked the faulting bytes (shader, size, whether that GPU work had
+// already finished, how long ago it was bound) and how many downloaded bytes differed from guest
+// memory. Only the GPU thread records, except the byte comparison (download completions).
 class ReadbackStats {
 public:
 	enum Outcome : uint32_t { Unregistered, Unmarked, Downloaded, NothingToDownload, OutcomeCount };
+	static constexpr uint32_t AgeBuckets = 5; // <1 ms, <10 ms, <50 ms, <250 ms, older
+
+	struct Writer {
+		bool     found    = false;
+		bool     finished = false;
+		uint32_t age      = 0;
+		uint64_t shader   = 0;
+		uint64_t size     = 0;
+	};
 
 	class Scope {
 	public:
@@ -51,7 +64,7 @@ public:
 			if (m_stats != nullptr) {
 				const auto elapsed = std::chrono::steady_clock::now() - m_start;
 				m_stats->Record(m_buffer_begin, m_buffer_size, m_vaddr, m_is_write, m_outcome,
-				                m_download_bytes,
+				                m_download_bytes, m_writer,
 				                std::chrono::duration<double, std::micro>(elapsed).count());
 			}
 		}
@@ -64,27 +77,86 @@ public:
 		}
 		void SetOutcome(Outcome outcome) { m_outcome = outcome; }
 		void SetDownloadBytes(uint64_t bytes) { m_download_bytes = bytes; }
+		// The latest written binding covering the faulting address; is_finished(tick) tells
+		// whether that GPU work has completed.
+		template <typename IsFinished>
+		void FindWriter(IsFinished&& is_finished) {
+			if (m_stats != nullptr) {
+				m_writer = m_stats->FindWriter(m_vaddr, is_finished);
+			}
+		}
 
 	private:
 		ReadbackStats*                        m_stats;
 		uint64_t                              m_vaddr;
 		bool                                  m_is_write;
 		std::chrono::steady_clock::time_point m_start;
-		uint64_t                              m_buffer_begin = 0;
-		uint64_t                              m_buffer_size  = 0;
-		Outcome                               m_outcome      = Unregistered;
+		uint64_t                              m_buffer_begin   = 0;
+		uint64_t                              m_buffer_size    = 0;
+		Outcome                               m_outcome        = Unregistered;
 		uint64_t                              m_download_bytes = 0;
+		Writer                                m_writer;
 	};
 
+	// GPU thread: the shader whose resources are being bound next.
+	static void SetShader(uint64_t hash) { s_shader = hash; }
+
+	// GPU thread: a binding the GPU may write.
+	static void NoteWrite(uint64_t begin, uint64_t size, uint64_t tick) {
+		if (auto* stats = Get(); stats != nullptr) {
+			auto& mark = stats->m_marks[stats->m_next_mark++ % stats->m_marks.size()];
+			mark       = {begin, begin + size, tick, s_shader, std::chrono::steady_clock::now()};
+		}
+	}
+
+	// Download completion: how many bytes the GPU copy changed in guest memory.
+	static void NoteCompare(uint64_t changed, uint64_t total) {
+		if (Get() != nullptr) {
+			s_changed_bytes.fetch_add(changed, std::memory_order_relaxed);
+			s_compared_bytes.fetch_add(total, std::memory_order_relaxed);
+		}
+	}
+
+	[[nodiscard]] static bool On() { return Get() != nullptr; }
+
 private:
+	struct Mark {
+		uint64_t                              begin  = 0;
+		uint64_t                              end    = 0;
+		uint64_t                              tick   = 0;
+		uint64_t                              shader = 0;
+		std::chrono::steady_clock::time_point time;
+	};
+
 	static ReadbackStats* Get() {
 		static auto&         enabled = Common::LiveSwitches::Get("KYTY_READBACK_STATS", 0);
 		static ReadbackStats stats;
 		return enabled.load(std::memory_order_relaxed) != 0 ? &stats : nullptr;
 	}
 
+	template <typename IsFinished>
+	Writer FindWriter(uint64_t vaddr, IsFinished&& is_finished) const {
+		// Newest first.
+		for (size_t i = 0; i < m_marks.size(); i++) {
+			const auto& mark = m_marks[(m_next_mark + m_marks.size() - 1 - i) % m_marks.size()];
+			if (mark.end == 0 || vaddr < mark.begin || vaddr >= mark.end) {
+				continue;
+			}
+			const auto age_ms = std::chrono::duration<double, std::milli>(
+			                        std::chrono::steady_clock::now() - mark.time)
+			                        .count();
+			const uint32_t age = age_ms < 1     ? 0
+			                     : age_ms < 10  ? 1
+			                     : age_ms < 50  ? 2
+			                     : age_ms < 250 ? 3
+			                                    : 4;
+			return {true, is_finished(mark.tick), age, mark.shader, mark.end - mark.begin};
+		}
+		return {};
+	}
+
 	void Record(uint64_t buffer_begin, uint64_t buffer_size, uint64_t vaddr, bool is_write,
-	            Outcome outcome, uint64_t download_bytes, double micros) {
+	            Outcome outcome, uint64_t download_bytes, const Writer& writer, double micros) {
 		auto& entry = m_entries[buffer_begin];
 		entry.size  = buffer_size;
 		(is_write ? entry.writes : entry.reads)++;
@@ -92,6 +164,14 @@ private:
 		entry.download_bytes += download_bytes;
 		entry.micros += micros;
 		entry.pages.insert(vaddr >> 12u);
+		if (writer.found) {
+			(writer.finished ? entry.writer_finished : entry.writer_running)++;
+			entry.writer_age[writer.age]++;
+			entry.writer_shaders[writer.shader]++;
+			entry.writer_size = std::max(entry.writer_size, writer.size);
+		} else if (outcome == Downloaded) {
+			entry.writer_unknown++;
+		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now - m_last >= std::chrono::seconds(5)) {
 			Print();
@@ -110,8 +190,11 @@ private:
 		std::ranges::sort(sorted, [](const auto& a, const auto& b) {
 			return a.second->micros > b.second->micros;
 		});
-		::printf("Readback stats (5 s): %zu buffers, %.1f ms on the GPU thread\n", sorted.size(),
-		         total / 1000.0);
+		const auto changed  = s_changed_bytes.exchange(0, std::memory_order_relaxed);
+		const auto compared = s_compared_bytes.exchange(0, std::memory_order_relaxed);
+		::printf("Readback stats (5 s): %zu buffers, %.1f ms on the GPU thread; downloads changed "
+		         "%" PRIu64 " of %" PRIu64 " KiB of guest memory\n",
+		         sorted.size(), total / 1000.0, changed / 1024, compared / 1024);
 		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
 			const auto& [begin, e] = sorted[i];
 			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
@@ -121,21 +204,50 @@ private:
 			         begin, e->size / 1024, e->writes, e->reads, e->outcomes[Unregistered],
 			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->download_bytes / 1024,
 			         e->outcomes[NothingToDownload], e->pages.size(), e->micros / 1000.0);
+			if (e->writer_finished + e->writer_running + e->writer_unknown == 0) {
+				continue;
+			}
+			::printf("    writer: finished %" PRIu64 " still-running %" PRIu64 " unknown %" PRIu64
+			         "; bound <1ms %" PRIu64 " <10ms %" PRIu64 " <50ms %" PRIu64 " <250ms %" PRIu64
+			         " older %" PRIu64 "; largest binding %" PRIu64 " KiB; shaders",
+			         e->writer_finished, e->writer_running, e->writer_unknown, e->writer_age[0],
+			         e->writer_age[1], e->writer_age[2], e->writer_age[3], e->writer_age[4],
+			         e->writer_size / 1024);
+			std::vector<std::pair<uint64_t, uint64_t>> shaders(e->writer_shaders.begin(),
+			                                                   e->writer_shaders.end());
+			std::ranges::sort(shaders,
+			                  [](const auto& a, const auto& b) { return a.second > b.second; });
+			for (size_t s = 0; s < std::min<size_t>(shaders.size(), 4); s++) {
+				::printf(" 0x%016" PRIx64 " x%" PRIu64, shaders[s].first, shaders[s].second);
+			}
+			::printf("\n");
 		}
 		std::fflush(stdout);
 	}
 
 	struct Entry {
-		uint64_t                     size   = 0;
-		uint64_t                     writes = 0;
-		uint64_t                     reads  = 0;
-		uint64_t                     outcomes[OutcomeCount] {};
-		uint64_t                     download_bytes = 0;
-		double                       micros         = 0;
-		std::unordered_set<uint64_t> pages;
+		uint64_t                               size   = 0;
+		uint64_t                               writes = 0;
+		uint64_t                               reads  = 0;
+		uint64_t                               outcomes[OutcomeCount] {};
+		uint64_t                               download_bytes = 0;
+		double                                 micros         = 0;
+		std::unordered_set<uint64_t>           pages;
+		uint64_t                               writer_finished = 0;
+		uint64_t                               writer_running  = 0;
+		uint64_t                               writer_unknown  = 0;
+		uint64_t                               writer_age[AgeBuckets] {};
+		uint64_t                               writer_size = 0;
+		std::unordered_map<uint64_t, uint64_t> writer_shaders;
 	};
 	std::unordered_map<uint64_t, Entry>   m_entries;
 	std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
+	std::array<Mark, 1024>                m_marks {};
+	size_t                                m_next_mark = 0;
+
+	inline static thread_local uint64_t s_shader = 0;
+	inline static std::atomic<uint64_t> s_changed_bytes {0};
+	inline static std::atomic<uint64_t> s_compared_bytes {0};
 };
 
 bool AsyncWriteReadbackEnabled() {
@@ -159,6 +271,10 @@ uint64_t ReadbackWindowSize() {
 }
 
 } // namespace
+
+void BufferCache::SetReadbackStatsShader(uint64_t hash) {
+	ReadbackStats::SetShader(hash);
+}
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
@@ -345,6 +461,23 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		if (ReadbackStats::On()) {
+			uint64_t             changed = 0;
+			uint64_t             total   = 0;
+			std::vector<uint8_t> current;
+			for (const auto& copy: copies) {
+				current.resize(copy.size);
+				const auto* downloaded = mapped + (copy.dstOffset - offset);
+				if (Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset,
+				                                            current.data(), copy.size)) {
+					for (uint64_t b = 0; b < copy.size; b++) {
+						changed += current[b] != downloaded[b] ? 1 : 0;
+					}
+					total += copy.size;
+				}
+			}
+			ReadbackStats::NoteCompare(changed, total);
+		}
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
@@ -513,6 +646,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 	if (stats.Enabled()) {
+		stats.FindWriter([this](uint64_t tick) { return m_scheduler.IsFree(tick); });
 		uint64_t         dirty_bytes = 0;
 		std::shared_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.ForEachInRange(
@@ -870,6 +1004,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	if (is_written) {
+		ReadbackStats::NoteWrite(vaddr, size, m_scheduler.CurrentTick());
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
