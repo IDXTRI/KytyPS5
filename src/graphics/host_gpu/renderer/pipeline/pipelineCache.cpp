@@ -1487,13 +1487,6 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[slot]       = bc.color_srcblend;
-		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-		static_params.color_destblend[slot]      = bc.color_destblend;
-		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
@@ -1511,6 +1504,17 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		if (alpha_remap) {
 			static_params.blend_alpha_source_remap = true;
+		}
+		if (static_params.blend_enable[slot]) {
+			static_params.color_srcblend[slot]       = bc.color_srcblend;
+			static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
+			static_params.color_destblend[slot]      = bc.color_destblend;
+			static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
+			if (bc.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = bc.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = bc.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = bc.alpha_destblend;
+			}
 		}
 	}
 	const bool with_depth =

@@ -14445,11 +14445,14 @@ public:
                 "last-vertex flat shading changed coverage or did not use vertex two");
       }
 
-      const auto blend_pipeline = [&](bool enabled, bool bypass) -> PipelineCache::Pipeline & {
+      const auto blend_pipeline = [&](bool enabled, bool bypass,
+                                      bool alternate = false) -> PipelineCache::Pipeline & {
         auto blend = registers.GetBlendControl(0);
         blend.enable = enabled;
-        blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
-        blend.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+        blend.color_srcblend = static_cast<uint8_t>(alternate ? Prospero::BlendFactor::kOne
+                                                            : Prospero::BlendFactor::kZero);
+        blend.alpha_srcblend = blend.color_srcblend;
+        blend.separate_alpha_blend = alternate;
         registers.SetBlendControl(0, blend);
         auto target = registers.GetRenderTarget(0).info;
         target.blend_bypass = bypass;
@@ -14459,13 +14462,21 @@ public:
       auto &disabled_blend = blend_pipeline(false, false);
       Require(name, "effective blend pipeline cache",
               blend_pipeline(false, true).pipeline == disabled_blend.pipeline &&
-                  blend_pipeline(true, true).pipeline == disabled_blend.pipeline,
+                  blend_pipeline(true, true).pipeline == disabled_blend.pipeline &&
+                  blend_pipeline(false, false, true).pipeline == disabled_blend.pipeline &&
+                  blend_pipeline(true, true, true).pipeline == disabled_blend.pipeline,
               "disabled and bypassed blending did not share the same host pipeline");
       auto &enabled_blend = blend_pipeline(true, false);
       Require(name, "enabled blend pipeline cache",
               enabled_blend.pipeline != disabled_blend.pipeline &&
                   blend_pipeline(true, false).pipeline == enabled_blend.pipeline,
               "active blending was lost from the pipeline key or missed its cached pipeline");
+      auto dormant_alpha = registers.GetBlendControl(0);
+      dormant_alpha.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, dormant_alpha);
+      Require(name, "dormant alpha blend pipeline cache",
+              pipeline(true, 2, 2).pipeline == enabled_blend.pipeline,
+              "inactive separate-alpha state recompiled the pipeline");
       draw(enabled_blend);
       const auto blended_pixels = read_color();
       Require(name, "active blend output",
