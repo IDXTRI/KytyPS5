@@ -514,6 +514,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	m_last_submit_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count(),
+	                       std::memory_order_relaxed);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);

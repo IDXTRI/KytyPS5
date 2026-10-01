@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,10 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Steady-clock time of the last vkQueueSubmit, in microseconds.
+	[[nodiscard]] int64_t LastSubmitUs() const noexcept {
+		return m_last_submit_us.load(std::memory_order_relaxed);
+	}
 
 private:
 	class CommandPool {
@@ -102,6 +107,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::atomic<int64_t>         m_last_submit_us {0};
 };
 
 } // namespace Libs::Graphics

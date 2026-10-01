@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -1405,7 +1407,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		}
 		if (LabelsAfterGpu()) {
 			// Submit so the tick can complete; the label and any interrupt follow it.
-			GetScheduler().Flush();
+			FlushForLabel();
 		}
 	};
 
@@ -1473,7 +1475,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						Sync::WriteAtEndOfPipe64(m_submit_id, command, dst, value);
 					}
 					if (LabelsAfterGpu()) {
-						GetScheduler().Flush();
+						FlushForLabel();
 					}
 				};
 
@@ -1765,6 +1767,26 @@ void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint3
 		LibKernel::Memory::WriteBacking(reinterpret_cast<uint64_t>(dst), &data, bytes);
 		renderer.GetGpu().Wake();
 	});
+}
+
+// Research: a submit per EOP label let each label complete as early as possible, but Wolverine
+// writes thousands per frame and vkQueueSubmit took about a quarter of Thread_Gpu. The label is
+// published by the completion thread whenever its tick completes, and every processed slice ends
+// with a flush (a slice blocked on WAIT_REG_MEM too), so batching cannot deadlock: it only delays
+// a label by up to KYTY_LABEL_FLUSH_US after the previous submit. 0 submits on every label.
+void CommandProcessor::FlushForLabel() {
+	static auto& interval_us = Common::LiveSwitches::Get("KYTY_LABEL_FLUSH_US", 0);
+	const auto   interval    = interval_us.load(std::memory_order_relaxed);
+	auto&        scheduler   = GetScheduler();
+	if (interval > 0) {
+		const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                        std::chrono::steady_clock::now().time_since_epoch())
+		                        .count();
+		if (now_us - scheduler.LastSubmitUs() < interval) {
+			return;
+		}
+	}
+	scheduler.Flush();
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
