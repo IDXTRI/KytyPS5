@@ -148,6 +148,9 @@ private:
 
 	// GPU thread: a guest fault on GPU-written memory, resolved synchronously.
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	// GPU thread: KYTY_DIRECT_READBACK (see bufferCache.cpp).
+	[[nodiscard]] bool TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                     bool is_write);
 	// KYTY_ASYNC_WRITE_READBACK (see ReadMemory). A window whose download is submitted but not
 	// yet published to guest memory; its pages stay GPU-owned until the readback is completed.
 	// Only the GPU thread touches the list.
@@ -180,6 +183,7 @@ private:
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	std::vector<PendingWriteReadback>                  m_pending_write_readbacks;
+	uint64_t                                           m_direct_readbacks = 0;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	StreamBuffer                                       m_stream_buffer;

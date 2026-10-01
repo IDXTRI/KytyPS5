@@ -43,7 +43,14 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 // memory. Only the GPU thread records, except the byte comparison (download completions).
 class ReadbackStats {
 public:
-	enum Outcome : uint32_t { Unregistered, Unmarked, Downloaded, NothingToDownload, OutcomeCount };
+	enum Outcome : uint32_t {
+		Unregistered,
+		Unmarked,
+		Downloaded,
+		NothingToDownload,
+		DirectRead,
+		OutcomeCount
+	};
 	static constexpr uint32_t AgeBuckets = 5; // <1 ms, <10 ms, <50 ms, <250 ms, older
 
 	struct Writer {
@@ -200,10 +207,11 @@ private:
 			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
 			         " reads %" PRIu64 ", unregistered %" PRIu64 " unmarked %" PRIu64
 			         " downloaded %" PRIu64 " (%" PRIu64 " KiB) nothing-to-download %" PRIu64
-			         ", %zu pages, %.1f ms\n",
+			         " direct-read %" PRIu64 ", %zu pages, %.1f ms\n",
 			         begin, e->size / 1024, e->writes, e->reads, e->outcomes[Unregistered],
 			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->download_bytes / 1024,
-			         e->outcomes[NothingToDownload], e->pages.size(), e->micros / 1000.0);
+			         e->outcomes[NothingToDownload], e->outcomes[DirectRead], e->pages.size(),
+			         e->micros / 1000.0);
 			if (e->writer_finished + e->writer_running + e->writer_unknown == 0) {
 				continue;
 			}
@@ -249,6 +257,11 @@ private:
 	inline static std::atomic<uint64_t> s_changed_bytes {0};
 	inline static std::atomic<uint64_t> s_compared_bytes {0};
 };
+
+bool DirectReadbackEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_DIRECT_READBACK", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
 
 bool AsyncWriteReadbackEnabled() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_WRITE_READBACK", 0);
@@ -639,6 +652,11 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		return;
 	}
 
+	if (TryDirectReadback(buffer, vaddr, size, is_write)) {
+		stats.SetOutcome(ReadbackStats::DirectRead);
+		return;
+	}
+
 	// Widen nearby CPU reads so they share one GPU drain.
 	const uint64_t WindowSize   = ReadbackWindowSize();
 	const auto     buffer_begin = buffer.CpuAddress();
@@ -667,6 +685,44 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
+}
+
+// KYTY_DIRECT_READBACK=1 (a live switch, off by default): when the buffer lives in host-visible
+// device memory and every GPU write recorded into it has completed, the faulting pages' GPU-written
+// bytes are copied straight from the mapping into guest memory: no GPU copy, submission or drain.
+// Submissions end with a device-to-host barrier while such buffers exist (CommandScheduler).
+bool BufferCache::TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_write) {
+	if (!DirectReadbackEnabled() || buffer.Mapped().empty() ||
+	    !m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+		return false;
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (!buffer.IsInBounds(page_begin, page_end - page_begin) ||
+	    OverlapsPendingWriteReadback(page_begin, page_end)) {
+		return false;
+	}
+	{
+		KYTY_PROFILER_BLOCK("BufferCache::DirectReadback");
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		// A queued download of these bytes would publish them again when it lands.
+		if (m_downloading_ranges.Intersects(page_begin, page_end - page_begin)) {
+			return false;
+		}
+		const auto* mapped = buffer.Mapped().data();
+		m_gpu_modified_ranges.ForEachInRange(
+		    page_begin, page_end - page_begin, [&](uint64_t start, uint64_t end) {
+			    Libs::LibKernel::Memory::WriteBacking(start, mapped + buffer.Offset(start),
+			                                          end - start);
+		    });
+		m_gpu_modified_ranges.Subtract(page_begin, page_end - page_begin);
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+	m_direct_readbacks++;
+	return true;
 }
 
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
@@ -849,6 +905,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	new_buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 	DeleteBuffer(overlap_id);
 }
 
@@ -1007,6 +1064,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	if (is_written) {
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 		ReadbackStats::NoteWrite(vaddr, size, m_scheduler.CurrentTick());
 	}
 	return {&buffer, buffer.Offset(vaddr)};

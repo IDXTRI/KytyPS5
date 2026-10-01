@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -172,6 +173,10 @@ struct BufferCacheTestAccess {
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
+  }
+
+  static uint64_t DirectReadbacks(const BufferCache &cache) {
+    return cache.m_direct_readbacks;
   }
 
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
@@ -4027,6 +4032,9 @@ public:
               "wrapped fault batch published incorrect disjoint ranges");
 
       constexpr uint64_t window_size = 512 * 1024;
+      auto &window_switch =
+          Common::LiveSwitches::Get("KYTY_READBACK_WINDOW_KB", 2048);
+      const auto saved_window = window_switch.exchange(window_size / 1024);
       constexpr uint64_t window_owner_offset = 0x240000;
       constexpr uint64_t window_owner_size = 0xc0000;
       constexpr uint64_t window_fault_offset = window_owner_offset + 0x100;
@@ -4072,6 +4080,52 @@ public:
                                             sizeof(window_value)),
               "readback did not honor the clamped half-open 512 KiB window");
       cache.ReadMemory(base + window_outside_offset, sizeof(window_value));
+      window_switch.store(saved_window);
+
+      // KYTY_DIRECT_READBACK: a finished GPU write into a buffer in host-visible device
+      // memory is read straight from the mapping into guest memory, without a download.
+      {
+        auto &mapped_switch =
+            Common::LiveSwitches::Get("KYTY_MAPPED_DEVICE_BUFFERS", 0);
+        auto &direct_switch = Common::LiveSwitches::Get("KYTY_DIRECT_READBACK", 0);
+        const auto saved_mapped = mapped_switch.exchange(1);
+        const auto saved_direct = direct_switch.exchange(1);
+        constexpr uint64_t direct_read_offset = 0x3000100;
+        constexpr uint32_t direct_stale = 0x31415926u;
+        constexpr uint32_t direct_value = 0x27182818u;
+        Libs::LibKernel::Memory::WriteBacking(base + direct_read_offset,
+                                              &direct_stale, sizeof(direct_stale));
+        MarkGpuWrite(base + direct_read_offset, sizeof(direct_value));
+        cache.FillBuffer(base + direct_read_offset, sizeof(direct_value),
+                         direct_value, false);
+        const auto owner =
+            BufferCacheTestAccess::PageOwner(cache, base + direct_read_offset);
+        const bool mapped_owner =
+            owner && !cache.GetBuffer(owner).Mapped().empty();
+        scheduler.Finish();
+        const auto direct_before = BufferCacheTestAccess::DirectReadbacks(cache);
+        cache.ReadMemory(base + direct_read_offset, sizeof(direct_value));
+        uint32_t direct_backing = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + direct_read_offset,
+                                                &direct_backing,
+                                                sizeof(direct_backing));
+        Require(name, "direct readback",
+                direct_backing == direct_value &&
+                    !cache.HasGpuDirtyBytes(base + direct_read_offset,
+                                            sizeof(direct_value)) &&
+                    !cache.IsRegionGpuModified(base + direct_read_offset,
+                                               sizeof(direct_value)) &&
+                    (!mapped_owner ||
+                     BufferCacheTestAccess::DirectReadbacks(cache) ==
+                         direct_before + 1),
+                "a finished GPU write was not published through the mapping");
+        if (!mapped_owner) {
+          std::printf("[host]    (no host-visible device memory: direct readback "
+                      "took the download path)\n");
+        }
+        mapped_switch.store(saved_mapped);
+        direct_switch.store(saved_direct);
+      }
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
                                             sizeof(first_stale));

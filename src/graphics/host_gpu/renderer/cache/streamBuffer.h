@@ -35,6 +35,12 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// KYTY_MAPPED_DEVICE_BUFFERS=1 (read when a buffer is created): buffers that mirror guest
+// memory are allocated in host-visible device memory (resizable BAR) when the device has it,
+// so the buffer cache can read finished GPU writes without a GPU copy. True once any such
+// buffer exists; submissions then make device writes visible to the host.
+[[nodiscard]] bool AnyMappedDeviceBuffer() noexcept;
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
@@ -70,6 +76,8 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
+	// Tick of the last recorded GPU write into the buffer (BufferCache direct readback).
+	uint64_t last_gpu_write_tick = 0;
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;

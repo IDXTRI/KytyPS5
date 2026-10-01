@@ -2,10 +2,12 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <atomic>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -40,6 +42,13 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 }
 
+std::atomic_bool g_any_mapped_device_buffer {false};
+
+[[nodiscard]] bool MappedDeviceBuffersRequested() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_MAPPED_DEVICE_BUFFERS", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
 [[nodiscard]] bool AlignUp(uint64_t value, uint64_t alignment, uint64_t& result) {
 	if (alignment == 0) {
 		result = value;
@@ -54,6 +63,10 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 }
 
 } // namespace
+
+bool AnyMappedDeviceBuffer() noexcept {
+	return g_any_mapped_device_buffer.load(std::memory_order_relaxed);
+}
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
@@ -79,9 +92,29 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result        = vk::Result::eErrorOutOfDeviceMemory;
+	const bool        mappable =
+	    usage == MemoryUsage::DeviceLocal && cpu_address != 0 && MappedDeviceBuffersRequested();
+	if (mappable) {
+		// Only memory that is both device-local and host-visible: never system memory.
+		auto mapped_info = allocation_info;
+		mapped_info.flags |=
+		    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		mapped_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                    &mapped_info, &native_buffer, &m_allocation, &allocation_result));
+		if (result == vk::Result::eSuccess) {
+			g_any_mapped_device_buffer.store(true, std::memory_order_relaxed);
+		}
+	}
+	if (result != vk::Result::eSuccess) {
+		result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
