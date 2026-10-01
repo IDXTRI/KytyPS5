@@ -94,6 +94,9 @@ private:
 	void              Wake();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// KYTY_SLICE_FLUSH_US (see graphicsRun.cpp). GPU thread.
+	void              FlushSlice(CommandProcessor& cp, bool complete);
+	void              FlushPendingSlices();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -135,6 +138,8 @@ private:
 	// KYTY_LABELS_AFTER_GPU: the last value recorded for each label and the scheduler tick that
 	// publishes it. An entry is stale once its tick has completed. GPU thread only.
 	std::unordered_map<uint64_t, RecordedLabel> m_recorded_labels;
+	// A completed slice skipped its submit (KYTY_SLICE_FLUSH_US). GPU thread only.
+	bool m_slice_flush_pending = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

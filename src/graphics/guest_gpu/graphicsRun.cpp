@@ -685,15 +685,23 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		// Commands a gated slice left unsubmitted go to the GPU before this thread waits.
+		bool flush_pending = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_slice_flush_pending) {
+					flush_pending = true;
+					break;
+				}
 				KYTY_PROFILER_BLOCK("GuestGpu::WaitForWork");
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (flush_pending) {
+				gpu->m_processing = true;
+			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				gpu->m_suspend_point_done.SignalAll();
@@ -712,7 +720,10 @@ void GuestGpu::ThreadRun(void* data) {
 						break;
 					}
 				}
-				if (selected_queue < 0) {
+				if (selected_queue < 0 && gpu->m_slice_flush_pending) {
+					flush_pending     = true;
+					gpu->m_processing = true;
+				} else if (selected_queue < 0) {
 					gpu->m_processing = false;
 					{
 						KYTY_PROFILER_BLOCK("GuestGpu::WaitBlockedQueues");
@@ -724,15 +735,20 @@ void GuestGpu::ThreadRun(void* data) {
 						}
 					}
 					continue;
+				} else {
+					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+					submission  = std::move(queue.front());
+					queue.pop_front();
+					gpu->m_submission_count--;
+					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+					gpu->m_processing = true;
+					has_submission    = true;
 				}
-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
-				queue.pop_front();
-				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
-				has_submission    = true;
 			}
+		}
+		if (flush_pending) {
+			gpu->FlushPendingSlices();
+			continue;
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
@@ -775,6 +791,37 @@ void GuestGpu::ThreadRun(void* data) {
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 			gpu->m_idle.SignalAll();
 		}
+	}
+}
+
+// Research: KYTY_SLICE_FLUSH_US=N (live, 0 = off). Every processed slice of a guest submission
+// ended with a submit: in Wolverine ~800 per second, most of them small async-compute
+// submissions, each a ~50 us kernel call on Thread_Gpu. With label waits forwarded and labels
+// batched, a completed slice no longer has to submit at once: it does when N microseconds have
+// passed since the last submit, and otherwise its commands go with the next one. A slice that
+// blocks always submits, and so does the GPU thread before it waits for work or for blocked
+// queues (FlushPendingSlices), so nothing waits on commands that were never submitted.
+void GuestGpu::FlushSlice(CommandProcessor& cp, bool complete) {
+	static auto& interval_us = Common::LiveSwitches::Get("KYTY_SLICE_FLUSH_US", 0);
+	const auto   interval    = interval_us.load(std::memory_order_relaxed);
+	if (complete && interval > 0) {
+		const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                        std::chrono::steady_clock::now().time_since_epoch())
+		                        .count();
+		if (now_us - m_renderer.GetCommandScheduler().LastSubmitUs() < interval) {
+			m_slice_flush_pending = true;
+			return;
+		}
+	}
+	m_slice_flush_pending = false;
+	cp.BufferFlush();
+}
+
+void GuestGpu::FlushPendingSlices() {
+	EXIT_IF(!IsGpuThread());
+	if (m_slice_flush_pending) {
+		m_slice_flush_pending = false;
+		m_gfx_cp->BufferFlush();
 	}
 }
 
@@ -828,7 +875,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				FlushSlice(cp, complete);
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -854,7 +901,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				FlushSlice(cp, complete);
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
