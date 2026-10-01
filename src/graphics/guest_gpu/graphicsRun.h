@@ -46,6 +46,11 @@ public:
 	void DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size);
 	template <typename T>
 	[[nodiscard]] T ReadLabel(const volatile T* address) const;
+	// GPU thread. KYTY_LABELS_AFTER_GPU: a label recorded at `tick`, published when it completes.
+	void NoteRecordedLabel(uint64_t address, uint64_t value, uint32_t size, uint64_t tick);
+	// GPU thread. The recorded value of a label whose publishing tick has not completed yet.
+	template <typename T>
+	[[nodiscard]] bool FindRecordedLabel(const volatile T* address, T* value);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void              Submit(std::span<const uint32_t> draw_commands,
@@ -121,6 +126,15 @@ private:
 	// Label writes recorded but not yet visible to the CPU. GPU thread only.
 	std::unordered_map<uint64_t, PendingLabel> m_pending_labels;
 	uint64_t                                   m_label_sequence = 0;
+
+	struct RecordedLabel {
+		uint64_t value = 0;
+		uint32_t size  = 0;
+		uint64_t tick  = 0;
+	};
+	// KYTY_LABELS_AFTER_GPU: the last value recorded for each label and the scheduler tick that
+	// publishes it. An entry is stale once its tick has completed. GPU thread only.
+	std::unordered_map<uint64_t, RecordedLabel> m_recorded_labels;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

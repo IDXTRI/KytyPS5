@@ -204,6 +204,33 @@ T GuestGpu::ReadLabel(const volatile T* address) const {
 template uint32_t GuestGpu::ReadLabel<uint32_t>(const volatile uint32_t*) const;
 template uint64_t GuestGpu::ReadLabel<uint64_t>(const volatile uint64_t*) const;
 
+void GuestGpu::NoteRecordedLabel(uint64_t address, uint64_t value, uint32_t size, uint64_t tick) {
+	if (!IsGpuThread()) {
+		return; // only forwarded waits need it; they run on the GPU thread
+	}
+	m_recorded_labels[address] = {value, size, tick};
+}
+
+template <typename T>
+bool GuestGpu::FindRecordedLabel(const volatile T* address, T* value) {
+	EXIT_IF(!IsGpuThread());
+	const auto recorded = m_recorded_labels.find(reinterpret_cast<uint64_t>(address));
+	if (recorded == m_recorded_labels.end()) {
+		return false;
+	}
+	if (recorded->second.size < sizeof(T) ||
+	    m_renderer.GetCommandScheduler().IsFree(recorded->second.tick)) {
+		// Published (or about to be): guest memory is the truth from here on.
+		m_recorded_labels.erase(recorded);
+		return false;
+	}
+	*value = static_cast<T>(recorded->second.value);
+	return true;
+}
+
+template bool GuestGpu::FindRecordedLabel<uint32_t>(const volatile uint32_t*, uint32_t*);
+template bool GuestGpu::FindRecordedLabel<uint64_t>(const volatile uint64_t*, uint64_t*);
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -478,9 +505,37 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+	if (TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+		return;
+	}
+	// Research: KYTY_LABEL_WAIT_FORWARD=1. With KYTY_LABELS_AFTER_GPU a label this GPU recorded
+	// stays invisible until its tick completes, so a wait on it parked Thread_Gpu until the host
+	// GPU caught up (Wolverine: ~28% of Thread_Gpu idle with every queue blocked). Everything
+	// recorded before the label is ahead in the same Vulkan queue, so a full barrier gives the
+	// commands after the wait the ordering the wait promised, and recording can go on.
+	static auto&                 forward = Common::LiveSwitches::Get("KYTY_LABEL_WAIT_FORWARD", 0);
+	static std::atomic<uint64_t> suspended {0};
+	static std::atomic<uint64_t> forwarded {0};
+	static std::atomic<uint64_t> forwardable {0};
+	static auto                  report_time = std::chrono::steady_clock::now();
+	T                            recorded    = 0;
+	const bool can_forward = m_renderer.GetGpu().FindRecordedLabel(addr, &recorded) &&
+	                         TestWaitRegMemValue(recorded, ref, mask, func);
+	if (can_forward && forward.load(std::memory_order_relaxed) != 0) {
+		forwarded++;
+		EmitGlobalBarrier();
+	} else {
+		(can_forward ? forwardable : suspended)++;
 		KYTY_PROFILER_BLOCK("Pm4Suspend::WaitRegMem");
 		SuspendPm4();
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - report_time >= std::chrono::seconds(5)) {
+		report_time = now;
+		::printf("Label waits (5 s): suspended %" PRIu64 ", forwardable %" PRIu64
+		         ", forwarded %" PRIu64 "\n",
+		         suspended.exchange(0), forwardable.exchange(0), forwarded.exchange(0));
+		std::fflush(stdout);
 	}
 }
 
@@ -1761,6 +1816,10 @@ void CommandProcessor::SynchronizeGpu() {
 void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint32_t bytes,
                                                 bool clock) {
 	auto& renderer = m_renderer;
+	if (!clock) {
+		renderer.GetGpu().NoteRecordedLabel(reinterpret_cast<uint64_t>(dst), value, bytes,
+		                                    GetScheduler().CurrentTick());
+	}
 	GetScheduler().DeferPriorityOperation([&renderer, dst, value, bytes, clock] {
 		const uint64_t data = clock ? Sync::ReadReferenceClock() : value;
 		// The backing write cannot fault into the caches from this thread.
