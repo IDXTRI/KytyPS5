@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -214,6 +215,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	Transit(destination_layout, destination_access, range, CommandRecorder(command_buffer));
+}
+
+void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+                    std::optional<ImageSubresourceRange> range,
+                    const CommandRecorder&               command_buffer) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

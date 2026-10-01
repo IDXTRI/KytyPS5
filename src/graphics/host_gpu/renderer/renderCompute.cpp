@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -555,7 +556,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	do {
 		RebindImages(bindings);
 		RebindBuffers(bindings);
-		auto              vk_buffer        = buffer.Handle();
+		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
@@ -650,7 +651,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
-		const auto vk_buffer = buffer.Handle();
+		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    HasShaderBufferWrites(input_info.stage) ||
 		    std::any_of(

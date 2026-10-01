@@ -26,6 +26,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	// Idle until KYTY_RECORD_THREAD turns on for a command buffer (commandScheduler.cpp).
+	m_command_scheduler.EnableRecordingThread();
 }
 
 RenderContext::~RenderContext() {

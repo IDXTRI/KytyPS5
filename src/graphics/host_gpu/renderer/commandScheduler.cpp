@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>
@@ -66,12 +67,12 @@ size_t CommandScheduler::CommandPool::Grow() {
 	return first;
 }
 
-vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search = [this, &gpu_tick, tick](size_t begin, size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = tick;
 				return index;
 			}
 		}
@@ -89,7 +90,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = tick;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
@@ -240,6 +241,7 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	StopRecordingThread();
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -456,44 +458,44 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	static auto& record_thread = Common::LiveSwitches::Get("KYTY_RECORD_THREAD", 0);
+	const bool   threaded =
+	    m_record_thread.joinable() && record_thread.load(std::memory_order_relaxed) != 0;
+	if (!threaded && m_record_thread.joinable()) {
+		// The recording thread may still be ending or submitting the previous command buffer, and
+		// the pool must not be used by two threads.
+		(void)DrainRecording();
+	}
+	m_threaded           = threaded;
+	m_command.m_threaded = threaded;
+	m_command.m_open     = true;
+	if (threaded) {
+		BeginThreadedCommand();
+		return m_command;
+	}
+	m_command.m_buffer = m_command_pool.Commit(m_master.CurrentTick());
 	m_command.Begin();
 	m_gpu_timer->Collect([this](uint64_t tick) { return IsFree(tick); });
-	m_gpu_timer->Begin(m_command.Handle());
+	m_gpu_timer->Begin(m_command.m_buffer);
 	return m_command;
 }
 
-uint64_t CommandScheduler::Submit(SubmitInfo submit) {
-	EXIT_IF(m_command.IsInvalid());
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+// The final barrier and the queue submission of a command buffer, for both the GPU thread and
+// the recording thread.
+struct CommandScheduler::SubmitDebug {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0 = 0, arg1 = 0, arg2 = 0, arg3 = 0;
+	uint64_t arg4 = 0;
+};
 
-	if (AnyMappedDeviceBuffer()) {
-		// Buffers in host-visible device memory are read by the host once this submission's
-		// tick completes (BufferCache direct readback): make its writes visible to the host.
-		m_command.EndRendering();
-		vk::MemoryBarrier2 barrier {};
-		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
-		barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
-		vk::DependencyInfo dependency {};
-		dependency.memoryBarrierCount = 1;
-		dependency.pMemoryBarriers    = &barrier;
-		m_command.Handle().pipelineBarrier2(dependency);
-	}
-	m_command.EndRendering();
-	m_gpu_timer->End(m_command.Handle());
-	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
+void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+                                   const SubmitDebug& debug) {
+	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
-
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -523,16 +525,218 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		DumpDeviceLossDiagnostics(graphics);
 	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, debug.op, debug.submit_id, debug.arg0,
+		                  debug.arg1, debug.arg2, debug.arg3, debug.arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	m_command.m_buffer = nullptr;
 	m_gpu_timer->Submitted(tick);
+}
+
+uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	EXIT_IF(m_command.IsInvalid());
+	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
+	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+
+	if (AnyMappedDeviceBuffer()) {
+		// Buffers in host-visible device memory are read by the host once this submission's
+		// tick completes (BufferCache direct readback): make its writes visible to the host.
+		m_command.EndRendering();
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		m_command.Recorder().pipelineBarrier2(dependency);
+	}
+	m_command.EndRendering();
+	const SubmitDebug debug {m_command.m_debug_op,   m_command.m_debug_submit_id,
+	                         m_command.m_debug_arg0, m_command.m_debug_arg1,
+	                         m_command.m_debug_arg2, m_command.m_debug_arg3,
+	                         m_command.m_debug_arg4};
+	if (m_threaded) {
+		return SubmitThreaded(submit, debug);
+	}
+	m_gpu_timer->End(m_command.m_buffer);
+	m_command.End();
+	uint64_t tick = 0;
+	{
+		// The tick is taken under the queue lock in this path, as before.
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		tick = m_master.NextTick();
+	}
+	QueueSubmit(m_command.m_buffer, submit, tick, debug);
+	m_command.m_buffer = nullptr;
+	m_command.m_open   = false;
 	return tick;
+}
+
+// Research: KYTY_RECORD_THREAD=1 (live, per command buffer; default 0). Thread_Gpu spent ~15-20 %
+// of its time inside the Vulkan driver recording and submitting. With the switch on, the
+// renderer's scheduler hands the Vulkan calls of the current command buffer to a recording
+// thread: CommandRecorder (Recorder()) and Record() queue them in order, with every array they
+// point to copied into the command chunk; the recording thread owns the command pool, begins,
+// ends and submits the command buffers. Ticks are still assigned here, in order, when a command
+// buffer is submitted, so everything keyed by ticks is unchanged; a host wait on a tick the
+// recording thread has not submitted yet just waits longer (timeline semaphores allow it).
+// Code that still records through the raw Handle() first waits for the recording thread to
+// catch up (DrainRecording), so it stays correct, only slower.
+void CommandScheduler::EnableRecordingThread() {
+	EXIT_IF(m_record_thread.joinable());
+	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+}
+
+void CommandScheduler::BeginThreadedCommand() {
+	static std::atomic_bool announced = false;
+	if (!announced.exchange(true, std::memory_order_relaxed)) {
+		::printf("Record thread: first threaded command buffer\n");
+		std::fflush(stdout);
+	}
+	m_command.m_buffer = nullptr;
+	m_command.InvalidateDynamicState();
+	const auto tick = m_master.CurrentTick();
+	Record([this, tick](vk::CommandBuffer) {
+		m_worker_buffer = m_command_pool.Commit(tick);
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+		m_gpu_timer->Collect([this](uint64_t done) { return IsFree(done); });
+		m_gpu_timer->Begin(m_worker_buffer);
+	});
+}
+
+uint64_t CommandScheduler::SubmitThreaded(SubmitInfo submit, const SubmitDebug& debug) {
+	const auto tick = m_master.NextTick();
+	Record([this, submit, tick, debug](vk::CommandBuffer command) mutable {
+		m_gpu_timer->End(command);
+		EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
+		QueueSubmit(command, submit, tick, debug);
+		m_worker_buffer = nullptr;
+	});
+	DispatchChunk();
+	m_command.m_buffer = nullptr;
+	m_command.m_open   = false;
+
+	// Every 5 s: threaded command buffers, chunks handed over, and drains (raw Handle() uses,
+	// which make Thread_Gpu wait for the recording thread: the sites still to convert).
+	m_record_stats.buffers++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_record_stats.report >= std::chrono::seconds(5)) {
+		uint64_t chunks = 0;
+		{
+			std::lock_guard lock(m_record_mutex);
+			chunks = m_chunks_dispatched;
+		}
+		::printf("Record thread (5 s): %" PRIu64 " command buffers, %" PRIu64 " chunks, %" PRIu64
+		         " drains\n",
+		         m_record_stats.buffers, chunks - m_record_stats.chunks, m_record_stats.drains);
+		std::fflush(stdout);
+		m_record_stats = {.chunks = chunks, .report = now};
+	}
+	return tick;
+}
+
+void* CommandScheduler::Allocate(size_t size, size_t alignment) {
+	EXIT_IF(!m_threaded || size > Chunk::Size);
+	const auto take = [this] {
+		std::lock_guard lock(m_record_mutex);
+		if (m_free_chunks.empty()) {
+			return std::make_unique<Chunk>();
+		}
+		auto chunk = std::move(m_free_chunks.back());
+		m_free_chunks.pop_back();
+		return chunk;
+	};
+	if (m_chunk == nullptr) {
+		m_chunk = take();
+	}
+	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
+	if (offset + size > Chunk::Size) {
+		DispatchChunk();
+		m_chunk = take();
+		offset  = 0;
+	}
+	m_chunk->used = offset + size;
+	return m_chunk->storage + offset;
+}
+
+void CommandScheduler::DispatchChunk() {
+	if (m_chunk == nullptr || m_chunk->used == 0) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_record_mutex);
+		m_record_queue.push_back(std::move(m_chunk));
+		m_chunks_dispatched++;
+	}
+	m_record_available.notify_one();
+}
+
+vk::CommandBuffer CommandScheduler::DrainRecording() {
+	if (!m_record_thread.joinable()) {
+		return m_command.m_buffer;
+	}
+	KYTY_PROFILER_FUNCTION();
+	if (m_threaded) {
+		m_record_stats.drains++;
+	}
+	DispatchChunk();
+	std::unique_lock lock(m_record_mutex);
+	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+	return m_worker_buffer;
+}
+
+void CommandScheduler::RecordingThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("Thread_GpuRecord");
+	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
+	// recycled only after the next two have run.
+	std::deque<std::unique_ptr<Chunk>> retained;
+	for (;;) {
+		std::unique_ptr<Chunk> chunk;
+		{
+			std::unique_lock lock(m_record_mutex);
+			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
+				return;
+			}
+			chunk = std::move(m_record_queue.front());
+			m_record_queue.pop_front();
+		}
+		for (auto* command = chunk->first; command != nullptr;) {
+			auto* next = command->next;
+			command->Execute(m_worker_buffer);
+			command->~RecordedCommand();
+			command = next;
+		}
+		chunk->first = nullptr;
+		chunk->last  = nullptr;
+		chunk->used  = 0;
+		retained.push_back(std::move(chunk));
+		std::unique_ptr<Chunk> recycled;
+		if (retained.size() > 2) {
+			recycled = std::move(retained.front());
+			retained.pop_front();
+		}
+		{
+			std::lock_guard lock(m_record_mutex);
+			if (recycled != nullptr) {
+				m_free_chunks.push_back(std::move(recycled));
+			}
+			m_chunks_executed++;
+		}
+		m_record_executed.notify_all();
+	}
+}
+
+void CommandScheduler::StopRecordingThread() {
+	if (!m_record_thread.joinable()) {
+		return;
+	}
+	(void)DrainRecording();
+	m_record_thread.request_stop();
+	m_record_available.notify_all();
+	m_record_thread.join();
 }
 
 void CommandScheduler::BeginNext() {

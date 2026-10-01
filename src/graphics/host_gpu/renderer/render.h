@@ -36,6 +36,8 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class CommandRecorder;
+class CommandScheduler;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -120,12 +122,16 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// The raw command buffer. With the recording thread (KYTY_RECORD_THREAD) this first waits
+	// until the thread has executed everything queued; hot paths use Recorder() instead.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
-	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
-	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	// Records directly, or through the recording thread when the command buffer is threaded.
+	[[nodiscard]] CommandRecorder Recorder() const;
+	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
+	[[nodiscard]] RenderContext&  GetContext() const noexcept { return m_context; }
+	[[nodiscard]] HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 	// KYTY_STATE_CACHE: the graphics dynamic state and pipeline last recorded into this command
 	// buffer, so a draw records only what changed. All draw pipelines share the same dynamic
@@ -162,22 +168,26 @@ private:
 	void Begin();
 	void End() const;
 
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer          = nullptr;
-	uint32_t            m_debug_op        = 0;
-	uint64_t            m_debug_submit_id = 0;
-	uint32_t            m_debug_arg0      = 0;
-	uint32_t            m_debug_arg1      = 0;
-	uint32_t            m_debug_arg2      = 0;
-	uint32_t            m_debug_arg3      = 0;
-	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState m_render_state;
+	RenderContext&    m_context;
+	GraphicContext&   m_graphics;
+	CommandScheduler& m_scheduler;
+	// Begun and not yet submitted. m_buffer is its handle when not threaded.
+	bool                 m_open            = false;
+	bool                 m_threaded        = false;
+	vk::CommandBuffer    m_buffer          = nullptr;
+	uint32_t             m_debug_op        = 0;
+	uint64_t             m_debug_submit_id = 0;
+	uint32_t             m_debug_arg0      = 0;
+	uint32_t             m_debug_arg1      = 0;
+	uint32_t             m_debug_arg2      = 0;
+	uint32_t             m_debug_arg3      = 0;
+	uint64_t             m_debug_arg4      = 0;
+	mutable RenderState  m_render_state;
 	mutable DynamicState m_dynamic_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	mutable bool         m_rendering   = false;
+	HW::Context*         m_registers   = nullptr;
+	HW::UserConfig*      m_user_config = nullptr;
+	HW::Shader*          m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };

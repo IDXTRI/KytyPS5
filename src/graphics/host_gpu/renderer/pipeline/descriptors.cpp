@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -1241,8 +1242,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t descriptor_count = 0;
+	const auto                     vk_buffer        = buffer.Recorder();
+	size_t                         descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -1448,11 +1449,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			vk_buffer.updateAndBindDescriptorSet(
+			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
 		}
 	}
 	if (pipeline.uses_bindless) {

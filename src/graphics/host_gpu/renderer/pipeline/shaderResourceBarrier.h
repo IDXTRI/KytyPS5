@@ -7,6 +7,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+class CommandRecorder;
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
@@ -19,6 +20,11 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+// Recorder versions (the raw ones forward to them).
+void ShaderAccessBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(const CommandRecorder& vk_buffer,
+                              vk::PipelineStageFlags destination_stages);
+void ShaderWriteBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics
 

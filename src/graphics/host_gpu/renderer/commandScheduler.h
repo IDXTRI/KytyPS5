@@ -7,13 +7,19 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 
 #include <queue>
 
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -57,14 +63,77 @@ public:
 		return m_last_submit_us.load(std::memory_order_relaxed);
 	}
 
+	// KYTY_RECORD_THREAD (see commandScheduler.cpp). Enabled for the renderer's scheduler only.
+	void EnableRecordingThread();
+	// The current command buffer's Vulkan commands are executed by the recording thread.
+	[[nodiscard]] bool Threaded() const noexcept { return m_threaded; }
+	// Queues fn(vk::CommandBuffer) for the recording thread. Threaded mode only; captures must
+	// be values (arrays through Stash), as fn runs later on another thread.
+	template <typename F>
+	void Record(F&& fn) {
+		using Command = TypedCommand<std::decay_t<F>>;
+		void* memory  = Allocate(sizeof(Command), alignof(Command));
+		auto* command = new (memory) Command(std::forward<F>(fn));
+		if (m_chunk->last != nullptr) {
+			m_chunk->last->next = command;
+		} else {
+			m_chunk->first = command;
+		}
+		m_chunk->last = command;
+	}
+	// Copies count elements into memory that stays valid until the recording thread has executed
+	// the next command recorded after this call. Threaded mode only.
+	template <typename T>
+	[[nodiscard]] const T* Stash(const T* data, size_t count) {
+		if (data == nullptr || count == 0) {
+			return nullptr;
+		}
+		auto* copy = static_cast<T*>(Allocate(sizeof(T) * count, alignof(T)));
+		std::memcpy(static_cast<void*>(copy), data, sizeof(T) * count);
+		return copy;
+	}
+	// Waits until the recording thread has executed every queued command and returns the command
+	// buffer it records into, for code that records directly. Threaded mode only.
+	vk::CommandBuffer DrainRecording();
+
 private:
+	struct RecordedCommand {
+		virtual ~RecordedCommand()                  = default;
+		virtual void     Execute(vk::CommandBuffer) = 0;
+		RecordedCommand* next                       = nullptr;
+	};
+	template <typename F>
+	struct TypedCommand final: RecordedCommand {
+		explicit TypedCommand(F&& function): fn(std::move(function)) {}
+		explicit TypedCommand(const F& function): fn(function) {}
+		void Execute(vk::CommandBuffer command) override { fn(command); }
+		F    fn;
+	};
+	struct Chunk {
+		static constexpr size_t Size = 256 * 1024;
+		alignas(64) std::byte storage[Size];
+		size_t           used  = 0;
+		RecordedCommand* first = nullptr;
+		RecordedCommand* last  = nullptr;
+	};
+	struct SubmitDebug;
+	void*    Allocate(size_t size, size_t alignment);
+	void     DispatchChunk();
+	void     RecordingThread(std::stop_token stop);
+	void     StopRecordingThread();
+	void     BeginThreadedCommand();
+	uint64_t SubmitThreaded(SubmitInfo submit, const SubmitDebug& debug);
+	void     QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+	                     const SubmitDebug& debug);
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
-		vk::CommandBuffer Commit();
+		// tick: the tick the command buffer will be submitted with.
+		vk::CommandBuffer Commit(uint64_t tick);
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -108,6 +177,28 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	std::atomic<int64_t>         m_last_submit_us {0};
+
+	// Recording thread state. m_chunk and m_threaded belong to the recording side's producer (the
+	// thread that owns the scheduler); the queue, the free list and the counters are guarded by
+	// m_record_mutex; m_worker_buffer belongs to the recording thread (read after a drain).
+	bool                                m_threaded = false;
+	std::unique_ptr<Chunk>              m_chunk;
+	std::mutex                          m_record_mutex;
+	std::condition_variable_any         m_record_available;
+	std::condition_variable             m_record_executed;
+	std::deque<std::unique_ptr<Chunk>>  m_record_queue;
+	std::vector<std::unique_ptr<Chunk>> m_free_chunks;
+	uint64_t                            m_chunks_dispatched = 0;
+	uint64_t                            m_chunks_executed   = 0;
+	vk::CommandBuffer                   m_worker_buffer     = nullptr;
+	struct RecordStats {
+		uint64_t                              buffers = 0;
+		uint64_t                              chunks  = 0;
+		uint64_t                              drains  = 0;
+		std::chrono::steady_clock::time_point report  = std::chrono::steady_clock::now();
+	};
+	RecordStats  m_record_stats;
+	std::jthread m_record_thread;
 };
 
 } // namespace Libs::Graphics
