@@ -1106,6 +1106,41 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
+	// 0 false, 1 true, 2 not evaluated (no condition, no strict reader, or unreadable).
+	const auto outcome_of = [&](uint32_t index) -> uint8_t {
+		const auto& block = m_program.control_flow[index];
+		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
+			return 2u;
+		}
+		uint32_t condition = 0;
+		bool     known     = false;
+		if (UseNativeTables()) {
+			uint64_t wide = 0;
+			known         = EvaluateNative(m_native->Conditions()[index], wide);
+			condition     = static_cast<uint32_t>(wide);
+		} else {
+			known = Evaluate(block.condition, condition);
+		}
+		return known ? (condition != 0u ? 1u : 0u) : 2u;
+	};
+	// The walk is a function of the outcomes it sees: if the last walk's conditions give the same
+	// outcomes again, in order, its result stands (the conditions are memoized, so re-evaluating
+	// them reads nothing new).
+	const bool replay   = UseNativeTables();
+	bool       replayed = false;
+	if (replay && m_program.active_walk_valid) {
+		replayed = true;
+		for (const auto& [index, outcome]: m_program.active_walk) {
+			if (outcome_of(index) != outcome) {
+				replayed = false;
+				break;
+			}
+		}
+		// KYTY_SRT_NATIVE_VERIFY=1 walks anyway and compares below.
+		if (replayed && !NativeVerify()) {
+			return m_program.active_walk_result;
+		}
+	}
 	auto& active = m_program.active_sources;
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
@@ -1115,9 +1150,11 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
+	auto& walk    = m_program.active_walk;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
+	walk.clear();
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
@@ -1129,22 +1166,21 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		for (const auto source: block.sources) {
 			active[source] = 1u;
 		}
-		uint32_t condition = 0;
-		bool     known     = false;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
-			if (UseNativeTables()) {
-				uint64_t wide = 0;
-				known         = EvaluateNative(m_native->Conditions()[index], wide);
-				condition     = static_cast<uint32_t>(wide);
-			} else {
-				known = Evaluate(block.condition, condition);
-			}
-		}
-		if (known) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		const auto outcome = outcome_of(index);
+		walk.emplace_back(index, outcome);
+		if (outcome != 2u) {
+			pending.push_back(block.successors[outcome != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
+	}
+	if (replayed && active != m_program.active_walk_result) {
+		EXIT("SRT active sources: a replayed walk differs from the full walk (shader %016" PRIx64
+		     ")\n", m_program.shader_hash);
+	}
+	if (replay) {
+		m_program.active_walk_result = active;
+		m_program.active_walk_valid  = true;
 	}
 	return active;
 }

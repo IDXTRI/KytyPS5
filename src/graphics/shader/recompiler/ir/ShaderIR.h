@@ -621,6 +621,12 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	// The plan compiled into x86-64 code (SrtNative.h) once it is refreshed often enough.
+	// FindActiveSources' last walk: the blocks it visited in order with their condition outcomes
+	// (0 false, 1 true, 2 not evaluated), and its result. A walk whose conditions give the same
+	// outcomes is the same walk.
+	mutable std::vector<std::pair<uint32_t, uint8_t>> active_walk;
+	mutable std::vector<uint8_t>                      active_walk_result;
+	mutable bool                                      active_walk_valid = false;
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
 	mutable uint32_t                             native_uses      = 0;
 	mutable bool                                 native_attempted = false;
