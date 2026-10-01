@@ -1,13 +1,17 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -173,6 +177,25 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+
+	// KYTY_MEMORY_STATS=1: every 5 s, what each cache holds against the device budget.
+	static auto& stats       = Common::LiveSwitches::Get("KYTY_MEMORY_STATS", 0);
+	static auto  report_time = std::chrono::steady_clock::now();
+	if (stats.load(std::memory_order_relaxed) != 0) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - report_time >= std::chrono::seconds(5)) {
+			report_time          = now;
+			constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+			::printf("Memory: buffers %.2f GiB, images %.2f GiB, device usage %.2f GiB, "
+			         "budget %.2f GiB\n",
+			         static_cast<double>(m_buffer_cache.UsedMemory()) / GiB,
+			         static_cast<double>(m_texture_cache.UsedMemory()) / GiB,
+			         static_cast<double>(m_graphics.GetDeviceMemoryUsage()) / GiB,
+			         static_cast<double>(m_graphics.GetTotalMemoryBudget()) / GiB);
+			std::fflush(stdout);
+			m_graphics.LogMemoryBudget();
+		}
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

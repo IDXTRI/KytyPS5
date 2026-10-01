@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1996,8 +1997,11 @@ uint64_t TextureCache::LruClock() const noexcept {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
-	const uint64_t clock = LruClock();
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const uint64_t clock    = LruClock();
+	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 0);
+	m_other_cache_memory =
+	    combined.load(std::memory_order_relaxed) != 0 ? m_buffer_cache.UsedMemory() : 0;
+	if (GcUsedMemory() < m_trigger_gc_memory) {
 		return;
 	}
 	if (m_gc_budget_frame != clock) {
@@ -2007,16 +2011,16 @@ void TextureCache::RunGarbageCollector() {
 		m_gc_written_back_bytes_frame = 0;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
-		constexpr uint64_t MiB             = 1024 * 1024;
+		bool               pressured  = GcUsedMemory() >= m_pressure_gc_memory;
+		bool               aggressive = allow_aggressive && GcUsedMemory() >= m_critical_gc_memory;
+		const uint64_t     age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		constexpr uint64_t MiB = 1024 * 1024;
 		constexpr size_t   MaxFreesInFrame = 1024;
 		uint64_t           byte_budget     = 0;
 		size_t             deletions       = 10;
 		if (pressured || aggressive) {
 			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
-			const auto excess    = m_total_used_memory - threshold;
+			const auto excess    = GcUsedMemory() - threshold;
 			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
 			                         : std::max<uint64_t>(16 * MiB, excess / 8);
 			if (m_gc_freed_bytes_frame >= byte_budget ||
@@ -2077,18 +2081,18 @@ void TextureCache::RunGarbageCollector() {
 					break;
 				}
 			}
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (GcUsedMemory() < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (GcUsedMemory() < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (GcUsedMemory() >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

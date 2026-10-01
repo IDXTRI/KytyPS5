@@ -75,8 +75,15 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Bytes of device memory the cached images account for.
+	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
 
 private:
+	// What the collector compares with its thresholds: own bytes, plus the buffer cache's with
+	// KYTY_GC_COMBINED (both caches share one device budget).
+	[[nodiscard]] uint64_t GcUsedMemory() const noexcept {
+		return m_total_used_memory + m_other_cache_memory;
+	}
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
 	struct ImageDownload;
@@ -192,6 +199,9 @@ private:
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+
+	// The buffer cache's bytes during a KYTY_GC_COMBINED collection (see GcUsedMemory).
+	uint64_t m_other_cache_memory = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

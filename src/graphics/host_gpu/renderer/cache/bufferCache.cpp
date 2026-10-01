@@ -1276,11 +1276,18 @@ void BufferCache::RunGarbageCollector() {
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// KYTY_GC_COMBINED=1: the images count too. Each cache derives its thresholds from the whole
+	// device budget, so judged apart the two can fill well past it together; on a 12 GB card
+	// Windows then pages cache memory to system RAM and every frame waits on PCIe.
+	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 0);
+	const uint64_t used =
+	    m_total_used_memory +
+	    (combined.load(std::memory_order_relaxed) != 0 ? m_texture_cache.UsedMemory() : 0);
+	if (used < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool aggressive = used >= m_critical_gc_memory;
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
