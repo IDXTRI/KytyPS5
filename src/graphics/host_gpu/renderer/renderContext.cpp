@@ -240,10 +240,11 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	// KYTY_GC_INTERVAL_US (live, default 0): collect at most once per interval. This runs after
-	// every completed guest submission (~1300/s at the Wolverine spot) while both collectors age
-	// in frames and budget per frame.
-	static auto& gc_interval = Common::LiveSwitches::Get("KYTY_GC_INTERVAL_US", 0);
+	// KYTY_GC_INTERVAL_US (live, default 4000; 0 = every call): collect at most once per interval.
+	// This runs after every completed guest submission (~1300/s at the Wolverine spot) while both
+	// collectors age in frames and budget per frame. Run 31 A/B 0/4000: collectors 16.1 -> 4.0
+	// ms/s, mean frame 73.3 -> 72.6 ms; still ~250 collections per second.
+	static auto& gc_interval = Common::LiveSwitches::Get("KYTY_GC_INTERVAL_US", 4000);
 	const auto   interval    = gc_interval.load(std::memory_order_relaxed);
 	const auto   now_us      = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
