@@ -1491,8 +1491,10 @@ void BufferCache::RunGarbageCollector() {
 	// But 120 for every buffer loses UI glyphs (run 30: the title menu draws "C N INU G M"): a
 	// buffer kept alive over an image's memory feeds the image stale bytes (see the GC comment
 	// below and SynchronizeBufferFromImage). So the longer age applies only to buffers that share
-	// no bytes with a cached image; those keep the base age of 4 frames.
-	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 4);
+	// no bytes with a cached image; those keep the base age of 4 frames. Run 31 A/B 4/120 with this
+	// rule (age 120 from startup): menu and HUD text intact, buffers created ~1500 -> ~15 per 5 s,
+	// median 83.2 -> 66.9 ms, mean 76.8 -> 73.2 ms.
+	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 120);
 	const uint64_t relaxed_age =
 	    static_cast<uint64_t>(std::max<int64_t>(2, gc_age.load(std::memory_order_relaxed)));
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
