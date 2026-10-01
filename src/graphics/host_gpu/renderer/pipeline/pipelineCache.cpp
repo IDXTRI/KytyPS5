@@ -723,52 +723,8 @@ struct PipelineCache::ProgramCache {
 			return hash;
 		}
 	};
-	using ProgramMap = std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>;
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
-
-	// ProgramKeyHash buckets a shader's static-state variants together, so a lookup compared the
-	// full key (static state of up to ~100 words, expanded function code) with every variant of
-	// the shader: ~3 % of the GPU thread at the Wolverine spot (run 27, map hash + memcmp).
-	// KYTY_PROGRAM_FAST_LOOKUP=1 (live, default 1) first looks the key up by a hash of its whole
-	// content and confirms the hit with one exact comparison; misses fall back to programs.
-	static bool FastLookupEnabled() {
-		static auto& enabled = Common::LiveSwitches::Get("KYTY_PROGRAM_FAST_LOOKUP", 1);
-		return enabled.load(std::memory_order_relaxed) != 0;
-	}
-
-	static uint64_t ContentHash(const ProgramKey& key) {
-		std::size_t hash = ProgramKeyHash {}(key);
-		PipelineKeyHash::Mix(
-		    hash, static_cast<std::size_t>(XXH3_64bits(
-		              key.static_state.data(), key.static_state.size() * sizeof(uint32_t))));
-		if (!key.function_code.empty()) {
-			PipelineKeyHash::Mix(
-			    hash, static_cast<std::size_t>(XXH3_64bits(
-			              key.function_code.data(), key.function_code.size() * sizeof(uint32_t))));
-		}
-		return hash;
-	}
-
-	ProgramMap::iterator FindProgram(const ProgramKey& key) {
-		if (!FastLookupEnabled()) {
-			return programs.find(key);
-		}
-		if (fast_programs_buckets != programs.bucket_count()) {
-			fast_programs.clear();
-			fast_programs_buckets = programs.bucket_count();
-		}
-		const auto content = ContentHash(key);
-		if (const auto fast = fast_programs.find(content);
-		    fast != fast_programs.end() && fast->second->first == key) {
-			return fast->second;
-		}
-		const auto found = programs.find(key);
-		if (found != programs.end()) {
-			fast_programs[content] = found;
-		}
-		return found;
-	}
 
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
@@ -843,7 +799,7 @@ struct PipelineCache::ProgramCache {
 			if (unsupported.contains(lookup_key)) {
 				return ShaderProgram {};
 			}
-			entry = FindProgram(lookup_key);
+			entry = programs.find(lookup_key);
 		}
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
@@ -1065,10 +1021,6 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
-	// KYTY_PROGRAM_FAST_LOOKUP (see FindProgram): full-content hash -> entry of programs. Its
-	// iterators are dropped whenever programs rehashes.
-	std::unordered_map<uint64_t, ProgramMap::iterator>          fast_programs;
-	size_t                                                      fast_programs_buckets = 0;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
