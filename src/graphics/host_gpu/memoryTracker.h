@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -34,6 +35,13 @@ public:
 	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).
 	template <typename Func>
 	void ForEachMaybeCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		if (UseRegionBitmap()) {
+			IterateCpuSummary(vaddr, size,
+			                  [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				                  func(manager->GetCpuAddr() + offset, bytes);
+			                  });
+			return;
+		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			if (manager->MaybeModified<DirtySource::Cpu>()) {
 				func(manager->GetCpuAddr() + offset, bytes);
@@ -99,18 +107,26 @@ public:
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			const bool summary_clean = !manager->MaybeModified<DirtySource::Cpu>();
-			if (!is_written && summary_clean) {
-				return;
-			}
-			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
-			if (!is_written) {
-				manager->lock.unlock();
-			}
-		});
+		const auto  upload_region = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+            manager->lock.lock();
+            manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+			                                                       bytes, range_func);
+            if (!is_written) {
+                manager->lock.unlock();
+            }
+		};
+		if (!is_written && UseRegionBitmap()) {
+			// Only the regions whose CPU summary is set, found in the bitmap.
+			IterateCpuSummary(vaddr, size, upload_region);
+		} else {
+			Iterate<false>(vaddr, size,
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               if (!is_written && !manager->MaybeModified<DirtySource::Cpu>()) {
+					               return;
+				               }
+				               upload_region(manager, offset, bytes);
+			               });
+		}
 		if (is_written) {
 			// The region locks stay held until the GPU-modified marks below.
 			KYTY_PROFILER_BLOCK("MemoryTracker::UploadHoldingRegionLocks");
@@ -131,7 +147,48 @@ public:
 	}
 
 private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t REGION_COUNT  = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t SUMMARY_WORDS = (REGION_COUNT + 63) / 64;
+
+	// Research: KYTY_REGION_BITMAP=1 (live). Read synchronizations of large ranges (Wolverine
+	// binds a 2.7 GiB buffer; ~400k syncs/s averaging 377 MiB) visited every region manager just
+	// to read its CPU summary, a cache miss per 4 MiB. Each manager mirrors that summary into
+	// m_cpu_summary_bits, so the walk reads a bitmap word per 256 MiB instead.
+	static bool UseRegionBitmap();
+
+	// Calls func(manager, offset, bytes) for each existing region of the range whose CPU summary
+	// bit is set (conservative like the summary itself).
+	template <typename Func>
+	void IterateCpuSummary(uint64_t vaddr, uint64_t size, Func&& func) {
+		ValidateRange(vaddr, size);
+		if (size == 0) {
+			return;
+		}
+		const uint64_t end   = vaddr + size;
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (end - 1) / TRACKER_REGION_SIZE;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			uint64_t bits = m_cpu_summary_bits[word].load(std::memory_order_acquire);
+			if (word == first / 64) {
+				bits &= ~uint64_t {0} << (first % 64);
+			}
+			if (word == last / 64 && last % 64 != 63) {
+				bits &= (uint64_t {1} << (last % 64 + 1)) - 1;
+			}
+			while (bits != 0) {
+				const uint64_t index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+				bits &= bits - 1;
+				auto* manager = m_regions[index].load(std::memory_order_acquire);
+				if (manager == nullptr) {
+					continue;
+				}
+				const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+				const uint64_t begin        = std::max(vaddr, region_begin);
+				const uint64_t finish       = std::min(end, region_begin + TRACKER_REGION_SIZE);
+				func(manager, begin - region_begin, finish - begin);
+			}
+		}
+	}
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
@@ -174,6 +231,7 @@ private:
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_summary_bits;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

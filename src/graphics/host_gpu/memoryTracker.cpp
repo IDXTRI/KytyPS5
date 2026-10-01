@@ -2,13 +2,20 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 
 namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
-	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_regions          = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_cpu_summary_bits = std::make_unique<std::atomic<uint64_t>[]>(SUMMARY_WORDS);
+}
+
+bool MemoryTracker::UseRegionBitmap() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_REGION_BITMAP", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -62,6 +69,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	}
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	auto* ptr     = manager.get();
+	ptr->SetCpuSummaryBit(&m_cpu_summary_bits[index / 64], uint64_t {1} << (index % 64));
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
