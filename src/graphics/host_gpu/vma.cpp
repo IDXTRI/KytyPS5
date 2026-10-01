@@ -15,13 +15,17 @@
 #endif
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <iterator>
 
 namespace Libs::Graphics {
 
@@ -57,6 +61,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	TrimImagePool(0, true);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -129,17 +134,91 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+// Research: KYTY_IMAGE_RECYCLE_MB=N (live, 0 = off). Wolverine reuses the same memory for
+// differently sized and formatted render targets within a frame, so the texture cache deletes
+// and recreates ~50 images per frame (~100/s, ~500 MB/s of driver allocations, kernel calls and
+// dedicated-memory frees on Thread_Gpu). A deleted image (only after the GPU is done with it:
+// the texture cache defers the erase to its tick) is parked, up to N MiB, and an identical
+// CreateImage takes it back. It starts in UNDEFINED layout like a new image, so its old
+// contents are never observed. Parked images unused for 2 s are destroyed.
+static int64_t ImageRecycleMegabytes() {
+	static auto& megabytes = Common::LiveSwitches::Get("KYTY_IMAGE_RECYCLE_MB", 0);
+	return megabytes.load(std::memory_order_relaxed);
+}
+
+decltype(GraphicContext::PooledImage::key)
+GraphicContext::PoolKey(const vk::ImageCreateInfo& info) {
+	return {info.flags,         info.imageType,    info.format,    info.extent.width,
+	        info.extent.height, info.extent.depth, info.mipLevels, info.arrayLayers,
+	        info.samples,       info.tiling,       info.usage,     info.sharingMode};
+}
+
+void GraphicContext::TrimImagePool(uint64_t cap_bytes, bool all) {
+	constexpr auto   MaxAge = std::chrono::seconds(2);
+	const auto       now    = std::chrono::steady_clock::now();
+	std::scoped_lock lock(m_image_pool_mutex);
+	// Oldest first: entries are appended as they are parked.
+	size_t keep_from = 0;
+	while (keep_from < m_image_pool.size() && (all || m_image_pool_bytes > cap_bytes ||
+	                                           now - m_image_pool[keep_from].parked > MaxAge)) {
+		auto& entry = m_image_pool[keep_from];
+		vmaDestroyImage(allocator, entry.image, entry.allocation);
+		m_image_pool_bytes -= entry.bytes;
+		keep_from++;
+	}
+	m_image_pool.erase(m_image_pool.begin(),
+	                   m_image_pool.begin() + static_cast<std::ptrdiff_t>(keep_from));
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
+	vk::Image::CType native_image = VK_NULL_HANDLE;
+	auto             result       = vk::Result::eErrorUnknown;
+	if (image_info.pNext == nullptr && image_info.initialLayout == vk::ImageLayout::eUndefined &&
+	    ImageRecycleMegabytes() > 0) {
+		const auto       key = PoolKey(image_info);
+		std::scoped_lock lock(m_image_pool_mutex);
+		// Newest first, so the entries kept warm are the ones reused.
+		for (auto it = m_image_pool.rbegin(); it != m_image_pool.rend(); ++it) {
+			if (it->key == key) {
+				native_image     = it->image;
+				image.allocation = it->allocation;
+				m_image_pool_bytes -= it->bytes;
+				m_image_pool.erase(std::next(it).base());
+				result = vk::Result::eSuccess;
+				break;
+			}
+		}
+	}
+
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (ImageRecycleMegabytes() > 0) {
+		static std::atomic<uint64_t> reused {0};
+		static std::atomic<uint64_t> allocated {0};
+		static std::atomic<int64_t>  report_ms {0};
+		(result == vk::Result::eSuccess ? reused : allocated)++;
+		const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                        std::chrono::steady_clock::now().time_since_epoch())
+		                        .count();
+		if (auto last = report_ms.load();
+		    now_ms - last >= 5000 && report_ms.compare_exchange_strong(last, now_ms)) {
+			std::scoped_lock lock(m_image_pool_mutex);
+			::printf("Image pool (5 s): reused %" PRIu64 ", allocated %" PRIu64
+			         ", parked %zu (%.1f MiB)\n",
+			         reused.exchange(0), allocated.exchange(0), m_image_pool.size(),
+			         static_cast<double>(m_image_pool_bytes) / 1048576.0);
+			std::fflush(stdout);
+		}
+	}
+	if (result != vk::Result::eSuccess) {
+		result = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+	}
 	if (result != vk::Result::eSuccess) {
 		alloc_info.requiredFlags  = 0;
 		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
@@ -168,6 +247,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.samples    = static_cast<uint32_t>(image_info.samples);
 	image.usage      = image_info.usage;
 	image.flags      = image_info.flags;
+	image.tiling     = image_info.tiling;
+	image.sharing    = image_info.sharingMode;
+	image.recyclable =
+	    image_info.pNext == nullptr && image_info.initialLayout == vk::ImageLayout::eUndefined;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
 
@@ -178,9 +261,36 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
-	image.image      = nullptr;
-	image.allocation = nullptr;
+	const auto megabytes = ImageRecycleMegabytes();
+	const auto cap       = static_cast<uint64_t>(std::max<int64_t>(megabytes, 0)) << 20u;
+	if (megabytes > 0 && image.recyclable) {
+		vk::ImageCreateInfo info {};
+		info.flags       = image.flags;
+		info.imageType   = image.image_type;
+		info.format      = image.format;
+		info.extent      = image.extent;
+		info.mipLevels   = image.mip_levels;
+		info.arrayLayers = image.layers;
+		info.samples     = static_cast<vk::SampleCountFlagBits>(image.samples);
+		info.tiling      = image.tiling;
+		info.usage       = image.usage;
+		info.sharingMode = image.sharing;
+		VmaAllocationInfo allocation {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation);
+		{
+			std::scoped_lock lock(m_image_pool_mutex);
+			m_image_pool.push_back({PoolKey(info), image.image, image.allocation, allocation.size,
+			                        std::chrono::steady_clock::now()});
+			m_image_pool_bytes += allocation.size;
+		}
+		image.image      = nullptr;
+		image.allocation = nullptr;
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+		image.image      = nullptr;
+		image.allocation = nullptr;
+	}
+	TrimImagePool(cap, megabytes <= 0);
 }
 
 } // namespace Libs::Graphics

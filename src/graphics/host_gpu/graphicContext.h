@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -133,6 +134,26 @@ struct GraphicContext {
 	uint32_t screen_height = 0;
 
 private:
+	// KYTY_IMAGE_RECYCLE_MB (see vma.cpp): deleted images kept for reuse by an identical
+	// CreateImage, instead of a driver allocation each time.
+	struct PooledImage {
+		std::tuple<vk::ImageCreateFlags, vk::ImageType, vk::Format, uint32_t, uint32_t, uint32_t,
+		           uint32_t, uint32_t, vk::SampleCountFlagBits, vk::ImageTiling,
+		           vk::ImageUsageFlags, vk::SharingMode>
+		                                      key;
+		vk::Image                             image      = nullptr;
+		VmaAllocation                         allocation = nullptr;
+		uint64_t                              bytes      = 0;
+		std::chrono::steady_clock::time_point parked;
+	};
+	[[nodiscard]] static decltype(PooledImage::key) PoolKey(const vk::ImageCreateInfo& info);
+	// Destroys parked images beyond the byte cap, older than the age limit, or all of them.
+	void TrimImagePool(uint64_t cap_bytes, bool all);
+
+	std::mutex               m_image_pool_mutex;
+	std::vector<PooledImage> m_image_pool;
+	uint64_t                 m_image_pool_bytes = 0;
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -164,6 +185,11 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// The rest of the create info, for KYTY_IMAGE_RECYCLE_MB: only an image created without a
+	// pNext chain may be parked and handed to an identical CreateImage.
+	vk::ImageTiling tiling     = vk::ImageTiling::eOptimal;
+	vk::SharingMode sharing    = vk::SharingMode::eExclusive;
+	bool            recyclable = false;
 };
 
 
