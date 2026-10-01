@@ -11,9 +11,69 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// KYTY_FAULT_STATS=1 (live, default 0): every 5 s, the tracked-page faults by kind, the distinct
+// pages and the pages that faulted most, to tell a few hot pages from many cold ones.
+class FaultStats {
+public:
+	static bool Enabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_FAULT_STATS", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
+	void Add(bool write, uint64_t vaddr) {
+		std::lock_guard lock(m_mutex);
+		auto&           page = m_pages[vaddr >> 12u];
+		(write ? page.writes : page.reads)++;
+		(write ? m_writes : m_reads)++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_report < std::chrono::seconds(5)) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, Counts>> top(m_pages.begin(), m_pages.end());
+		const auto                               count = std::min<size_t>(top.size(), 8);
+		std::partial_sort(top.begin(), top.begin() + static_cast<ptrdiff_t>(count), top.end(),
+		                  [](const auto& a, const auto& b) {
+			                  return a.second.reads + a.second.writes >
+			                         b.second.reads + b.second.writes;
+		                  });
+		::printf("Faults (5 s): %" PRIu64 " writes, %" PRIu64 " reads, %zu pages; top:", m_writes,
+		         m_reads, m_pages.size());
+		for (size_t i = 0; i < count; i++) {
+			::printf(" 0x%" PRIx64 " w%" PRIu64 "/r%" PRIu64, top[i].first << 12u,
+			         top[i].second.writes, top[i].second.reads);
+		}
+		::printf("\n");
+		m_pages.clear();
+		m_writes = 0;
+		m_reads  = 0;
+		m_report = now;
+	}
+
+private:
+	struct Counts {
+		uint64_t writes = 0;
+		uint64_t reads  = 0;
+	};
+	std::mutex                            m_mutex;
+	std::unordered_map<uint64_t, Counts>  m_pages;
+	uint64_t                              m_writes = 0;
+	uint64_t                              m_reads  = 0;
+	std::chrono::steady_clock::time_point m_report = std::chrono::steady_clock::now();
+};
+
+FaultStats g_fault_stats;
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -72,6 +132,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	if (FaultStats::Enabled()) {
+		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr);
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
