@@ -27,6 +27,8 @@
 #include <unordered_map>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,10 +148,27 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // its dwords from that copy. A chunk with any GPU-owned byte, or one that is not all mapped,
 // is refused and its reads take the per-read path, so the values are the ones read before.
 // The copies live for one lookup only: descriptors change between draws.
+// The same object can log every read and its result (KYTY_RESOURCE_MEMO, ProgramCache).
 class ShaderReadChunks {
 public:
+	struct LoggedRead {
+		uint64_t address = 0;
+		uint32_t first   = 0; // index of the first word in ReadLog::words
+		uint32_t count   = 0;
+		bool     ok      = false;
+	};
+	struct ReadLog {
+		std::vector<LoggedRead> reads;
+		std::vector<uint32_t>   words;
+	};
+
+	explicit ShaderReadChunks(bool chunks): m_chunks(chunks) {}
+
 	// Returns false when the chunk cannot serve the read; the caller reads as before.
 	bool Read(uint64_t address, std::span<uint32_t> values) {
+		if (!m_chunks) {
+			return false;
+		}
 		const auto base = address & ~(ChunkSize - 1);
 		if (values.size_bytes() > ChunkSize || address + values.size_bytes() > base + ChunkSize) {
 			return false;
@@ -167,6 +186,21 @@ public:
 		std::memcpy(values.data(), slot->words.data() + (address - base) / sizeof(uint32_t),
 		            values.size_bytes());
 		return true;
+	}
+
+	void SetLog(ReadLog* log) { m_log = log; }
+
+	void Log(uint64_t address, std::span<const uint32_t> values, bool ok) {
+		if (m_log == nullptr) {
+			return;
+		}
+		m_log->reads.push_back({.address = address,
+		                        .first   = static_cast<uint32_t>(m_log->words.size()),
+		                        .count   = static_cast<uint32_t>(values.size()),
+		                        .ok      = ok});
+		if (ok) {
+			m_log->words.insert(m_log->words.end(), values.begin(), values.end());
+		}
 	}
 
 	static bool Enabled() {
@@ -192,24 +226,27 @@ private:
 		return nullptr;
 	}
 
+	bool                m_chunks = false;
+	ReadLog*            m_log    = nullptr;
 	std::array<Slot, 8> m_slots;
 	size_t              m_next = 0;
 };
 
-// Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
-// mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
-// whatever address a descriptor chain produced, including 0 on a path the shader never takes.
-bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
-	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
+// Both SRT readers: only memory the guest has committed. Bytes the GPU has not written are
+// current in the backing store; reading them there skips the tracked-page fault, which drains
+// the GPU to refresh whatever else on the page the GPU wrote (constants that share a page with
+// GPU-written arguments cost a drain per dispatch). Bytes that are mapped but GPU-owned are read
+// through the guest mapping, so the fault refreshes them and the value is the one the shader
+// would see. Without a reader the walker dereferenced whatever address a descriptor chain
+// produced, including 0 on a path the shader never takes.
+bool ReadShaderGuestMemoryImpl(ShaderReadChunks* chunks, uint64_t address,
+                               std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
 	}
-	if (userdata != nullptr && static_cast<ShaderReadChunks*>(userdata)->Read(address, values)) {
+	if (chunks != nullptr && chunks->Read(address, values)) {
 		return true;
 	}
-	// Bytes the GPU has not written are current in the backing store. Reading them there skips
-	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
-	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
 	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
 	                                                    values.size_bytes())) {
 		return true;
@@ -219,6 +256,16 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
+}
+
+bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
+	auto*      chunks = static_cast<ShaderReadChunks*>(userdata);
+	const bool ok     = ReadShaderGuestMemoryImpl(chunks, address, values);
+	if (chunks != nullptr) {
+		chunks->Log(address, values, ok);
+	}
+	return ok;
 }
 
 // Research: a subroutine's code for inlining, in 1 KiB steps while the guest has it committed.
@@ -238,25 +285,18 @@ std::vector<uint32_t> ReadShaderCode(uint64_t address) {
 
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
-	if (values.empty()) {
-		return false;
+	auto*      chunks = static_cast<ShaderReadChunks*>(userdata);
+	const bool ok     = ReadShaderGuestMemoryImpl(chunks, address, values);
+	if (chunks != nullptr) {
+		chunks->Log(address, values, ok);
 	}
-	if (userdata != nullptr && static_cast<ShaderReadChunks*>(userdata)->Read(address, values)) {
-		return true;
-	}
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
-	                                                    values.size_bytes())) {
-		return true;
-	}
-	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
-	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
-	// the one the shader would see. Before, this only ever succeeded because the aggressive
-	// garbage collector happened to have downloaded the range first.
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
-		return false;
-	}
-	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-	return true;
+	return ok;
+}
+
+// KYTY_RESOURCE_MEMO=1 (a live switch, off by default): see ProgramCache::Materialize.
+bool ResourceMemoEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
 // --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
@@ -405,6 +445,16 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
+	// KYTY_RESOURCE_MEMO: the inputs and results of a recent MaterializeResources call.
+	struct MemoSlot {
+		std::vector<uint32_t>                        user_data;
+		uint64_t                                     shader_base = 0;
+		ShaderReadChunks::ReadLog                    log;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		std::vector<std::pair<uint64_t, uint64_t>>   specialization_reads;
+		uint64_t                                     last_use = 0;
+	};
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
@@ -416,7 +466,90 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
+		std::vector<MemoSlot>                        memo;
 	};
+
+	static constexpr size_t MemoSlots = 8;
+
+	// Materialization reads guest memory only through the runtime's two readers, so the same
+	// user data and shader base, with every logged read returning the same result and words,
+	// give the same snapshot and specialization. A hit re-reads the logged words and copies the
+	// stored result instead of evaluating the resource plan again.
+	bool Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                 ShaderReadChunks& reads) {
+		if (!ResourceMemoEnabled()) {
+			return ShaderRecompiler::IR::MaterializeResources(
+			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+		}
+		memo_clock++;
+		for (auto& slot: entry.memo) {
+			if (slot.shader_base == runtime.shader_base &&
+			    std::ranges::equal(slot.user_data, runtime.user_data) &&
+			    ReadsUnchanged(slot.log, reads)) {
+				entry.resources      = slot.resources;
+				entry.specialization = slot.specialization;
+				if (entry.resource_plan.capture_specialization_reads) {
+					entry.resource_plan.specialization_reads = slot.specialization_reads;
+				}
+				slot.last_use = memo_clock;
+				memo_hits++;
+				ReportMemo();
+				return true;
+			}
+		}
+		memo_misses++;
+		ShaderReadChunks::ReadLog log;
+		reads.SetLog(&log);
+		const bool ok = ShaderRecompiler::IR::MaterializeResources(
+		    entry.resource_plan, runtime, entry.resources, entry.specialization);
+		reads.SetLog(nullptr);
+		if (ok) {
+			MemoSlot* slot = nullptr;
+			if (entry.memo.size() < MemoSlots) {
+				slot = &entry.memo.emplace_back();
+			} else {
+				slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
+			}
+			slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			slot->shader_base    = runtime.shader_base;
+			slot->log            = std::move(log);
+			slot->resources      = entry.resources;
+			slot->specialization = entry.specialization;
+			slot->specialization_reads.clear();
+			if (entry.resource_plan.capture_specialization_reads) {
+				slot->specialization_reads = entry.resource_plan.specialization_reads;
+			}
+			slot->last_use = memo_clock;
+		}
+		ReportMemo();
+		return ok;
+	}
+
+	bool ReadsUnchanged(const ShaderReadChunks::ReadLog& log, ShaderReadChunks& reads) {
+		for (const auto& read: log.reads) {
+			memo_words.resize(read.count);
+			const bool ok = ReadShaderGuestMemoryImpl(&reads, read.address, memo_words);
+			if (ok != read.ok || (ok && !std::equal(memo_words.begin(), memo_words.end(),
+			                                        log.words.begin() + read.first))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void ReportMemo() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - memo_report < std::chrono::seconds(5)) {
+			return;
+		}
+		const auto total = memo_hits + memo_misses;
+		::printf("Resource memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hits)\n",
+		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0);
+		std::fflush(stdout);
+		memo_hits   = 0;
+		memo_misses = 0;
+		memo_report = now;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -515,12 +648,12 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		ShaderReadChunks                       read_chunks;
+		ShaderReadChunks                       read_chunks(ShaderReadChunks::Enabled());
 		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryRaw,
-		    .userdata                   = ShaderReadChunks::Enabled() ? &read_chunks : nullptr,
+		    .userdata                   = &read_chunks,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
@@ -528,9 +661,7 @@ struct PipelineCache::ProgramCache {
 			bool materialized = false;
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
-				materialized = ShaderRecompiler::IR::MaterializeResources(
-				    entry->second.resource_plan, runtime, entry->second.resources,
-				    entry->second.specialization);
+				materialized = Materialize(entry->second, runtime, read_chunks);
 			}
 			if (!materialized) {
 				// A descriptor source that cannot be read right now (memory the guest has not
@@ -725,6 +856,12 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
+	// KYTY_RESOURCE_MEMO bookkeeping (GPU thread).
+	uint64_t                              memo_clock  = 0;
+	uint64_t                              memo_hits   = 0;
+	uint64_t                              memo_misses = 0;
+	std::vector<uint32_t>                 memo_words;
+	std::chrono::steady_clock::time_point memo_report = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
