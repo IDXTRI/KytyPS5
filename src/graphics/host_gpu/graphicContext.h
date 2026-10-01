@@ -72,7 +72,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
-	std::atomic<uint64_t>              presented_frames {0};
+	// Queue 1 of queue_family, if the device has it; used by the GPU thread only (BufferCache).
+	uint32_t              queue_count    = 1;
+	vk::Queue             readback_queue = nullptr;
+	std::atomic<uint64_t> presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

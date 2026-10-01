@@ -164,6 +164,17 @@ private:
 	// GPU thread: KYTY_DIRECT_READBACK (see bufferCache.cpp).
 	[[nodiscard]] bool TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_write);
+	// GPU thread: KYTY_COPY_QUEUE_READBACK (see bufferCache.cpp). Downloads the window's
+	// GPU-written bytes on the readback queue when every GPU write to the buffer has executed.
+	[[nodiscard]] bool TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
+	                                        uint64_t window_end);
+	struct CopyQueueReadback {
+		vk::CommandPool         pool    = nullptr;
+		vk::CommandBuffer       command = nullptr;
+		vk::Fence               fence   = nullptr;
+		std::unique_ptr<Buffer> staging;
+	};
+	CopyQueueReadback m_copy_queue_readback;
 	// KYTY_ASYNC_WRITE_READBACK (see ReadMemory). A window whose download is submitted but not
 	// yet published to guest memory; its pages stay GPU-owned until the readback is completed.
 	// Only the GPU thread touches the list.
