@@ -90,6 +90,8 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	// Steady-clock time of the last collection (KYTY_GC_INTERVAL_US), GPU thread.
+	int64_t                   m_last_gc_us            = 0;
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
 
