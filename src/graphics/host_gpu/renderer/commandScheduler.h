@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -83,6 +84,10 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+
+	// KYTY_GPU_TIME (see commandScheduler.cpp).
+	struct GpuTimer;
+	std::unique_ptr<GpuTimer> m_gpu_timer;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

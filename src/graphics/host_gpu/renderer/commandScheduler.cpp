@@ -1,13 +1,18 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
+#include <deque>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -95,9 +100,114 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+// KYTY_GPU_TIME=1 (a live switch, off by default): every command buffer gets a timestamp at its
+// start and end. When its tick completes, the GPU time it covered (overlaps with the previous
+// command buffer removed) is added up, and every 5 s the log reports how busy the GPU was.
+struct CommandScheduler::GpuTimer {
+	static constexpr uint32_t Slots = 4096;
+
+	explicit GpuTimer(GraphicContext& graphics): graphics(graphics) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = Slots * 2;
+		if (graphics.device.createQueryPool(&info, nullptr, &pool) != vk::Result::eSuccess) {
+			pool = nullptr;
+		}
+		period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	}
+	~GpuTimer() {
+		if (pool) {
+			graphics.device.destroyQueryPool(pool, nullptr);
+		}
+	}
+	KYTY_CLASS_NO_COPY(GpuTimer);
+
+	static bool Enabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_GPU_TIME", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
+	// GPU thread, a new command buffer.
+	void Begin(vk::CommandBuffer command) {
+		open_slot = UINT32_MAX;
+		if (!pool || !Enabled() || pending.size() >= Slots) {
+			return;
+		}
+		open_slot = next_slot++ % Slots;
+		command.resetQueryPool(pool, open_slot * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, pool, open_slot * 2);
+	}
+
+	// GPU thread, before the command buffer ends.
+	void End(vk::CommandBuffer command) {
+		if (open_slot != UINT32_MAX) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, pool,
+			                        open_slot * 2 + 1);
+		}
+	}
+
+	void Submitted(uint64_t tick) {
+		if (open_slot != UINT32_MAX) {
+			pending.push_back({tick, open_slot});
+			open_slot = UINT32_MAX;
+		}
+	}
+
+	template <typename IsFree>
+	void Collect(IsFree&& is_free) {
+		while (!pending.empty() && is_free(pending.front().tick)) {
+			const auto              slot = pending.front().slot;
+			std::array<uint64_t, 2> stamps {};
+			if (graphics.device.getQueryPoolResults(
+			        pool, slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64) == vk::Result::eSuccess &&
+			    stamps[1] >= stamps[0]) {
+				const auto begin = std::max(stamps[0], last_end);
+				if (stamps[1] > begin) {
+					busy_ns += static_cast<double>(stamps[1] - begin) * period_ns;
+				}
+				last_end = std::max(last_end, stamps[1]);
+				buffers++;
+			}
+			pending.pop_front();
+		}
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - report).count();
+		if (elapsed >= 5.0) {
+			if (buffers != 0) {
+				const double busy_ms_per_s = busy_ns / 1e6 / elapsed;
+				::printf("GPU time (%.1f s): busy %.1f ms/s (%.0f%%), %" PRIu64
+				         " command buffers\n",
+				         elapsed, busy_ms_per_s, busy_ms_per_s / 10.0, buffers);
+				std::fflush(stdout);
+				TracyPlot("GPU busy ms/s", busy_ms_per_s);
+			}
+			busy_ns = 0;
+			buffers = 0;
+			report  = now;
+		}
+	}
+
+	struct Pending {
+		uint64_t tick = 0;
+		uint32_t slot = 0;
+	};
+
+	GraphicContext&                       graphics;
+	vk::QueryPool                         pool      = nullptr;
+	float                                 period_ns = 1.0f;
+	uint32_t                              next_slot = 0;
+	uint32_t                              open_slot = UINT32_MAX;
+	std::deque<Pending>                   pending;
+	uint64_t                              last_end = 0;
+	double                                busy_ns  = 0;
+	uint64_t                              buffers  = 0;
+	std::chrono::steady_clock::time_point report   = std::chrono::steady_clock::now();
+};
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
+    : m_gpu_timer(std::make_unique<GpuTimer>(graphics)), m_master(graphics), m_context(context),
+      m_graphics(graphics), m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
@@ -346,6 +456,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_gpu_timer->Collect([this](uint64_t tick) { return m_master.IsFree(tick); });
+	m_gpu_timer->Begin(m_command.Handle());
 	return m_command;
 }
 
@@ -368,6 +480,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		dependency.pMemoryBarriers    = &barrier;
 		m_command.Handle().pipelineBarrier2(dependency);
 	}
+	m_command.EndRendering();
+	m_gpu_timer->End(m_command.Handle());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -411,6 +525,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	m_gpu_timer->Submitted(tick);
 	return tick;
 }
 
