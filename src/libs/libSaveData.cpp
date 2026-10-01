@@ -257,16 +257,6 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
-static constexpr uint32_t SAVE_DATA_EVENT_TYPE_CONVERT_END       = 5u;
-
-struct SaveDataConvertParam {
-	int32_t                   user_id;
-	int32_t                   pad;
-	const SceSaveDataDirName* src_dir_name;
-	const SceSaveDataDirName* dst_dir_name;
-	uint64_t                  dst_blocks;
-	uint8_t                   reserved[24];
-};
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
 static constexpr uint32_t SAVE_DATA_MEMORY_SET_PARAM     = 1u;
@@ -395,6 +385,11 @@ static std::filesystem::path save_param_path(const std::filesystem::path& direct
 	return directory / "sce_sys" / "param.bin";
 }
 
+static bool is_legacy_save(const std::filesystem::path& directory) {
+	std::error_code error;
+	return !std::filesystem::exists(directory / "sce_sys", error) && !error;
+}
+
 static int64_t newest_save_time(const std::filesystem::path& directory) {
 	int64_t mtime = 0;
 	std::error_code error;
@@ -419,7 +414,10 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 
 static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
 	*param = {};
-	const int status = read_save_param(save_param_path(directory), param);
+	int status = read_save_param(save_param_path(directory), param);
+	if (status == SAVE_DATA_ERROR_NOT_FOUND && is_legacy_save(directory)) {
+		status = OK;
+	}
 	if (status == OK) {
 		param->mtime = newest_save_time(directory);
 	}
@@ -608,7 +606,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
 			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
-			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
+			    (Common::File::IsFileExisting(save_param_path(root / entry.name)) ||
+			     is_legacy_save(root / entry.name))) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -1208,51 +1207,6 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	return OK;
 }
 
-// Converts a save made in an older format to the current one and reports the end as a
-// CONVERT_END event. Kyty keeps a single format, so there is nothing to rewrite: the conversion
-// ends at once, copying the save when the title names a different destination.
-int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
-	PRINT_NAME();
-
-	if (convert == nullptr || convert->src_dir_name == nullptr) {
-		return SAVE_DATA_ERROR_PARAMETER;
-	}
-	const auto* dst = convert->dst_dir_name != nullptr ? convert->dst_dir_name : convert->src_dir_name;
-	const std::string src_name(convert->src_dir_name->data,
-	                           strnlen(convert->src_dir_name->data, sizeof(convert->src_dir_name->data)));
-	const std::string dst_name(dst->data, strnlen(dst->data, sizeof(dst->data)));
-	LOGF("\t user_id = %" PRId32 ", src = %s, dst = %s, dst_blocks = %" PRIu64 "\n",
-	     convert->user_id, src_name.c_str(), dst_name.c_str(), convert->dst_blocks);
-
-	Common::LockGuard lock(g_mount_mutex);
-	int32_t    error = OK;
-	const auto from  = save_directory(get_title_id(), src_name, convert->user_id);
-	std::error_code ec;
-	if (!std::filesystem::exists(from, ec)) {
-		error = SAVE_DATA_ERROR_NOT_FOUND;
-	} else if (dst_name != src_name) {
-		std::filesystem::copy(from, save_directory(get_title_id(), dst_name, convert->user_id),
-		                      std::filesystem::copy_options::recursive |
-		                          std::filesystem::copy_options::overwrite_existing,
-		                      ec);
-		if (ec) {
-			error = SAVE_DATA_ERROR_INTERNAL;
-		}
-	}
-	LOGF("\t result = 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
-	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, nullptr, dst, error);
-	return OK;
-}
-
-int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
-	PRINT_NAME();
-	if (progress == nullptr) {
-		return SAVE_DATA_ERROR_PARAMETER;
-	}
-	*progress = 1.0f; // conversion ends inside SaveDataConvert
-	return OK;
-}
-
 int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
                                    const void* param_buf, size_t param_buf_size) {
 	PRINT_NAME();
@@ -1344,6 +1298,56 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
+struct SaveDataConvertParam {
+	int32_t                   user_id;
+	int32_t                   reserved0;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name; // may be null
+	uint64_t                  dst_blocks;   // 0 keeps the source size
+	uint8_t                   reserved[24];
+};
+
+static_assert(sizeof(SaveDataConvertParam) == 56);
+
+// Converts save data to the current format. A result >= 0 starts an asynchronous conversion that
+// the caller polls with GetConvertProgress; the caller seen treats NOT_FOUND and NO_NEED_CONVERT
+// as "nothing to convert" and goes on to mount or create its save. Kyty only ever writes save data
+// in the current format, so an existing directory needs no conversion.
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
+	PRINT_NAME();
+
+	if (convert == nullptr || convert->src_dir_name == nullptr ||
+	    !valid_path_component(convert->src_dir_name->data)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (convert->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id    = %" PRId32 "\n"
+	     "\t src        = %s\n"
+	     "\t dst        = %s\n"
+	     "\t dst_blocks = %" PRIu64 "\n",
+	     convert->user_id, convert->src_dir_name->data,
+	     convert->dst_dir_name != nullptr ? convert->dst_dir_name->data : "<null>",
+	     convert->dst_blocks);
+
+	std::error_code error;
+	const auto dir = save_directory(get_title_id(), convert->src_dir_name->data, convert->user_id);
+	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT
+	                                           : SAVE_DATA_ERROR_NOT_FOUND;
+}
+
+// Convert never starts an asynchronous conversion, so any poll sees it finished.
+int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
+	PRINT_NAME();
+	if (progress == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	*progress = 1.0f;
+	return OK;
+}
+
 } // namespace SaveData
 
 namespace LibSaveDataNative {
@@ -1352,8 +1356,6 @@ LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
 
 LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);
-	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
-	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 	LIB_FUNC("dyIhnXq-0SM", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("PHnuI4LhuRk", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("ZP4e7rlzOUk", ::Libs::SaveData::SaveDataMount3);
@@ -1379,6 +1381,8 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 }
 
 } // namespace LibSaveDataNative
