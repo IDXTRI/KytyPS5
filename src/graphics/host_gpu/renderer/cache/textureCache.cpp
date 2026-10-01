@@ -20,9 +20,12 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -224,8 +227,79 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+namespace {
+
+// KYTY_IMAGE_STATS=1 (live): every 5 s, how many images were created and deleted and the guest
+// ranges created most often. An image recreated every frame shows up at the top.
+class ImageChurnStats {
+public:
+	void Note(const ImageInfo& info, bool created) {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_IMAGE_STATS", 0);
+		if (enabled.load(std::memory_order_relaxed) == 0) {
+			return;
+		}
+		std::scoped_lock lock {m_mutex};
+		if (created) {
+			m_created++;
+			m_created_bytes += info.data.size;
+			const Key key {info.data.address, info.data.size, info.pixel_format, info.extent.width,
+			               info.extent.height};
+			m_by_range[key]++;
+		} else {
+			m_deleted++;
+			m_deleted_bytes += info.data.size;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_report_time < std::chrono::seconds(5)) {
+			return;
+		}
+		m_report_time = now;
+		::printf("Images (5 s): created %" PRIu64 " (%.1f MiB), deleted %" PRIu64 " (%.1f MiB)\n",
+		         m_created, static_cast<double>(m_created_bytes) / 1048576.0, m_deleted,
+		         static_cast<double>(m_deleted_bytes) / 1048576.0);
+		std::vector<std::pair<uint64_t, Key>> top;
+		top.reserve(m_by_range.size());
+		for (const auto& [key, count]: m_by_range) {
+			top.emplace_back(count, key);
+		}
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.first > b.first; });
+		for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
+			const auto& [count, key] = top[i];
+			::printf("  %5" PRIu64 "x 0x%010" PRIx64 " %8" PRIu64 " KiB %4ux%-4u %s\n", count,
+			         key.address, key.size / 1024, key.width, key.height,
+			         vk::to_string(key.format).c_str());
+		}
+		std::fflush(stdout);
+		m_created = m_created_bytes = m_deleted = m_deleted_bytes = 0;
+		m_by_range.clear();
+	}
+
+private:
+	struct Key {
+		uint64_t   address;
+		uint64_t   size;
+		vk::Format format;
+		uint32_t   width;
+		uint32_t   height;
+		auto       operator<=>(const Key&) const = default;
+	};
+	std::mutex                            m_mutex;
+	std::map<Key, uint64_t>               m_by_range;
+	uint64_t                              m_created       = 0;
+	uint64_t                              m_created_bytes = 0;
+	uint64_t                              m_deleted       = 0;
+	uint64_t                              m_deleted_bytes = 0;
+	std::chrono::steady_clock::time_point m_report_time   = std::chrono::steady_clock::now();
+};
+
+ImageChurnStats g_image_churn_stats;
+
+} // namespace
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	g_image_churn_stats.Note(info, true);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -285,7 +359,8 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
+	// Only depth images own stencil associations (AssociateStencil); the scan visits every image.
+	if (!image->depth_id && image->info.IsDepth()) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
 			if (associated.depth_id == id) {
@@ -299,6 +374,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image->IsGpuModified()) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
+	g_image_churn_stats.Note(image->info, false);
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
