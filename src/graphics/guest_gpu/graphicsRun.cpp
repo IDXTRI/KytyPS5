@@ -513,7 +513,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// GPU caught up (Wolverine: ~28% of Thread_Gpu idle with every queue blocked). Everything
 	// recorded before the label is ahead in the same Vulkan queue, so a full barrier gives the
 	// commands after the wait the ordering the wait promised, and recording can go on.
-	static auto&                 forward = Common::LiveSwitches::Get("KYTY_LABEL_WAIT_FORWARD", 0);
+	// Wolverine, standing still, same process: 0 → 283 ms/frame, 1 → 217 ms; claws and scene
+	// unchanged.
+	static auto&                 forward = Common::LiveSwitches::Get("KYTY_LABEL_WAIT_FORWARD", 1);
 	static std::atomic<uint64_t> suspended {0};
 	static std::atomic<uint64_t> forwarded {0};
 	static std::atomic<uint64_t> forwardable {0};
