@@ -802,7 +802,9 @@ void GuestGpu::ThreadRun(void* data) {
 // blocks always submits, and so does the GPU thread before it waits for work or for blocked
 // queues (FlushPendingSlices), so nothing waits on commands that were never submitted.
 void GuestGpu::FlushSlice(CommandProcessor& cp, bool complete) {
-	static auto& interval_us = Common::LiveSwitches::Get("KYTY_SLICE_FLUSH_US", 0);
+	// Wolverine run 19, same process: submits 8.8k -> 4.8k per 5 s; frames 138 vs 135-147 / 15 s
+	// (frame time unchanged, vblank-bound); fewer, larger command buffers for the GPU.
+	static auto& interval_us = Common::LiveSwitches::Get("KYTY_SLICE_FLUSH_US", 500);
 	const auto   interval    = interval_us.load(std::memory_order_relaxed);
 	if (complete && interval > 0) {
 		const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
