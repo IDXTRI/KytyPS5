@@ -238,8 +238,34 @@ struct TrackerHarness {
   MemoryTracker tracker;
 };
 
+// The tests place their memory at fixed offsets in a 64 MiB window: the first of a few addresses
+// below the tracker's 1 TiB lower range where the host has room. A single fixed address near
+// 0x200000000 collided at random with the dyld shared cache on arm64 macOS CI runners, whose slide
+// changes per boot.
+uintptr_t TestWindow() {
+  static const uintptr_t window = [] {
+    constexpr uint64_t size = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+    for (const uint64_t candidate :
+         {64 * gib, 128 * gib, 256 * gib, 512 * gib, 768 * gib, 8 * gib}) {
+      void *probe = VirtualAlloc(reinterpret_cast<void *>(candidate), size, MEM_RESERVE,
+                                 PAGE_NOACCESS);
+      if (probe == nullptr) {
+        continue;
+      }
+      Check(VirtualFree(probe, 0, MEM_RELEASE) != 0, "test window release failed");
+      if (probe == reinterpret_cast<void *>(candidate)) {
+        return static_cast<uintptr_t>(candidate);
+      }
+    }
+    Check(false, "no free test window below 1 TiB");
+    return uintptr_t {0};
+  }();
+  return window;
+}
+
 uint8_t *Allocate(PageManager &manager, uint64_t pages) {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  const uintptr_t base = TestWindow() + 0x10000u;
   const auto size = manager.GetPageSize() * pages;
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), size,
@@ -311,7 +337,7 @@ void TestGuestRange() {
 }
 
 void TestQueriesDoNotRequireMappedOwnership() {
-  constexpr uint64_t address = 0x0000000203000000ull;
+  const uint64_t address = TestWindow() + 0x3000000u;
   TrackerHarness harness;
   const auto page_size = harness.page_manager.GetPageSize();
   Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
@@ -386,7 +412,7 @@ void TestCpuDirtyUpload() {
 }
 
 void TestRangeInvalidation() {
-  constexpr uintptr_t base = 0x0000000201000000ull;
+  const uintptr_t base = TestWindow() + 0x1000000u;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -614,7 +640,7 @@ void TestGpuDownloadProtectionMirrors() {
 }
 
 void TestCrossRegionUpload() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  const uintptr_t base = TestWindow() + 0x10000u;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -643,9 +669,8 @@ void TestCrossRegionUpload() {
 // IsRangeCpuCleanHint mirrors the regions' CPU summaries one bit per region; the read-only upload
 // walk is skipped only when every region of the range exists and is clean.
 void TestRegionBitmapHint() {
-  // Region aligned (4 MiB) and above 0x200010000: the macOS test binary's guest segments reach
-  // past 0x200000000, so a fixed allocation there fails.
-  constexpr uintptr_t base = 0x0000000200400000ull;
+  // Region aligned (4 MiB), clear of the other tests' memory.
+  const uintptr_t base = TestWindow() + 0x400000u;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
