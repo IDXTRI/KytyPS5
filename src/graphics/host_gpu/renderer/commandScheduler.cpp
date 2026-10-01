@@ -458,7 +458,7 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	static auto& record_thread = Common::LiveSwitches::Get("KYTY_RECORD_THREAD", 0);
+	static auto& record_thread = Common::LiveSwitches::Get("KYTY_RECORD_THREAD", 1);
 	const bool   threaded =
 	    m_record_thread.joinable() && record_thread.load(std::memory_order_relaxed) != 0;
 	if (!threaded && m_record_thread.joinable()) {
@@ -574,8 +574,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return tick;
 }
 
-// Research: KYTY_RECORD_THREAD=1 (live, per command buffer; default 0). Thread_Gpu spent ~15-20 %
-// of its time inside the Vulkan driver recording and submitting. With the switch on, the
+// Research: KYTY_RECORD_THREAD (live, per command buffer; default 1, 0 records inline). Thread_Gpu spent ~15-20 %
+// of its time inside the Vulkan driver recording and submitting (run 21: 9.4 -> 9.9 fps). With the switch on, the
 // renderer's scheduler hands the Vulkan calls of the current command buffer to a recording
 // thread: CommandRecorder (Recorder()) and Record() queue them in order, with every array they
 // point to copied into the command chunk; the recording thread owns the command pool, begins,
