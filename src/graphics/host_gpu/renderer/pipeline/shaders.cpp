@@ -361,9 +361,6 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 			}
 		}
 
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
-
 		EXIT_IF(registers_num < 1 || registers_num > 4);
 	}
 

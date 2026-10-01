@@ -10560,6 +10560,39 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
                        result.resources.buffers[0].dwords.begin()),
         "embedded fetch discarded a scalar-load component used by another buffer read");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const auto key = MakeStageStaticKey(input);
+  const auto compile = [&](const ShaderVertexInputInfo &vertex) {
+    auto variant_options = options;
+    variant_options.input_info.vertex = &vertex;
+    return RecompileForTest(code, variant_options).spirv;
+  };
+  auto layout = input;
+  layout.resources_dst[0].register_start = 32;
+  layout.resources_dst[0].fetch_index = 1;
+  layout.resources[0].UpdateAddress48(0x56780000u);
+  layout.resources[0].fields[1] = 52u << 16u;
+  layout.resources[0].fields[2] = 128;
+  layout.resources[0].fields[3] |= 3u << 28u;
+  layout.buffers_num = 1;
+  layout.buffers[0] = {.addr = 0x56780000u, .stride = 52, .num_records = 128,
+                       .fetch_index = 1};
+  Check(compile(layout) == result.spirv,
+        "pipeline-only vertex layout changed the embedded-fetch shader");
+  Check(MakeStageStaticKey(layout) == key,
+        "pipeline-only vertex layout fragmented the shader module cache key");
+
+  auto formatted = input;
+  formatted.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32UInt) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(compile(formatted) != result.spirv && MakeStageStaticKey(formatted) != key,
+        "vertex input numeric type lost its shader module specialization");
+  auto swizzled = input;
+  swizzled.resources[0].fields[3] =
+      (swizzled.resources[0].fields[3] & ~0xfffu) | DstSel(5, 4, 6, 7);
+  Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key,
+        "vertex input destination selectors lost their shader module specialization");
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -10611,7 +10644,7 @@ void TestEmbeddedVertexFormatSwizzle() {
     Decoder::Program decoded;
     Decoder::DecodeProgram(code, decoded);
     const uint32_t attribute = static_cast<uint32_t>(test.attribute_format) << 5u;
-    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
+    uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
                                (static_cast<uint32_t>(test.format) << 12u) | test.swizzle};
     HW::VertexShaderInfo regs{};
     regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
@@ -10630,6 +10663,16 @@ void TestEmbeddedVertexFormatSwizzle() {
     ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
     PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (&test == cases) {
+      for (const auto [word, flag] : {std::pair{1u, 1u << 31u}, std::pair{3u, 1u << 23u}}) {
+        buffer[word] |= flag;
+        ExpectFatal([&] { PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input); },
+                    "unsupported vertex fetch flags bypassed acquisition validation");
+        buffer[word] &= ~flag;
+      }
+    }
+#endif
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};
@@ -11031,35 +11074,6 @@ void TestNewShaderRecompilerClipDisabledPosition() {
   shifted.clip_space.offset[0] += 1.0f;
   Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
         "clip-disabled viewport transform is absent from the shader cache key");
-
-  ShaderVertexInputInfo layout_a{};
-  layout_a.resources_num = 1;
-  layout_a.buffers_num = 1;
-  layout_a.buffers[0].stride = 16;
-  auto layout_b = layout_a;
-  layout_b.buffers[0].stride = 32;
-  layout_b.buffers[0].fetch_index = 1;
-  layout_b.resources[0].UpdateAddress48(4);
-  Check(MakeStageStaticKey(layout_a) == MakeStageStaticKey(layout_b),
-        "pipeline-only vertex layout fragmented the shader module cache key");
-
-  const auto descriptor_state = [](const ShaderBufferResource &resource) {
-    return std::array<uint32_t, 9>{
-        resource.Stride(), resource.SwizzleEnabled(), resource.DstSelX(),
-        resource.DstSelY(), resource.DstSelZ(), resource.DstSelW(),
-        resource.RawFormat(), resource.OutOfBounds(), resource.AddTid()};
-  };
-  const auto key = MakeStageStaticKey(layout_a);
-  const auto state = descriptor_state(layout_a.resources[0]);
-  for (uint32_t word = 0; word < 4; word++) {
-    for (uint32_t bit = 0; bit < 32; bit++) {
-      auto changed = layout_a;
-      changed.resources[0].fields[word] ^= 1u << bit;
-      Check((MakeStageStaticKey(changed) == key) ==
-                (descriptor_state(changed.resources[0]) == state),
-            "vertex key lost a descriptor field or included runtime-only bits");
-    }
-  }
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {

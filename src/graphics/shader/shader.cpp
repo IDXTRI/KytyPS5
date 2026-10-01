@@ -456,6 +456,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
+		EXIT_NOT_IMPLEMENTED(r.AddTid());
+		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
@@ -711,12 +713,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
 		const auto& destination = info.resources_dst[i];
-		key.push_back(destination.register_start);
 		key.push_back(destination.registers_num);
-		key.push_back(destination.fetch_index);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[1] & 0xbfff0000u); // Stride and swizzle enable.
-		key.push_back(resource.fields[3] & 0x3087ffffu); // Channels, format, OOB, and add TID.
+		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
 	}
 }
 
