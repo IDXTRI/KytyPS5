@@ -1314,7 +1314,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			            heap->checked_count <= resolved.size()
 			         ? heap->checked_count
 			         : 0;
-			if (verify) {
+			// KYTY_BINDLESS_SKIP=0 (live) checks every image again, for same-process A/B.
+			static auto& skip = Common::LiveSwitches::Get("KYTY_BINDLESS_SKIP", 1);
+			if (verify || skip.load(std::memory_order_relaxed) == 0) {
 				begin = 0;
 			}
 			const auto skipped =
