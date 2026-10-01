@@ -183,6 +183,99 @@ public:
 		m_scheduler->Record(
 		    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
 	}
+	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
+		copyBuffer(source, destination, 1, &region);
+	}
+	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
+	                uint32_t value) const {
+		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
+	}
+	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
+	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		if (!Threaded()) {
+			m_direct.copyBufferToImage(source, destination, layout, count, regions);
+			return;
+		}
+		const auto* r = m_scheduler->Stash(regions, count);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.copyBufferToImage(source, destination, layout, count, r);
+		});
+	}
+	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
+	                       const vk::BufferImageCopy& region) const {
+		copyBufferToImage(source, destination, layout, 1, &region);
+	}
+	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
+	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		if (!Threaded()) {
+			m_direct.copyImageToBuffer(source, layout, destination, count, regions);
+			return;
+		}
+		const auto* r = m_scheduler->Stash(regions, count);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.copyImageToBuffer(source, layout, destination, count, r);
+		});
+	}
+	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
+	                       const vk::BufferImageCopy& region) const {
+		copyImageToBuffer(source, layout, destination, 1, &region);
+	}
+	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
+	               vk::ImageLayout destination_layout, uint32_t count,
+	               const vk::ImageCopy* regions) const {
+		if (!Threaded()) {
+			m_direct.copyImage(source, source_layout, destination, destination_layout, count,
+			                   regions);
+			return;
+		}
+		const auto* r = m_scheduler->Stash(regions, count);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.copyImage(source, source_layout, destination, destination_layout, count, r);
+		});
+	}
+	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
+	               vk::ImageLayout destination_layout, const vk::ImageCopy& region) const {
+		copyImage(source, source_layout, destination, destination_layout, 1, &region);
+	}
+	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
+	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+		Run([=](vk::CommandBuffer command) {
+			command.resolveImage(source, source_layout, destination, destination_layout, 1,
+			                     &region);
+		});
+	}
+	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
+	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		if (!Threaded()) {
+			m_direct.clearColorImage(image, layout, color, count, ranges);
+			return;
+		}
+		const auto  value = *color;
+		const auto* r     = m_scheduler->Stash(ranges, count);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.clearColorImage(image, layout, &value, count, r);
+		});
+	}
+	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
+	                            const vk::ClearDepthStencilValue* value, uint32_t count,
+	                            const vk::ImageSubresourceRange* ranges) const {
+		if (!Threaded()) {
+			m_direct.clearDepthStencilImage(image, layout, value, count, ranges);
+			return;
+		}
+		const auto  clear = *value;
+		const auto* r     = m_scheduler->Stash(ranges, count);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.clearDepthStencilImage(image, layout, &clear, count, r);
+		});
+	}
+	template <typename Writes>
+	void pushDescriptorSetKHR(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+	                          uint32_t set, const Writes& writes) const {
+		pushDescriptorSetKHR(bind_point, layout, set, static_cast<uint32_t>(std::size(writes)),
+		                     std::data(writes));
+	}
+	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
 		if (!Threaded()) {
 			m_direct.beginRendering(info);

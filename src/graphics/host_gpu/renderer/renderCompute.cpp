@@ -636,14 +636,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk::DeviceSize indirect_offset = args_offset;
 		if (use_thread_dimensions) {
 			EXIT_IF(!args_buffer->HasDeviceAddress());
-			const std::array<uint32_t, 3> local_size {
-			    std::max(cs_regs.cs_regs.num_thread_x, 1u),
-			    std::max(cs_regs.cs_regs.num_thread_y, 1u),
-			    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
-			const auto converted = m_indirect_groups->Convert(
-			    buffer.Handle(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
-			indirect_buffer = converted.groups_buffer;
-			indirect_offset = converted.groups_offset;
+			const std::array<uint32_t, 3> local_size {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			                                          std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			                                          std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+			const auto                    converted = m_indirect_groups->Convert(
+                buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
+			indirect_buffer              = converted.groups_buffer;
+			indirect_offset              = converted.groups_offset;
 			bindings.dispatch_dimensions = {static_cast<uint32_t>(converted.threads),
 			                                static_cast<uint32_t>(converted.threads >> 32u), 0u};
 		}

@@ -5,6 +5,7 @@
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -150,7 +151,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	}
 
 	m_scheduler.EndRendering();
-	auto               command = m_scheduler.Current().Handle();
+	auto               command = m_scheduler.Current().Recorder();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;

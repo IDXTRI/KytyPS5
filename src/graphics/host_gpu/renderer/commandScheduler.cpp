@@ -516,11 +516,6 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
-	m_last_submit_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
-	                           std::chrono::steady_clock::now().time_since_epoch())
-	                           .count(),
-	                       std::memory_order_relaxed);
-
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);
 	}
@@ -556,6 +551,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	                         m_command.m_debug_arg0, m_command.m_debug_arg1,
 	                         m_command.m_debug_arg2, m_command.m_debug_arg3,
 	                         m_command.m_debug_arg4};
+	// The time this thread hands the command buffer over: the gates on it (KYTY_LABEL_FLUSH_US,
+	// KYTY_SLICE_FLUSH_US) measure this thread's batching, not when the driver call happens.
+	m_last_submit_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count(),
+	                       std::memory_order_relaxed);
 	if (m_threaded) {
 		return SubmitThreaded(submit, debug);
 	}

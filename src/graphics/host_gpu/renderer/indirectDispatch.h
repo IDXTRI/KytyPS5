@@ -11,6 +11,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class CommandRecorder;
 
 // DISPATCH_INDIRECT with the thread-dimension initiator carries thread counts, not workgroup
 // counts. The command processor used to read them on the CPU, but the previous dispatch writes
@@ -32,7 +33,7 @@ public:
 	// Records the conversion of the three thread counts at `threads` and returns the workgroup
 	// counts' location, ready for dispatchIndirect. Binds a compute pipeline and push state, so
 	// call it before committing the guest dispatch's bindings.
-	[[nodiscard]] Result Convert(vk::CommandBuffer command, vk::DeviceAddress threads,
+	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress threads,
 	                             const std::array<uint32_t, 3>& local_size);
 
 private:

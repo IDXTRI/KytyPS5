@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "gpu_tiler_shaders/dispatch_indirect_groups_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -68,9 +69,9 @@ IndirectDispatchGroups::~IndirectDispatchGroups() {
 	m_graphics.device.destroyDescriptorSetLayout(m_set_layout, nullptr);
 }
 
-IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
-    vk::CommandBuffer command, vk::DeviceAddress threads,
-    const std::array<uint32_t, 3>& local_size) {
+IndirectDispatchGroups::Result
+IndirectDispatchGroups::Convert(const CommandRecorder& command, vk::DeviceAddress threads,
+                                const std::array<uint32_t, 3>& local_size) {
 	const auto entry  = m_next;
 	m_next            = (m_next + 1u) % Entries;
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
