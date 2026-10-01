@@ -14,7 +14,8 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 }
 
 bool MemoryTracker::UseRegionBitmap() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_REGION_BITMAP", 0);
+	// Wolverine run 16, same process: 0 -> 118-119 frames / 15 s, 1 -> 123-129.
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_REGION_BITMAP", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 

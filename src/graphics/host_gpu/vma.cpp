@@ -142,7 +142,9 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 // CreateImage takes it back. It starts in UNDEFINED layout like a new image, so its old
 // contents are never observed. Parked images unused for 2 s are destroyed.
 static int64_t ImageRecycleMegabytes() {
-	static auto& megabytes = Common::LiveSwitches::Get("KYTY_IMAGE_RECYCLE_MB", 0);
+	// Wolverine run 16: 256 MiB reuses ~450 of ~451 image creations per 5 s with ~20 MiB parked;
+	// frame time unchanged there (116.8 ms either way), allocations and kernel calls gone.
+	static auto& megabytes = Common::LiveSwitches::Get("KYTY_IMAGE_RECYCLE_MB", 256);
 	return megabytes.load(std::memory_order_relaxed);
 }
 

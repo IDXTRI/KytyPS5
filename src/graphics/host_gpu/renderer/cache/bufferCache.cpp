@@ -1307,7 +1307,9 @@ void BufferCache::RunGarbageCollector() {
 	// KYTY_GC_COMBINED=1: the images count too. Each cache derives its thresholds from the whole
 	// device budget, so judged apart the two can fill well past it together; on a 12 GB card
 	// Windows then pages cache memory to system RAM and every frame waits on PCIe.
-	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 0);
+	// Wolverine run 16 (paging, device usage 11.0 > budget 9.9 GiB): on trimmed to 9.8 GiB, GPU
+	// busy 86% -> 27%, 167 -> 117 ms/frame; a one-time stutter while it trims.
+	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 1);
 	const uint64_t used =
 	    m_total_used_memory +
 	    (combined.load(std::memory_order_relaxed) != 0 ? m_texture_cache.UsedMemory() : 0);

@@ -441,7 +441,9 @@ private:
 // KYTY_SRT_COMPILED (live): 0 walks the IR, 1 evaluates compiled plans, 2 evaluates every root
 // both ways and logs the first mismatches (results come from the IR walker).
 int64_t CompiledMode() {
-	static auto& mode = Common::LiveSwitches::Get("KYTY_SRT_COMPILED", 0);
+	// Wolverine run 16: mode 2 compared 33.5M roots without a mismatch; with Thread_Gpu the
+	// limiter, 0 -> 114 frames / 15 s (mean 122 ms), 1 -> 121-131 (mean 113 ms).
+	static auto& mode = Common::LiveSwitches::Get("KYTY_SRT_COMPILED", 1);
 	return mode.load(std::memory_order_relaxed);
 }
 

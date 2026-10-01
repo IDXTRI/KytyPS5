@@ -2074,7 +2074,7 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock    = LruClock();
-	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 0);
+	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 1);
 	m_other_cache_memory =
 	    combined.load(std::memory_order_relaxed) != 0 ? m_buffer_cache.UsedMemory() : 0;
 	if (GcUsedMemory() < m_trigger_gc_memory) {
