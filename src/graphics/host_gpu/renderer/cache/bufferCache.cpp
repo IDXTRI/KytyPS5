@@ -743,7 +743,9 @@ bool BufferCache::TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t siz
 // queue of the graphics family instead, behind nothing: its submission waits for the writer's
 // tick on the timeline semaphore (the memory dependency), and only this copy is waited for.
 static bool CopyQueueReadbackEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_COPY_QUEUE_READBACK", 0);
+	// Wolverine run 18, same process: 0 -> 110 frames / 15 s, 1 -> 126-136; readback time on
+	// Thread_Gpu 1.22 -> 0.62 s per 5 s; no visual change.
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_COPY_QUEUE_READBACK", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
