@@ -1482,19 +1482,24 @@ void BufferCache::RunGarbageCollector() {
 	};
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
-	// KYTY_BUFFER_GC_AGE (live, frames, default 120; 4 before): the age below the critical mark.
+	// KYTY_BUFFER_GC_AGE (live, frames): the age below the critical mark for buffers that share no
+	// memory with a cached image (default set below).
 	// Wolverine sits between the marks (7.7 of 5.2/8.4 GiB with the images): at 4 the collector ran
 	// on every submission and retired ~170 small buffers/s that came back at once (~340 created/s,
 	// run 28). Run 29 A/B 4/120: buffers created 1500 -> 15 per 5 s, same memory use, median 83.1
 	// -> 66.8 ms, mean 76.7 -> 72.5 ms. Above the critical mark the age stays 2 frames.
-	// But 120 from startup loses UI glyphs (run 30: the title menu draws "C N INU G M"): a buffer
-	// kept alive over an image's memory feeds the image stale bytes (see GC comment below and
-	// SynchronizeBufferFromImage). Default back to 4.
+	// But 120 for every buffer loses UI glyphs (run 30: the title menu draws "C N INU G M"): a
+	// buffer kept alive over an image's memory feeds the image stale bytes (see the GC comment
+	// below and SynchronizeBufferFromImage). So the longer age applies only to buffers that share
+	// no bytes with a cached image; those keep the base age of 4 frames.
 	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 4);
 	const uint64_t relaxed_age =
 	    static_cast<uint64_t>(std::max<int64_t>(2, gc_age.load(std::memory_order_relaxed)));
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : relaxed_age, clock);
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
+	// Kept buffers stay at the front of the LRU list; bound the walk past them.
+	constexpr size_t MaxKeptVisits = 256;
+	size_t           kept_visits   = 0;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count  = 0;
@@ -1505,6 +1510,11 @@ void BufferCache::RunGarbageCollector() {
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
+		}
+		if (!aggressive && relaxed_age > age &&
+		    clock - m_lru_cache.TickOf(buffer.lru_id) < relaxed_age &&
+		    !m_texture_cache.HasImagesInRegion(buffer.CpuAddress(), buffer.Size())) {
+			return ++kept_visits == MaxKeptVisits;
 		}
 		if (OverlapsPendingWriteReadback(buffer.CpuAddress(),
 		                                 buffer.CpuAddress() + buffer.Size())) {

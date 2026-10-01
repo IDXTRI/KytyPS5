@@ -66,6 +66,8 @@ public:
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// A writable buffer binding over [address, address + size): the shader may write any of it.
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Any cached image shares bytes with [address, address + size).
+	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
