@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -11,8 +12,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -322,6 +325,145 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
+// The value of an immediate as SrtWalker evaluates it; false for types it does not evaluate.
+bool ImmediateValue(Value value, uint64_t& result) {
+	switch (value.GetType()) {
+		case Type::U1: result = value.U1(); return true;
+		case Type::U8: result = value.U8(); return true;
+		case Type::U16: result = value.U16(); return true;
+		case Type::U32: result = value.U32(); return true;
+		case Type::U64: result = value.U64(); return true;
+		case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
+		default: return false;
+	}
+}
+
+// Builds a plan's CompiledSrt: one node per instruction its roots reach, immediates folded into
+// constant nodes. Only the argument layout is decided here; opcodes keep SrtWalker's semantics.
+class SrtCompiler {
+public:
+	explicit SrtCompiler(const ResourcePlan& program): m_program(program) {}
+
+	std::shared_ptr<const CompiledSrt> Run() {
+		auto compiled = std::make_shared<CompiledSrt>();
+		m_out         = compiled.get();
+		for (const auto& read: m_program.srt_reads) {
+			m_out->srt_reads.push_back(NodeFor(read.value));
+		}
+		for (const auto& source: m_program.descriptor_sources) {
+			std::array<int32_t, 8> dwords {};
+			dwords.fill(CompiledSrt::None);
+			for (uint32_t i = 0; i < source.dword_count && i < dwords.size(); i++) {
+				dwords[i] = NodeFor(source.dwords[i]);
+			}
+			m_out->descriptors.push_back(dwords);
+		}
+		for (const auto& block: m_program.control_flow) {
+			m_out->conditions.push_back(block.condition.IsEmpty() ? CompiledSrt::None
+			                                                      : NodeFor(block.condition));
+		}
+		return m_ok ? compiled : nullptr;
+	}
+
+private:
+	int32_t Add(CompiledSrt::Node node) {
+		m_out->nodes.push_back(node);
+		return static_cast<int32_t>(m_out->nodes.size() - 1);
+	}
+
+	int32_t NodeFor(Value value) {
+		value = value.Resolve();
+		if (value.IsEmpty()) {
+			return Add({});
+		}
+		if (value.IsImmediate()) {
+			CompiledSrt::Node node {};
+			if (ImmediateValue(value, node.value)) {
+				node.kind = CompiledSrt::Kind::Constant;
+			}
+			return Add(node);
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return Add({});
+		}
+		if (const auto found = m_out->index.find(inst); found != m_out->index.end()) {
+			return found->second;
+		}
+		CompiledSrt::Node node {};
+		node.inst          = inst;
+		node.kind          = CompiledSrt::Kind::Inst;
+		const auto id      = Add(node);
+		m_out->index[inst] = id;
+		std::array<int32_t, 8> args {};
+		args.fill(CompiledSrt::None);
+		size_t count = 0;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::Phi: {
+				const auto resolved =
+				    ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(inst)));
+				args[0] = resolved.IsEmpty() ? Add({}) : NodeFor(resolved);
+				count   = 1;
+				break;
+			}
+			case ValueOpcode::ReadConst: {
+				const auto slot = inst->Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+				    slot.U32() < m_program.srt_reads.size()) {
+					args[0] = NodeFor(m_program.srt_reads[slot.U32()].value);
+					count   = 1;
+				}
+				break;
+			}
+			// Nested walkers with an EXEC mask: the plan keeps the IR walker.
+			case ValueOpcode::ReadFirstLane: m_ok = false; break;
+			default:
+				if (inst->NumArgs() > args.size()) {
+					m_ok = false;
+					break;
+				}
+				count = inst->NumArgs();
+				for (size_t i = 0; i < count; i++) {
+					args[i] = NodeFor(inst->Arg(i));
+				}
+				break;
+		}
+		m_out->nodes[static_cast<size_t>(id)].args     = args;
+		m_out->nodes[static_cast<size_t>(id)].num_args = static_cast<uint8_t>(count);
+		return id;
+	}
+
+	const ResourcePlan& m_program;
+	CompiledSrt*        m_out = nullptr;
+	bool                m_ok  = true;
+};
+
+// KYTY_SRT_COMPILED (live): 0 walks the IR, 1 evaluates compiled plans, 2 evaluates every root
+// both ways and logs the first mismatches (results come from the IR walker).
+int64_t CompiledMode() {
+	static auto& mode = Common::LiveSwitches::Get("KYTY_SRT_COMPILED", 0);
+	return mode.load(std::memory_order_relaxed);
+}
+
+const CompiledSrt* GetCompiled(const ResourcePlan& program) {
+	if (!program.compiled_srt_tried) {
+		program.compiled_srt_tried = true;
+		program.compiled_srt       = SrtCompiler(program).Run();
+		static std::atomic<uint32_t> reported {0};
+		if (program.compiled_srt == nullptr &&
+		    reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr, "SRT plan not compiled (walker kept): shader 0x%016llx\n",
+			             static_cast<unsigned long long>(program.shader_hash));
+		}
+	}
+	return program.compiled_srt.get();
+}
+
+// A handle argument's own arguments are its IR arguments unless the node rewrote them.
+bool HasIrArgs(const CompiledSrt::Node& node) {
+	const auto op = node.inst->GetOpcode();
+	return op != ValueOpcode::Phi && op != ValueOpcode::ReadConst;
+}
 
 } // namespace
 
@@ -330,13 +472,29 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      Value active_mask)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_context(AcquireContext(program)) {
+	const auto mode = m_active_mask.IsEmpty() ? CompiledMode() : 0;
+	if (mode != 0) {
+		m_compiled = GetCompiled(program);
+		m_compare  = mode == 2;
+		if (m_compiled != nullptr && m_context.node_values.size() < m_compiled->nodes.size()) {
+			m_context.node_values.resize(m_compiled->nodes.size());
+		}
+	}
+}
 
 SrtWalker::~SrtWalker() {
 	--m_program.evaluation_depth;
 }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
+	if (m_compiled != nullptr && m_node == nullptr) {
+		if (const auto* inst = value.Resolve().TryInstruction(); inst != nullptr) {
+			if (const auto found = m_compiled->index.find(inst); found != m_compiled->index.end()) {
+				return EvaluateRoot(found->second, value, result);
+			}
+		}
+	}
 	uint64_t wide = 0;
 	if (!EvaluateWide(value, wide)) {
 		return false;
@@ -365,15 +523,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return true;
 	}
 	if (value.IsImmediate()) {
-		switch (value.GetType()) {
-			case Type::U1: result = value.U1(); return true;
-			case Type::U8: result = value.U8(); return true;
-			case Type::U16: result = value.U16(); return true;
-			case Type::U32: result = value.U32(); return true;
-			case Type::U64: result = value.U64(); return true;
-			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
-		}
+		return ImmediateValue(value, result);
 	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
@@ -396,8 +546,10 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
-	uint64_t   out                     = 0;
-	const bool evaluated               = EvaluateInst(*inst, out);
+	uint64_t    out                    = 0;
+	const auto* node                   = std::exchange(m_node, nullptr);
+	const bool  evaluated              = EvaluateInst(*inst, out);
+	m_node                             = node;
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
@@ -411,11 +563,107 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	return true;
 }
 
+bool SrtWalker::EvaluateNode(int32_t id, uint64_t& result) {
+	if (id < 0) {
+		return false;
+	}
+	const auto& node = m_compiled->nodes[static_cast<size_t>(id)];
+	if (node.kind == CompiledSrt::Kind::Constant) {
+		result = node.value;
+		return true;
+	}
+	if (node.kind == CompiledSrt::Kind::Fail) {
+		return false;
+	}
+	auto& memo = m_context.node_values[static_cast<size_t>(id)];
+	if (memo.generation == m_context.generation) {
+		result = memo.value;
+		return true;
+	}
+	// The low generation bit marks a node that is still being evaluated.
+	if (memo.generation == (m_context.generation | 1u)) {
+		return false;
+	}
+	memo.generation       = m_context.generation | 1u;
+	uint64_t    out       = 0;
+	const auto* previous  = std::exchange(m_node, &node);
+	const bool  evaluated = EvaluateInst(*node.inst, out);
+	m_node                = previous;
+	auto& entry           = m_context.node_values[static_cast<size_t>(id)];
+	if (!evaluated) {
+		if (m_failed_value == nullptr) m_failed_value = node.inst;
+		entry.generation = 0;
+		return false;
+	}
+	entry.value      = out;
+	entry.generation = m_context.generation;
+	result           = out;
+	return true;
+}
+
+bool SrtWalker::EvaluateRoot(int32_t node, Value value, uint32_t& result) {
+	if (m_compiled == nullptr) {
+		return Evaluate(value, result);
+	}
+	uint64_t   compiled    = 0;
+	const bool compiled_ok = EvaluateNode(node, compiled);
+	if (!m_compare) {
+		result = static_cast<uint32_t>(compiled);
+		return compiled_ok;
+	}
+	uint64_t                     walked    = 0;
+	const bool                   walked_ok = EvaluateWide(value, walked);
+	static std::atomic<uint64_t> compared {0};
+	if (const auto count = ++compared; (count & (count - 1)) == 0) {
+		std::fprintf(stderr, "SRT compiled compare: %llu roots compared\n",
+		             static_cast<unsigned long long>(count));
+	}
+	if (compiled_ok != walked_ok ||
+	    (walked_ok && static_cast<uint32_t>(compiled) != static_cast<uint32_t>(walked))) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::fprintf(stderr,
+			             "SRT compiled mismatch: shader 0x%016llx node %d: compiled %s 0x%08x, "
+			             "walker %s 0x%08x\n",
+			             static_cast<unsigned long long>(m_program.shader_hash), node,
+			             compiled_ok ? "ok" : "failed", static_cast<uint32_t>(compiled),
+			             walked_ok ? "ok" : "failed", static_cast<uint32_t>(walked));
+		}
+	}
+	result = static_cast<uint32_t>(walked);
+	return walked_ok;
+}
+
+int32_t SrtWalker::CurrentNodeArg(const Inst& inst, size_t index) const {
+	if (m_node == nullptr || m_node->inst != &inst || index >= m_node->num_args) {
+		return CompiledSrt::None;
+	}
+	return m_node->args[index];
+}
+
 bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
+	if (m_node != nullptr && m_node->inst == &inst) {
+		return EvaluateNode(m_node->args[index], result);
+	}
 	return EvaluateWide(inst.Arg(index), result);
 }
 
+bool SrtWalker::HandleArg(const Inst& inst, size_t handle, size_t index, uint64_t& result) {
+	const auto node = CurrentNodeArg(inst, handle);
+	if (node >= 0) {
+		const auto& owner = m_compiled->nodes[static_cast<size_t>(node)];
+		if (owner.kind == CompiledSrt::Kind::Inst && HasIrArgs(owner) && index < owner.num_args) {
+			return EvaluateNode(owner.args[index], result);
+		}
+	}
+	const auto* owner = inst.Arg(handle).ResolveInstruction();
+	return owner != nullptr && EvaluateWide(owner->Arg(index), result);
+}
+
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
+	if (const auto node = CurrentNodeArg(inst, 0); node >= 0) {
+		return EvaluateNode(node, result);
+	}
 	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
 	return !value.IsEmpty() && EvaluateWide(value, result);
 }
@@ -442,12 +690,12 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		return false;
 	}
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-		return EvaluateWide(source->Arg(component), result);
+		return HandleArg(inst, 0, component, result);
 	}
 	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
 		uint64_t lhs = 0;
 		uint64_t rhs = 0;
-		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
+		if (!HandleArg(inst, 0, 0, lhs) || !HandleArg(inst, 0, 1, rhs)) {
 			return false;
 		}
 		const auto sum =
@@ -471,7 +719,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+	if (!HandleArg(inst, 0, 0, low) || !HandleArg(inst, 0, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
@@ -480,7 +728,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+		if (handle->NumArgs() != 4u || !HandleArg(inst, 0, 2, records) ||
+		    !HandleArg(inst, 0, 3, word3)) {
 			return false;
 		}
 		if (immediate < 0) {
@@ -538,9 +787,10 @@ bool SrtWalker::EvaluateBufferRead(const Inst& inst, uint64_t& result) {
 		return true;
 	}
 	ShaderBufferResource descriptor;
-	const auto&          handle = *inst.Arg(0).ResolveInstruction();
 	for (uint32_t i = 0; i < 4u; i++) {
-		if (!Evaluate(handle.Arg(i), descriptor.fields[i])) return false;
+		uint64_t field = 0;
+		if (!HandleArg(inst, 0, i, field)) return false;
+		descriptor.fields[i] = static_cast<uint32_t>(field);
 	}
 	// Lane-indexed and swizzled addressing are not uniform raw linear reads.
 	if (descriptor.Type() != 0u || descriptor.AddTid() || descriptor.SwizzleEnabled() ||
@@ -610,10 +860,17 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return false;
 			}
+			const auto node = CurrentNodeArg(inst, 0);
 			if (slot.U32() < m_clean_flat_slots.size() && m_clean_flat_slots[slot.U32()] != 0u &&
 			    m_clean_evaluator != nullptr) {
+				if (node >= 0 && m_clean_evaluator->m_compiled == m_compiled) {
+					return m_clean_evaluator->EvaluateNode(node, result);
+				}
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
 				                                       result);
+			}
+			if (node >= 0) {
+				return EvaluateNode(node, result);
 			}
 			return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 		}
@@ -853,8 +1110,12 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectF32: {
-			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-			if (predicate.EvaluateWide(inst.Arg(0), a)) {
+			auto&      predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			const auto node      = CurrentNodeArg(inst, 0);
+			const bool evaluated = node >= 0 && predicate.m_compiled == m_compiled
+			                           ? predicate.EvaluateNode(node, a)
+			                           : predicate.EvaluateWide(inst.Arg(0), a);
+			if (evaluated) {
 				return Arg(inst, a != 0u ? 1u : 2u, result);
 			}
 			return false;
@@ -936,7 +1197,11 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	result                 = {};
 	result.dword_count     = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
-		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+		const bool evaluated = m_compiled != nullptr
+		                           ? EvaluateRoot(m_compiled->descriptors[source][index],
+		                                          descriptor.dwords[index], result.dwords[index])
+		                           : Evaluate(descriptor.dwords[index], result.dwords[index]);
+		if (!evaluated) {
 			return false;
 		}
 	}
@@ -972,7 +1237,9 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		}
 		uint32_t condition = 0;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(block.condition, condition)) {
+		    (m_compiled != nullptr
+		         ? EvaluateRoot(m_compiled->conditions[index], block.condition, condition)
+		         : Evaluate(block.condition, condition))) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1014,8 +1281,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
 			return report("no clean reader", index, read.flat_offset, clean);
 		}
-		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+		auto&      evaluator = clean ? *m_clean_evaluator : *this;
+		const bool compiled  = evaluator.m_compiled != nullptr;
+		if (read.flat_offset >= flat.size() ||
+		    !(compiled ? evaluator.EvaluateRoot(evaluator.m_compiled->srt_reads[index], read.value,
+		                                        flat[read.flat_offset])
+		               : evaluator.Evaluate(read.value, flat[read.flat_offset]))) {
 			return report("value unreadable", index, read.flat_offset, clean);
 		}
 	}

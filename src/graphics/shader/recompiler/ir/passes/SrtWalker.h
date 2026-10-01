@@ -4,7 +4,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <cstdint>
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -29,6 +32,26 @@ struct SrtRuntime {
 };
 
 enum class RuntimeValueType { Any, Integer };
+
+// A ResourcePlan compiled for evaluation (KYTY_SRT_COMPILED): every value its roots reach,
+// resolved once (identity chains, invariant phis, ReadConst's SRT read), with arguments as node
+// indices. Evaluation stays lazy and uses SrtWalker's opcode semantics.
+struct CompiledSrt {
+	static constexpr int32_t None = -1;
+	enum class Kind : uint8_t { Fail, Constant, Inst };
+	struct Node {
+		const Inst*            inst     = nullptr;
+		uint64_t               value    = 0;
+		Kind                   kind     = Kind::Fail;
+		uint8_t                num_args = 0;
+		std::array<int32_t, 8> args {};
+	};
+	std::vector<Node>                        nodes;
+	std::unordered_map<const Inst*, int32_t> index;
+	std::vector<int32_t>                     srt_reads;
+	std::vector<std::array<int32_t, 8>>      descriptors;
+	std::vector<int32_t>                     conditions;
+};
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
@@ -55,7 +78,14 @@ private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
+	// KYTY_SRT_COMPILED: evaluates a compiled node (the IR value `value` for the comparison mode).
+	bool EvaluateRoot(int32_t node, Value value, uint32_t& result);
+	bool EvaluateNode(int32_t node, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
+	// Argument `index` of the instruction that is argument `handle` of inst (a resolved handle).
+	bool HandleArg(const Inst& inst, size_t handle, size_t index, uint64_t& result);
+	// Argument `index` of inst as a compiled node, if inst is the node being evaluated.
+	[[nodiscard]] int32_t CurrentNodeArg(const Inst& inst, size_t index) const;
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
@@ -69,6 +99,11 @@ private:
 	Value                           m_active_mask;
 	const Inst*                     m_failed_value = nullptr;
 	ResourcePlan::EvaluationContext& m_context;
+	// KYTY_SRT_COMPILED: the plan's compiled form (null: walk the IR), the node being evaluated,
+	// and whether every root is evaluated both ways and compared (mode 2).
+	const CompiledSrt*       m_compiled = nullptr;
+	const CompiledSrt::Node* m_node     = nullptr;
+	bool                     m_compare  = false;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
 	uint64_t    m_read_failure_address = 0;

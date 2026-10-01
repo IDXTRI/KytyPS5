@@ -579,6 +579,9 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// SrtWalker's compiled form of a plan (KYTY_SRT_COMPILED, see SrtWalker.cpp).
+struct CompiledSrt;
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -589,6 +592,8 @@ struct ResourcePlan {
 		};
 
 		std::vector<Entry> values;
+		// The same memo, indexed by CompiledSrt node.
+		std::vector<Entry> node_values;
 		uint64_t           generation = 0;
 	};
 
@@ -635,6 +640,10 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Built on first use by SrtWalker when KYTY_SRT_COMPILED is on; null if the plan cannot be
+	// compiled. Its nodes point into value_storage, which a move keeps in place.
+	mutable std::shared_ptr<const CompiledSrt> compiled_srt;
+	mutable bool                               compiled_srt_tried = false;
 };
 
 struct Program: ResourcePlan {
