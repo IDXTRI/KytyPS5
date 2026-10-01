@@ -180,7 +180,9 @@ struct CommandScheduler::GpuTimer {
 				         " command buffers\n",
 				         elapsed, busy_ms_per_s, busy_ms_per_s / 10.0, buffers);
 				std::fflush(stdout);
-				TracyPlot("GPU busy ms/s", busy_ms_per_s);
+				if (tracy::ProfilerAvailable()) {
+					TracyPlot("GPU busy ms/s", busy_ms_per_s);
+				}
 			}
 			busy_ns = 0;
 			buffers = 0;
@@ -456,7 +458,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
-	m_gpu_timer->Collect([this](uint64_t tick) { return m_master.IsFree(tick); });
+	m_gpu_timer->Collect([this](uint64_t tick) { return IsFree(tick); });
 	m_gpu_timer->Begin(m_command.Handle());
 	return m_command;
 }

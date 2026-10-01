@@ -57,6 +57,12 @@ struct Lifecycle {
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
 
-#define KYTY_PROFILER_FRAME() FrameMark
+// Tracy's FrameMark needs a started profiler (manual lifetime: only with --profile).
+#define KYTY_PROFILER_FRAME()                                                                      \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			FrameMark;                                                                             \
+		}                                                                                          \
+	} while (false)
 
 #endif /* KYTY_COMMON_PROFILER_H_ */
