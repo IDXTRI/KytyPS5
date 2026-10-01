@@ -257,9 +257,10 @@ bool AsyncWriteReadbackEnabled() {
 
 // A guest fault on GPU-written memory downloads an aligned window around the faulting bytes, so
 // nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a live switch; a power of two,
-// at least the tracker page) changes its width for A/B measurements; the default is 512 KiB.
+// at least the tracker page) changes its width for A/B measurements. The default, 2 MiB, measured
+// best in Marvel's Wolverine (512 KiB +3.5% frame time, 8 MiB +6%, 64 KiB +17%).
 uint64_t ReadbackWindowSize() {
-	constexpr int64_t DefaultKib = 512;
+	constexpr int64_t DefaultKib = 2048;
 	static auto&      kib        = Common::LiveSwitches::Get("KYTY_READBACK_WINDOW_KB", DefaultKib);
 	const auto        value      = kib.load(std::memory_order_relaxed);
 	const auto        bytes      = static_cast<uint64_t>(value) * 1024;

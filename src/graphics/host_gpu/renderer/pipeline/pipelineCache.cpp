@@ -142,7 +142,7 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 
 // The resource walker reads guest memory one dword per scalar load, and every read pays the
 // GPU-ownership checks and the address-space lock. With KYTY_SHADER_READ_CHUNKS=1 (a live
-// switch, off by default) one program lookup reads each aligned 256-byte chunk once and serves
+// switch, on by default) one program lookup reads each aligned 256-byte chunk once and serves
 // its dwords from that copy. A chunk with any GPU-owned byte, or one that is not all mapped,
 // is refused and its reads take the per-read path, so the values are the ones read before.
 // The copies live for one lookup only: descriptors change between draws.
@@ -170,7 +170,7 @@ public:
 	}
 
 	static bool Enabled() {
-		static auto& enabled = Common::LiveSwitches::Get("KYTY_SHADER_READ_CHUNKS", 0);
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_SHADER_READ_CHUNKS", 1);
 		return enabled.load(std::memory_order_relaxed) != 0;
 	}
 
