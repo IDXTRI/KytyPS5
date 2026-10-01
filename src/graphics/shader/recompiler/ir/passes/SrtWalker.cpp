@@ -432,6 +432,24 @@ void SrtWalker::BindNative() {
 	m_native_mode         = mode;
 }
 
+bool SrtWalker::UseNativeTables() const {
+	return m_native != nullptr;
+}
+
+bool SrtWalker::EvaluateNative(const SrtNativeValue& value, uint64_t& result) {
+	switch (value.kind) {
+		case SrtNativeValue::Immediate: result = value.immediate; return true;
+		case SrtNativeValue::Routine: {
+			const bool ok = m_native->Evaluate(m_native_frame, m_native_mode, value.index, result);
+			return NativeVerify() ? VerifyNative(Value(const_cast<Inst*>(value.inst)), ok, result) : ok;
+		}
+		case SrtNativeValue::Interpret:
+			return EvaluateWide(Value(const_cast<Inst*>(value.inst)), result);
+		case SrtNativeValue::Fail: return false;
+	}
+	return false;
+}
+
 bool SrtWalker::VerifyNative(Value value, bool native_ok, uint64_t native_result) {
 	const bool suppressed = g_native_suppressed;
 	g_native_suppressed   = true;
@@ -1065,6 +1083,17 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result                 = {};
 	result.dword_count     = descriptor.dword_count;
+	if (UseNativeTables() && descriptor.dword_count <= 8u) {
+		const auto* dwords = m_native->DescriptorDwords(source);
+		for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+			uint64_t wide = 0;
+			if (!EvaluateNative(dwords[index], wide)) {
+				return false;
+			}
+			result.dwords[index] = static_cast<uint32_t>(wide);
+		}
+		return true;
+	}
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -1101,8 +1130,17 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 			active[source] = 1u;
 		}
 		uint32_t condition = 0;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(block.condition, condition)) {
+		bool     known     = false;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
+			if (UseNativeTables()) {
+				uint64_t wide = 0;
+				known         = EvaluateNative(m_native->Conditions()[index], wide);
+				condition     = static_cast<uint32_t>(wide);
+			} else {
+				known = Evaluate(block.condition, condition);
+			}
+		}
+		if (known) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1145,7 +1183,18 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			return report("no clean reader", index, read.flat_offset, clean);
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+		if (read.flat_offset >= flat.size()) {
+			return report("value unreadable", index, read.flat_offset, clean);
+		}
+		if (evaluator.UseNativeTables()) {
+			uint64_t wide = 0;
+			if (!evaluator.EvaluateNative(evaluator.m_native->FlatReads()[index], wide)) {
+				return report("value unreadable", index, read.flat_offset, clean);
+			}
+			flat[read.flat_offset] = static_cast<uint32_t>(wide);
+			continue;
+		}
+		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
 			return report("value unreadable", index, read.flat_offset, clean);
 		}
 	}
