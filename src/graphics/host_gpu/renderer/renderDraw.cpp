@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -358,8 +359,30 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	// KYTY_STATE_CACHE: record only the dynamic state that differs from what this command buffer
+	// already holds (see CommandBuffer::DynamicState).
+	static auto& state_cache = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 0);
+	auto&        cached      = buffer.GetDynamicState();
+	const bool   use_cache   = state_cache.load(std::memory_order_relaxed) != 0;
+	const bool   known       = use_cache && cached.valid;
+	if (!use_cache) {
+		cached = {};
+	}
+	const auto viewport_bytes = sizeof(vk::Viewport) * viewport_count;
+	const auto scissor_bytes  = sizeof(vk::Rect2D) * viewport_count;
+	if (!known || cached.viewport_count != viewport_count ||
+	    std::memcmp(cached.viewports.data(), viewports.data(), viewport_bytes) != 0) {
+		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+	}
+	if (!known || cached.viewport_count != viewport_count ||
+	    std::memcmp(cached.scissors.data(), scissors.data(), scissor_bytes) != 0) {
+		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	}
+	if (use_cache) {
+		cached.viewport_count = viewport_count;
+		std::memcpy(cached.viewports.data(), viewports.data(), viewport_bytes);
+		std::memcpy(cached.scissors.data(), scissors.data(), scissor_bytes);
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -372,20 +395,33 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	if (!known || cached.line_width != line_width) {
+		vk_buffer.setLineWidth(line_width);
+	}
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	if (!known || cached.blend_constants != blend_constants) {
+		vk_buffer.setBlendConstants(blend_constants.data());
+	}
+	if (!known || cached.depth_test_enable != depth.depth_test_enable) {
+		vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
+	}
+	if (!known || cached.depth_write_enable != depth.depth_write_enable) {
+		vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
+	}
+	if (!known || cached.depth_compare_op != depth.depth_compare_op) {
+		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	}
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	if (!known || cached.depth_bias_enable != depth_bias_enable) {
+		vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	}
+	std::array<float, 3> depth_bias {};
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -394,19 +430,57 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		depth_bias = {constant_factor, poly_offset.clamp, slope_factor};
+		// The bias values only matter while biasing is enabled, so they are compared then only.
+		if (!known || !cached.depth_bias_enable || cached.depth_bias != depth_bias) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		}
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	if (!known || cached.stencil_test_enable != depth.stencil_test_enable) {
+		vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	}
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
+		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state,
+		                             const vk::StencilOpState& previous) {
+			const bool all = !known || !cached.stencil_test_enable;
+			if (all || state.failOp != previous.failOp || state.passOp != previous.passOp ||
+			    state.depthFailOp != previous.depthFailOp ||
+			    state.compareOp != previous.compareOp) {
+				vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp,
+				                       state.compareOp);
+			}
+			if (all || state.compareMask != previous.compareMask) {
+				vk_buffer.setStencilCompareMask(face, state.compareMask);
+			}
+			if (all || state.writeMask != previous.writeMask) {
+				vk_buffer.setStencilWriteMask(face, state.writeMask);
+			}
+			if (all || state.reference != previous.reference) {
+				vk_buffer.setStencilReference(face, state.reference);
+			}
 		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front, cached.stencil_front);
+		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back, cached.stencil_back);
+	}
+	if (use_cache) {
+		cached.valid              = true;
+		cached.line_width         = line_width;
+		cached.blend_constants    = blend_constants;
+		cached.depth_test_enable  = depth.depth_test_enable;
+		cached.depth_write_enable = depth.depth_write_enable;
+		cached.depth_compare_op   = depth.depth_compare_op;
+		// Keep the last bias values recorded: they still hold while biasing is off.
+		if (depth_bias_enable) {
+			cached.depth_bias = depth_bias;
+		}
+		cached.depth_bias_enable = depth_bias_enable;
+		// Likewise the stencil state recorded last stays in the command buffer while it is off.
+		if (depth.stencil_test_enable) {
+			cached.stencil_front = depth.stencil_front;
+			cached.stencil_back  = depth.stencil_back;
+		}
+		cached.stencil_test_enable = depth.stencil_test_enable;
 	}
 
 #if defined(__APPLE__)
@@ -1249,7 +1323,13 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	// KYTY_STATE_CACHE: the same pipeline bound again is a no-op. GetDynamicState().valid is set
+	// only while the cache is on (SetGraphicsDynamicParams above).
+	if (auto& cached = buffer.GetDynamicState();
+	    !cached.valid || cached.pipeline != pipeline.pipeline) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		cached.pipeline = pipeline.pipeline;
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

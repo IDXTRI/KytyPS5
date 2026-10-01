@@ -31,6 +31,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer = Handle();
+	InvalidateDynamicState();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;

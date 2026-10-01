@@ -193,6 +193,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+	// Another graphics pipeline and viewport: the draws' cached dynamic state no longer holds.
+	command_buffer.InvalidateDynamicState();
 }
 
 } // namespace Libs::Graphics

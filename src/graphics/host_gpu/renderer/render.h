@@ -127,6 +127,30 @@ public:
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
+	// KYTY_STATE_CACHE: the graphics dynamic state and pipeline last recorded into this command
+	// buffer, so a draw records only what changed. All draw pipelines share the same dynamic
+	// states, so their values survive pipeline binds. Cleared when the command buffer begins and
+	// by recordings that bind other graphics pipelines (InvalidateDynamicState).
+	struct DynamicState {
+		bool                         valid          = false;
+		vk::Pipeline                 pipeline       = nullptr;
+		uint32_t                     viewport_count = 0;
+		std::array<vk::Viewport, 16> viewports {};
+		std::array<vk::Rect2D, 16>   scissors {};
+		float                        line_width = 0.0f;
+		std::array<float, 4>         blend_constants {};
+		bool                         depth_test_enable  = false;
+		bool                         depth_write_enable = false;
+		vk::CompareOp                depth_compare_op   = vk::CompareOp::eNever;
+		bool                         depth_bias_enable  = false;
+		std::array<float, 3>         depth_bias {};
+		bool                         stencil_test_enable = false;
+		vk::StencilOpState           stencil_front {};
+		vk::StencilOpState           stencil_back {};
+	};
+	[[nodiscard]] DynamicState& GetDynamicState() const noexcept { return m_dynamic_state; }
+	void                        InvalidateDynamicState() const noexcept { m_dynamic_state = {}; }
+
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
@@ -149,6 +173,7 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
+	mutable DynamicState m_dynamic_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
