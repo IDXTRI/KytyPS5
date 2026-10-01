@@ -1774,8 +1774,10 @@ void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint3
 // published by the completion thread whenever its tick completes, and every processed slice ends
 // with a flush (a slice blocked on WAIT_REG_MEM too), so batching cannot deadlock: it only delays
 // a label by up to KYTY_LABEL_FLUSH_US after the previous submit. 0 submits on every label.
+// Wolverine, standing still: 0 → 200 ms/frame, 500 → 167 ms (submits 10k/s → 1.6k/s); 250 and
+// 1000 measured the same as 500, 2000 slightly slower.
 void CommandProcessor::FlushForLabel() {
-	static auto& interval_us = Common::LiveSwitches::Get("KYTY_LABEL_FLUSH_US", 0);
+	static auto& interval_us = Common::LiveSwitches::Get("KYTY_LABEL_FLUSH_US", 500);
 	const auto   interval    = interval_us.load(std::memory_order_relaxed);
 	auto&        scheduler   = GetScheduler();
 	if (interval > 0) {
