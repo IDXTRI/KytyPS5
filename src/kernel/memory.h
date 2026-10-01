@@ -119,6 +119,10 @@ bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
+// work has written any of them, else nullptr. Current until the GPU thread marks them
+// GPU-written or the guest remaps them.
+[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);

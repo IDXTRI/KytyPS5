@@ -187,6 +187,24 @@ public:
 		    });
 	}
 
+	// The backing bytes of [vaddr, vaddr + size) when one mapping holds all of them, else nullptr.
+	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		std::lock_guard lock(m_mutex);
+		auto            mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return nullptr;
+		}
+		const auto& entry = std::prev(mapping)->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+			return nullptr;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -735,6 +753,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
+		return m_backing->FindBacking(vaddr, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

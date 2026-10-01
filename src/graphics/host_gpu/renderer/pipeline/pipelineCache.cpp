@@ -148,11 +148,13 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 }
 
 // The resource walker reads guest memory one dword per scalar load, and every read pays the
-// GPU-ownership checks and the address-space lock. With KYTY_SHADER_READ_CHUNKS=1 (a live
-// switch, on by default) one program lookup reads each aligned 256-byte chunk once and serves
-// its dwords from that copy. A chunk with any GPU-owned byte, or one that is not all mapped,
-// is refused and its reads take the per-read path, so the values are the ones read before.
-// The copies live for one lookup only: descriptors change between draws.
+// GPU-ownership checks and the address-space lock. KYTY_SHADER_READ_CHUNKS (a live switch):
+// 1 reads each aligned 256-byte chunk once per program lookup and serves its dwords from that
+// copy; 2 (default) looks up each 4 KiB page's backing bytes once per lookup (FindGpuCleanBacking,
+// after Senaxx 820f72e5) and copies every later read of the page straight from them. A chunk or
+// page with any GPU-owned byte, or one that is not all mapped, is refused and its reads take the
+// per-read path, so the values are the ones read before. Nothing marks a page GPU-written during
+// one synchronous lookup on the GPU thread; the verdicts live for one lookup only.
 // The same object can log every read and its result (KYTY_RESOURCE_MEMO, ProgramCache).
 class ShaderReadChunks {
 public:
@@ -167,10 +169,13 @@ public:
 		std::vector<uint32_t>   words;
 	};
 
-	explicit ShaderReadChunks(bool chunks): m_chunks(chunks) {}
+	explicit ShaderReadChunks(int64_t mode): m_chunks(mode == 1), m_pages(mode == 2) {}
 
 	// Returns false when the chunk cannot serve the read; the caller reads as before.
 	bool Read(uint64_t address, std::span<uint32_t> values) {
+		if (m_pages) {
+			return ReadPage(address, values);
+		}
 		if (!m_chunks) {
 			return false;
 		}
@@ -208,9 +213,10 @@ public:
 		}
 	}
 
-	static bool Enabled() {
-		static auto& enabled = Common::LiveSwitches::Get("KYTY_SHADER_READ_CHUNKS", 1);
-		return enabled.load(std::memory_order_relaxed) != 0;
+	static int64_t Mode() {
+		// Wolverine run 23: see PROGRESS.md for the 1 vs 2 A/B.
+		static auto& mode = Common::LiveSwitches::Get("KYTY_SHADER_READ_CHUNKS", 2);
+		return mode.load(std::memory_order_relaxed);
 	}
 
 private:
@@ -222,6 +228,40 @@ private:
 		std::array<uint32_t, ChunkSize / sizeof(uint32_t)> words;
 	};
 
+	struct Page {
+		uint64_t       base    = UINT64_MAX;
+		const uint8_t* backing = nullptr;
+	};
+
+	bool ReadPage(uint64_t address, std::span<uint32_t> values) {
+		const auto base = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		if (values.empty() ||
+		    Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE) != base) {
+			return false;
+		}
+		const Page* page = nullptr;
+		for (size_t i = 0; i < m_page_count; i++) {
+			if (m_pages_cache[i].base == base) {
+				page = &m_pages_cache[i];
+				break;
+			}
+		}
+		if (page == nullptr) {
+			auto& slot = m_page_count < m_pages_cache.size()
+			                 ? m_pages_cache[m_page_count++]
+			                 : m_pages_cache[m_next_page++ % m_pages_cache.size()];
+			slot       = {.base = base,
+			              .backing =
+			                  Libs::LibKernel::Memory::FindGpuCleanBacking(base, TRACKER_PAGE_SIZE)};
+			page       = &slot;
+		}
+		if (page->backing == nullptr) {
+			return false;
+		}
+		std::memcpy(values.data(), page->backing + (address - base), values.size_bytes());
+		return true;
+	}
+
 	Slot* Find(uint64_t base) {
 		for (auto& slot: m_slots) {
 			if (slot.base == base) {
@@ -231,10 +271,14 @@ private:
 		return nullptr;
 	}
 
-	bool                m_chunks = false;
-	ReadLog*            m_log    = nullptr;
-	std::array<Slot, 8> m_slots;
-	size_t              m_next = 0;
+	bool                 m_chunks = false;
+	bool                 m_pages  = false;
+	ReadLog*             m_log    = nullptr;
+	std::array<Slot, 8>  m_slots;
+	size_t               m_next = 0;
+	std::array<Page, 16> m_pages_cache;
+	size_t               m_page_count = 0;
+	size_t               m_next_page  = 0;
 };
 
 // Both SRT readers: only memory the guest has committed. Bytes the GPU has not written are
@@ -760,7 +804,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		ShaderReadChunks                 read_chunks(ShaderReadChunks::Enabled());
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
