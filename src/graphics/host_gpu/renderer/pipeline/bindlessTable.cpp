@@ -19,6 +19,8 @@
 #include <fmt/format.h>
 #include <string>
 #include <cstdlib>
+#include <map>
+#include <tuple>
 
 namespace Libs::Graphics {
 
@@ -215,6 +217,45 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 		     " (%u new)\n",
 		     heap.base, heap.table_offset, heap.flags, heap.region, records.size(),
 		     static_cast<uint32_t>(infos.size()));
+	}
+	// KYTY_SAMPLER_DUMP=1 (environment): the first mirrors of each heap print what its S# records
+	// ask for, grouped: address modes, LOD range, mip filter, unnormalized coordinates, LOD bias.
+	static const bool dump = [] {
+		const char* value = std::getenv("KYTY_SAMPLER_DUMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint32_t> dumped = 0;
+	if (dump && !infos.empty() && dumped.fetch_add(1) < 24) {
+		std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>,
+		         uint32_t>
+		    groups;
+		for (const auto& record: records) {
+			ShaderSamplerResource r;
+			std::copy(record.begin(), record.end(), r.fields);
+			groups[{static_cast<uint32_t>(r.ClampX() | (r.ClampY() << 3u) | (r.ClampZ() << 6u)),
+			        r.MinLod(), r.MaxLod(), static_cast<uint32_t>(r.MipFilter()),
+			        r.ForceUnormCoords() ? 1u : 0u, r.LodBias(),
+			        static_cast<uint32_t>(r.XyMinFilter() | (r.XyMagFilter() << 2u))}]++;
+		}
+		::printf("Sampler heap 0x%016" PRIx64 "+0x%x flags=%u: %zu records, %zu distinct\n", heap.base,
+		         heap.table_offset, heap.flags, records.size(), groups.size());
+		size_t shown = 0;
+		for (const auto& [key, count]: groups) {
+			if (shown++ == 16) {
+				break;
+			}
+			const auto [clamp, min_lod, max_lod, mip, unnorm, bias, filters] = key;
+			::printf("  %4u x clamp=%u/%u/%u min_lod=%.2f max_lod=%.2f mip=%u unnorm=%u "
+			         "bias=0x%04x xyfilt=0x%x\n",
+			         count, clamp & 7u, (clamp >> 3u) & 7u, (clamp >> 6u) & 7u,
+			         static_cast<double>(min_lod) / 256.0, static_cast<double>(max_lod) / 256.0, mip,
+			         unnorm, bias, filters);
+		}
+		for (size_t i = 0; i < std::min<size_t>(records.size(), 4); i++) {
+			::printf("  raw[%zu] = %08x %08x %08x %08x\n", i, records[i][0], records[i][1],
+			         records[i][2], records[i][3]);
+		}
+		std::fflush(stdout);
 	}
 	heap.records.assign(records.begin(), records.end());
 	return true;
