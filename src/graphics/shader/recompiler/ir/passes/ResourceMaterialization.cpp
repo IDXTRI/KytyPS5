@@ -1606,7 +1606,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
 			snapshot.samplers[i].dword_count = 4u;
-			std::ranges::copy(BindlessDefaultSampler, snapshot.samplers[i].dwords.begin());
+			std::ranges::copy(FallbackSampler(), snapshot.samplers[i].dwords.begin());
 			specialization.samplers[i] = {.bindless = true, .bindless_mapping_offset = mapping_offset};
 			DescriptorValue      table;
 			ShaderBufferResource heap;

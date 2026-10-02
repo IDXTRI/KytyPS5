@@ -250,7 +250,7 @@ void Thread::SetCurrentPriority(int level) {
 void Thread::ApplyGpuThreadPriority() {
 	// The emulator's GPU-feeding threads are the bottleneck while ~40 guest threads share 16
 	// logical CPUs at normal priority; other emulators raise their GPU thread the same way.
-	static auto&           level   = LiveSwitches::Get("KYTY_GPU_THREAD_PRIORITY", 1);
+	static auto&           level   = LiveSwitches::Get("KYTY_GPU_THREAD_PRIORITY", 0);
 	thread_local int64_t   applied = -1;
 	const auto             wanted  = level.load(std::memory_order_relaxed);
 	if (wanted != applied) {

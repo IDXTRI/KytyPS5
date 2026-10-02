@@ -955,7 +955,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 	auto& cache = m_context.GetSamplerCache();
 	{
 		ShaderSamplerResource default_sampler;
-		std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
+		std::ranges::copy(ShaderRecompiler::IR::FallbackSampler(), default_sampler.fields);
 		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
 	}
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);

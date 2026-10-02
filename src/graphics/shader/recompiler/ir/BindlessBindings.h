@@ -3,6 +3,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -27,6 +29,22 @@ inline constexpr std::array<uint32_t, 4> BindlessDefaultSampler {
     0xfffu << 12u,                           // max_lod 255.9
     (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
     0x00000000u};
+
+// The sampler used where a bindless sampler cannot be resolved (BindlessDefaultSampler, and the
+// shader-side fallbacks in ResourceTracking). KYTY_DEFAULT_SAMPLER_CLAMP=1 (environment, read
+// once) clamps to the edge texel on every axis instead of wrapping: a texture meant to be drawn
+// once (Wolverine's moon) wrapped repeats across the whole surface.
+inline const std::array<uint32_t, 4>& FallbackSampler() {
+	static const std::array<uint32_t, 4> words = [] {
+		auto        result = BindlessDefaultSampler;
+		const char* clamp  = std::getenv("KYTY_DEFAULT_SAMPLER_CLAMP");
+		if (clamp != nullptr && std::strcmp(clamp, "0") != 0) {
+			result[0] = 2u | (2u << 3u) | (2u << 6u); // CLAMP_X/Y/Z = clamp to last texel
+		}
+		return result;
+	}();
+	return words;
+}
 
 // Research: the tail of the feedback buffer holds loop-watchdog trip reports. Word
 // WatchdogReportBase counts reports; report n is WatchdogReportWords words starting at

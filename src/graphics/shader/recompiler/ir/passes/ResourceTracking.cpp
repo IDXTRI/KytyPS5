@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -2437,11 +2438,8 @@ private:
 		if (!Frontend::TranslationNonFatal()) {
 			return;
 		}
-		constexpr std::array<uint32_t, 4> DefaultSampler {
-		    0x00000000u,                             // wrap on every axis
-		    0xfffu << 12u,                           // max_lod 255.9
-		    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
-		    0x00000000u};
+		// Trilinear, full LOD range; wraps unless KYTY_DEFAULT_SAMPLER_CLAMP (BindlessBindings.h).
+		const auto& DefaultSampler = FallbackSampler();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
@@ -2578,11 +2576,7 @@ private:
 			// filtering and edge addressing can differ from the material's own sampler.
 			if (expected == ValueOpcode::GetSamplerResource && width == 4u &&
 			    Frontend::TranslationNonFatal()) {
-				constexpr std::array<uint32_t, 4> DefaultSampler {
-				    0x00000000u,                             // wrap on every axis
-				    0xfffu << 12u,                           // max_lod 255.9
-				    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
-				    0x00000000u};
+				const auto& DefaultSampler = FallbackSampler();
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					handle->SetArg(dword, Value(DefaultSampler[dword]));
 					descriptor.dwords[dword] = Value(DefaultSampler[dword]);

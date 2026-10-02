@@ -37,7 +37,7 @@ public:
 	// Scheduling priority of the calling thread: 0 normal, 1 above normal, 2 highest
 	// (Windows only; elsewhere a no-op).
 	static void SetCurrentPriority(int level);
-	// Applies the live switch KYTY_GPU_THREAD_PRIORITY (default 1) to the calling thread when it
+	// Applies the live switch KYTY_GPU_THREAD_PRIORITY (default 0) to the calling thread when it
 	// changed since this thread last looked. For the threads that feed the host GPU.
 	static void ApplyGpuThreadPriority();
 
