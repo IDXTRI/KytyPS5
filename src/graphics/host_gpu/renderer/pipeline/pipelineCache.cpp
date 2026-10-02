@@ -707,6 +707,56 @@ struct PipelineCache::ProgramCache {
 		memo_report = now;
 	}
 
+	// KYTY_PREDICT_STATS=1 (live, default 0): how often a lookup finds the same program as the
+	// previous lookup of its stage (a candidate for evaluating the resources ahead from the
+	// upcoming user data), and how often the user data is the same too.
+	struct PredictStage {
+		const SourceEntry*    last = nullptr;
+		std::vector<uint32_t> user_data;
+		uint64_t              same_program = 0, same_inputs = 0, other = 0;
+	};
+	std::array<PredictStage, 3>           predict_stages;
+	std::chrono::steady_clock::time_point predict_report = std::chrono::steady_clock::now();
+
+	void NotePredictability(ShaderType stage, const SourceEntry* entry,
+	                        std::span<const uint32_t> user_data) {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_PREDICT_STATS", 0);
+		if (enabled.load(std::memory_order_relaxed) == 0 || entry == nullptr) {
+			return;
+		}
+		const size_t index = stage == ShaderType::Pixel     ? 1u
+		                     : stage == ShaderType::Compute ? 2u
+		                                                    : 0u;
+		auto&        s     = predict_stages[index];
+		if (s.last == entry) {
+			const bool same = std::ranges::equal(s.user_data, user_data);
+			(same ? s.same_inputs : s.same_program)++;
+		} else {
+			s.other++;
+		}
+		s.last = entry;
+		s.user_data.assign(user_data.begin(), user_data.end());
+		const auto now = std::chrono::steady_clock::now();
+		if (now - predict_report < std::chrono::seconds(5)) {
+			return;
+		}
+		predict_report                       = now;
+		static constexpr const char* Names[] = {"vertex", "pixel", "compute"};
+		::printf("Predictability (5 s):");
+		for (size_t i = 0; i < predict_stages.size(); i++) {
+			auto&      p     = predict_stages[i];
+			const auto total = p.same_program + p.same_inputs + p.other;
+			::printf(" %s %" PRIu64 ": same program %.1f%% (same inputs %.1f%%)", Names[i], total,
+			         total ? 100.0 * static_cast<double>(p.same_program + p.same_inputs) /
+			                     static_cast<double>(total)
+			               : 0.0,
+			         total ? 100.0 * static_cast<double>(p.same_inputs) / static_cast<double>(total)
+			               : 0.0);
+			p.same_program = p.same_inputs = p.other = 0;
+		}
+		::printf("\n");
+	}
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -804,6 +854,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
+		NotePredictability(stage, entry != programs.end() ? &entry->second : nullptr, user_data);
 		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
