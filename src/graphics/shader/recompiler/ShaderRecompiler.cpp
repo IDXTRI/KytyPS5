@@ -1051,6 +1051,21 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	for (auto& inst: ir.value_storage) {
 		inst.Invalidate();
 	}
+	// A bindless sampler handle's Arg(0) is the GPU-computed key that selects its slot (like an
+	// indirect image's), so it stays. Zeroing it made every material use record 0 of the heap
+	// (Wolverine: moon right by chance, wrap terrain flat).
+	std::set<const IR::Inst*> bindless_sampler_handles;
+	for (auto* block: ir.blocks) {
+		for (auto& inst: *block) {
+			if (!IR::ImageOpcodeInfoOf(inst.GetOpcode()).needs_sampler || inst.NumArgs() < 2u) {
+				continue;
+			}
+			const auto sampler = ir.memory_info[inst.Flags<IR::MemoryFlags>().index].sampler;
+			if (sampler < ir.info.samplers.size() && ir.info.samplers[sampler].bindless) {
+				bindless_sampler_handles.insert(inst.Arg(1).Resolve().TryInstruction());
+			}
+		}
+	}
 	for (auto* block: ir.blocks) {
 		for (auto& inst: *block) {
 			const auto op = inst.GetOpcode();
@@ -1066,7 +1081,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
 				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
-			} else if (op != IR::ValueOpcode::GetSamplerResource) {
+			} else if (op == IR::ValueOpcode::GetSamplerResource) {
+				first = bindless_sampler_handles.contains(&inst) ? 1u : 0u;
+			} else {
 				continue;
 			}
 			for (size_t index = first; index < inst.NumArgs(); index++) {
