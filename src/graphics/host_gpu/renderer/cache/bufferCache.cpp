@@ -169,6 +169,10 @@ private:
 		auto& entry = m_entries[buffer_begin];
 		entry.size  = buffer_size;
 		(is_write ? entry.writes : entry.reads)++;
+		if (s_forwarded) {
+			entry.forwarded++;
+			entry.forwarded_micros += micros;
+		}
 		entry.outcomes[outcome]++;
 		entry.download_bytes += download_bytes;
 		entry.micros += micros;
@@ -209,11 +213,12 @@ private:
 			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
 			         " reads %" PRIu64 ", unregistered %" PRIu64 " unmarked %" PRIu64
 			         " downloaded %" PRIu64 " (%" PRIu64 " KiB) nothing-to-download %" PRIu64
-			         " direct-read %" PRIu64 ", %zu pages, %.1f ms\n",
+			         " direct-read %" PRIu64 ", %zu pages, %.1f ms (guest threads %" PRIu64
+			         " / %.1f ms)\n",
 			         begin, e->size / 1024, e->writes, e->reads, e->outcomes[Unregistered],
 			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->download_bytes / 1024,
 			         e->outcomes[NothingToDownload], e->outcomes[DirectRead], e->pages.size(),
-			         e->micros / 1000.0);
+			         e->micros / 1000.0, e->forwarded, e->forwarded_micros / 1000.0);
 			if (e->writer_finished + e->writer_running + e->writer_unknown == 0) {
 				continue;
 			}
@@ -249,7 +254,16 @@ private:
 		uint64_t                               writer_age[AgeBuckets] {};
 		uint64_t                               writer_size = 0;
 		std::unordered_map<uint64_t, uint64_t> writer_shaders;
+		// Faults of guest threads handed to the GPU thread (the rest are its own).
+		uint64_t forwarded        = 0;
+		double   forwarded_micros = 0;
 	};
+
+public:
+	// GPU thread: set while a guest thread's fault is handled (BufferCache::ReadMemory).
+	inline static thread_local bool s_forwarded = false;
+
+private:
 	std::unordered_map<uint64_t, Entry>   m_entries;
 	std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
 	std::array<Mark, 1024>                m_marks {};
@@ -628,7 +642,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		return;
 	}
-	gpu.SendCommandSync([this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+	gpu.SendCommandSync([this, vaddr, size, is_write] {
+		ReadbackStats::s_forwarded = true;
+		ReadMemoryOnGpu(vaddr, size, is_write);
+		ReadbackStats::s_forwarded = false;
+	});
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
