@@ -793,10 +793,18 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	if (copies.empty() || total_size > StagingSize) {
 		return false;
 	}
-	if (writer_in_flight && buffer.last_gpu_write_tick >= m_scheduler.CurrentTick()) {
-		// The writer is in the open command buffer: submit it so the copy can wait for its tick.
+	if (writer_in_flight) {
 		KYTY_PROFILER_BLOCK("BufferCache::CopyQueueReadbackFlush");
-		m_scheduler.Flush();
+		if (buffer.last_gpu_write_tick >= m_scheduler.CurrentTick()) {
+			// The writer is in the open command buffer: submit it so the copy can wait for its
+			// tick.
+			m_scheduler.Flush();
+		}
+		// With KYTY_RECORD_THREAD a submitted tick can still be queued on the recording thread.
+		// The copy must not wait for a value whose signal the driver has not seen: run 34 hung
+		// with the readback waiting on it, the present (holding queue_mutex) stalled behind that
+		// wait, and the recording thread blocked on queue_mutex with the writer's submission.
+		(void)m_scheduler.DrainRecording();
 	}
 
 	KYTY_PROFILER_BLOCK("BufferCache::CopyQueueReadback");
