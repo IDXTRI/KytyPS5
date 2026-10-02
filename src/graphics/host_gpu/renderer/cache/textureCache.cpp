@@ -2112,7 +2112,15 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool               pressured  = GcUsedMemory() >= m_pressure_gc_memory;
 		bool               aggressive = allow_aggressive && GcUsedMemory() >= m_critical_gc_memory;
-		const uint64_t     age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		// KYTY_IMAGE_GC_CRITICAL_AGE (live, frames, default 1): the age above the critical mark
+		// (see KYTY_BUFFER_GC_CRITICAL_AGE).
+		static auto&   critical_age   = Common::LiveSwitches::Get("KYTY_IMAGE_GC_CRITICAL_AGE", 1);
+		const uint64_t aggressive_age = static_cast<uint64_t>(
+		    std::max<int64_t>(1, critical_age.load(std::memory_order_relaxed)));
+		const uint64_t age = std::min<uint64_t>(aggressive  ? aggressive_age
+		                                        : pressured ? 4
+		                                                    : 16,
+		                                        clock);
 		constexpr uint64_t MiB = 1024 * 1024;
 		constexpr size_t   MaxFreesInFrame = 1024;
 		uint64_t           byte_budget     = 0;

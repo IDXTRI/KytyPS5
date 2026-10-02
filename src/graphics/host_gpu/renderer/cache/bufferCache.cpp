@@ -1615,7 +1615,14 @@ void BufferCache::RunGarbageCollector() {
 	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 120);
 	const uint64_t relaxed_age =
 	    static_cast<uint64_t>(std::max<int64_t>(2, gc_age.load(std::memory_order_relaxed)));
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
+	// KYTY_BUFFER_GC_CRITICAL_AGE (live, frames, default 2): the age above the critical mark.
+	// Wolverine combat (run 49): the working set sat at 8.4-8.5 GiB, just over the critical mark,
+	// so the collector stayed aggressive and every 5 s deleted ~1000 buffers (~200 downloaded
+	// first, each waiting for the GPU) that were all created again (~2500).
+	static auto&   critical_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_CRITICAL_AGE", 2);
+	const uint64_t aggressive_age =
+	    static_cast<uint64_t>(std::max<int64_t>(1, critical_age.load(std::memory_order_relaxed)));
+	const uint64_t age        = std::min<uint64_t>(aggressive ? aggressive_age : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 	// Kept buffers stay at the front of the LRU list; bound the walk past them.
 	constexpr size_t MaxKeptVisits = 256;
