@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -447,8 +448,12 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	if (binding >= ImageArrays) {
 		return 0;
 	}
-	auto& free = m_free_slots[binding];
-	if (!free.empty() && m_scheduler.IsFree(free.front().first)) {
+	// KYTY_BINDLESS_SLOT_REUSE=0 (live, research): never reuse slots, to tell a stale slot
+	// reference from other bugs (Wolverine runs 54-58: wrong textures, then device losts).
+	static auto& reuse = Common::LiveSwitches::Get("KYTY_BINDLESS_SLOT_REUSE", 1);
+	auto&        free  = m_free_slots[binding];
+	if (reuse.load(std::memory_order_relaxed) != 0 && !free.empty() &&
+	    m_scheduler.IsFree(free.front().first)) {
 		const auto slot = free.front().second;
 		free.pop_front();
 		return slot;

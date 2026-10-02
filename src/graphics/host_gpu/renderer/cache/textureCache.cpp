@@ -2181,11 +2181,13 @@ void TextureCache::RunGarbageCollector() {
 				m_gc_stats.gone_or_depth++;
 				continue;
 			}
-			// KYTY_BINDLESS_EVICT=1 (live, default): unpin bindless images the shaders have not
+			// KYTY_BINDLESS_EVICT=1 (live, default 0): unpin bindless images the shaders have not
 			// sampled for KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their
 			// age), or KYTY_BINDLESS_EVICT_TIGHT_AGE (live, default 15) near the driver budget. The
-			// age stays well above the few frames feedback snapshots lag.
-			static auto& evict_pinned = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT", 1);
+			// age stays well above the few frames feedback snapshots lag. Off by default: with it,
+			// Wolverine showed wrong textures and lost the device (runs 54-58, a stale bindless
+			// slot reference is suspected; see KYTY_BINDLESS_SLOT_REUSE).
+			static auto& evict_pinned = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT", 0);
 			static auto& evict_age    = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_AGE", 60);
 			static auto& tight_age = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_TIGHT_AGE", 15);
 			const auto   pinned_age = static_cast<uint64_t>(std::max<int64_t>(

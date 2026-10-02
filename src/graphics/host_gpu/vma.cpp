@@ -233,11 +233,13 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	// KYTY_IMAGE_DEDICATED_KB (live, default 1024; 0 = off): images at least this large get their
-	// own device memory. Sharing VMA blocks, freed images left holes the driver still counts:
+	// KYTY_IMAGE_DEDICATED_KB (live, default 0 = off): images at least this large get their own
+	// device memory. Sharing VMA blocks, freed images left holes the driver still counts:
 	// Wolverine run 52 held 7.9 GiB of allocations in 9.9 GiB of blocks, and turning the camera
-	// paged up to 2.5 GiB out to system memory (run 53).
-	static auto& dedicated_kb = Common::LiveSwitches::Get("KYTY_IMAGE_DEDICATED_KB", 1024);
+	// paged up to 2.5 GiB out to system memory (run 53). 1024 fixed that (run 54) but turned a
+	// stale bindless texture read, harmless inside a live block, into device losts (runs 54-58)
+	// while KYTY_BINDLESS_EVICT was on; off until that read is fixed.
+	static auto& dedicated_kb = Common::LiveSwitches::Get("KYTY_IMAGE_DEDICATED_KB", 0);
 	if (const auto kb = dedicated_kb.load(std::memory_order_relaxed); kb > 0) {
 		// Estimated from the texel count at 4 bytes per texel (formats and mips vary).
 		const auto bytes = static_cast<uint64_t>(image_info.extent.width) *
