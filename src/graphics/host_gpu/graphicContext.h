@@ -129,6 +129,9 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// What the driver currently lets this process keep in device-local memory (no safety margin,
+	// unlike GetTotalMemoryBudget); 0 when it cannot report it.
+	[[nodiscard]] uint64_t GetDriverMemoryBudget() const;
 	// Device-local bytes VMA has handed out, and the bytes of the memory blocks holding them
 	// (the difference is free space inside blocks).
 	void GetDeviceAllocationStats(uint64_t& allocation_bytes, uint64_t& block_bytes) const;

@@ -2120,6 +2120,13 @@ void TextureCache::RunGarbageCollector() {
 		m_gc_freed_images_frame = 0;
 		m_gc_written_back_bytes_frame = 0;
 	}
+	// Within 512 MiB of what the driver lets the process keep in VRAM, unsampled bindless
+	// textures go after KYTY_BINDLESS_EVICT_TIGHT_AGE frames: a camera turn streams textures in
+	// faster than the normal age frees them, and past the budget the driver pages memory out
+	// (Wolverine run 53: 2.5 GiB to system memory, second-long frames).
+	const auto driver_budget      = m_graphics.GetDriverMemoryBudget();
+	const bool near_driver_budget = driver_budget != 0 &&
+	                                m_graphics.GetDeviceMemoryUsage() + (512ull << 20u) >= driver_budget;
 	const auto collect = [&](bool allow_aggressive) {
 		bool               pressured  = GcUsedMemory() >= m_pressure_gc_memory;
 		bool               aggressive = allow_aggressive && GcUsedMemory() >= m_critical_gc_memory;
@@ -2174,15 +2181,16 @@ void TextureCache::RunGarbageCollector() {
 				m_gc_stats.gone_or_depth++;
 				continue;
 			}
-			// KYTY_BINDLESS_EVICT=1 (live, default): collect bindless images the shaders have not sampled for
-			// KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their age), not
+			// KYTY_BINDLESS_EVICT=1 (live, default): collect bindless images the shaders have not
+			// sampled for KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their
+			// age), or KYTY_BINDLESS_EVICT_TIGHT_AGE (live, default 15) near the driver budget, not
 			// only images draws bind. Their keys become pending again and load anew when sampled,
-			// so the age stays well above the few frames feedback snapshots lag and covers a turn
-			// of the camera.
+			// so the age stays well above the few frames feedback snapshots lag.
 			static auto& evict_pinned = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT", 1);
 			static auto& evict_age    = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_AGE", 60);
-			const auto   pinned_age   = static_cast<uint64_t>(
-			    std::max<int64_t>(8, evict_age.load(std::memory_order_relaxed)));
+			static auto& tight_age = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_TIGHT_AGE", 15);
+			const auto   pinned_age = static_cast<uint64_t>(std::max<int64_t>(
+			    8, (near_driver_budget ? tight_age : evict_age).load(std::memory_order_relaxed)));
 			if (owner->bindless_pinned &&
 			    (evict_pinned.load(std::memory_order_relaxed) == 0 ||
 			     m_lru_cache.TickOf(owner->lru_id) + pinned_age > clock)) {

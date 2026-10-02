@@ -103,6 +103,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint64_t GraphicContext::GetDriverMemoryBudget() const {
+	if (!CanReportMemoryUsage() || allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const bool discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	uint64_t budget = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (!discrete || (physical_device_memory_properties.memoryHeaps[heap].flags &
+		                  vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			budget += budgets[heap].budget;
+		}
+	}
+	return budget;
+}
+
 void GraphicContext::GetDeviceAllocationStats(uint64_t& allocation_bytes,
                                               uint64_t& block_bytes) const {
 	allocation_bytes = 0;
@@ -215,6 +233,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	// KYTY_IMAGE_DEDICATED_KB (live, default 1024; 0 = off): images at least this large get their
+	// own device memory. Sharing VMA blocks, freed images left holes the driver still counts:
+	// Wolverine run 52 held 7.9 GiB of allocations in 9.9 GiB of blocks, and turning the camera
+	// paged up to 2.5 GiB out to system memory (run 53).
+	static auto& dedicated_kb = Common::LiveSwitches::Get("KYTY_IMAGE_DEDICATED_KB", 1024);
+	if (const auto kb = dedicated_kb.load(std::memory_order_relaxed); kb > 0) {
+		// Estimated from the texel count at 4 bytes per texel (formats and mips vary).
+		const auto bytes = static_cast<uint64_t>(image_info.extent.width) *
+		                   image_info.extent.height * image_info.extent.depth *
+		                   image_info.arrayLayers * 4u;
+		if (bytes >= static_cast<uint64_t>(kb) * 1024u) {
+			alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+		}
+	}
 
 	if (ImageRecycleMegabytes() > 0) {
 		static std::atomic<uint64_t> reused {0};
