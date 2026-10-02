@@ -4,6 +4,7 @@
 #include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -464,8 +465,58 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	return m_next_slot[binding]++;
 }
 
+namespace {
+// The table whose slots the device-loss report searches (one bindless table per context).
+BindlessTable* g_reported_table = nullptr;
+} // namespace
+
+void BindlessTable::ReportImageUsers(uint64_t image) {
+	if (g_reported_table == nullptr) {
+		return;
+	}
+	auto& table = *g_reported_table;
+	int   found = 0;
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		const auto& views = table.m_slot_views[binding];
+		for (uint32_t slot = 0; slot < views.size(); slot++) {
+			const auto view = reinterpret_cast<uint64_t>(static_cast<VkImageView>(views[slot]));
+			if (view == 0 || AddressBindingImageOfView(view) != image) {
+				continue;
+			}
+			found++;
+			std::printf("      bindless slot %u/%u still holds a view of it", binding, slot);
+			for (auto& heap: table.m_heaps) {
+				if (heap.binding != binding) {
+					continue;
+				}
+				for (uint32_t key = 0; key < heap.slots.size(); key++) {
+					if (heap.slots[key] == slot) {
+						std::printf(" (heap base=0x%" PRIx64 " key=%u settled=%u)", heap.base, key,
+						            heap.settled[key]);
+					}
+				}
+			}
+			std::printf("\n");
+		}
+	}
+	if (found == 0) {
+		std::printf("      no bindless slot holds a view of it (stale reference is elsewhere)\n");
+	}
+}
+
 void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
                               vk::ImageLayout layout) {
+	if (g_reported_table == nullptr && m_graphics.address_binding_report_enabled) {
+		g_reported_table = this;
+		AddressBindingSetImageUserReporter(&BindlessTable::ReportImageUsers);
+	}
+	if (binding < ImageArrays) {
+		auto& views = m_slot_views[binding];
+		if (views.size() <= slot) {
+			views.resize(slot + 1);
+		}
+		views[slot] = view;
+	}
 	const vk::DescriptorImageInfo info {nullptr, view, layout};
 	vk::WriteDescriptorSet        write {};
 	write.dstSet          = m_set;

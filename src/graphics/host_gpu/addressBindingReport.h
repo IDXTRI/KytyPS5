@@ -21,6 +21,14 @@ void AddressBindingNote(uint32_t object_type, uint64_t handle, uint64_t base, ui
 void AddressBindingDescribeObject(uint64_t handle, std::string description);
 void AddressBindingAnnotate(uint64_t handle, const char* event);
 
+// Image views by the image they belong to, so a fault on a released image can list who still
+// refers to one of its views.
+void AddressBindingNoteView(uint64_t view, uint64_t image);
+[[nodiscard]] uint64_t AddressBindingImageOfView(uint64_t view);
+// Set by the bindless table: prints the slots (and keys) whose descriptor holds a view of the
+// image.
+void AddressBindingSetImageUserReporter(void (*reporter)(uint64_t image));
+
 // Prints what owned the address: a live object, or the most recently released one.
 void AddressBindingDescribe(uint64_t address);
 

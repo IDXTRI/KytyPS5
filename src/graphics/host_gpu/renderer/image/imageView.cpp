@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
@@ -397,6 +398,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    info.data.address, static_cast<uint32_t>(normalized.format),
 	    static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 	    normalized.level_count, normalized.base_layer, normalized.layer_count);
+	if (m_graphics.address_binding_report_enabled) {
+		AddressBindingNoteView(reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)),
+		                       reinterpret_cast<uint64_t>(static_cast<VkImage>(image.image)));
+	}
 	views.push_back({normalized, view});
 	return view;
 }

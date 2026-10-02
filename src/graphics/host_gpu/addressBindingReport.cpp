@@ -37,6 +37,8 @@ std::mutex                                g_mutex;
 std::map<uint64_t, Range>                 g_live;     // by base address
 std::deque<std::pair<uint64_t, Range>>    g_released; // oldest first
 std::unordered_map<uint64_t, ObjectInfo>  g_objects;
+std::unordered_map<uint64_t, uint64_t>    g_view_images; // view -> image
+void (*g_image_user_reporter)(uint64_t)  = nullptr;
 std::deque<uint64_t>                      g_object_order;
 
 int64_t NowUs() {
@@ -130,7 +132,24 @@ void AddressBindingAnnotate(uint64_t handle, const char* event) {
 	}
 }
 
+void AddressBindingNoteView(uint64_t view, uint64_t image) {
+	std::scoped_lock lock {g_mutex};
+	g_view_images[view] = image;
+}
+
+uint64_t AddressBindingImageOfView(uint64_t view) {
+	std::scoped_lock lock {g_mutex};
+	const auto       found = g_view_images.find(view);
+	return found != g_view_images.end() ? found->second : 0;
+}
+
+void AddressBindingSetImageUserReporter(void (*reporter)(uint64_t image)) {
+	g_image_user_reporter = reporter;
+}
+
 void AddressBindingDescribe(uint64_t address) {
+	std::vector<uint64_t> images;
+	{
 	std::scoped_lock lock {g_mutex};
 	const auto       now   = NowUs();
 	bool             found = false;
@@ -160,6 +179,9 @@ void AddressBindingDescribe(uint64_t address) {
 			                                           1000.0
 			                                     : -1.0);
 			PrintObject(it->second.handle, now);
+			if (it->second.object_type == 10) {
+				images.push_back(it->second.handle);
+			}
 			found = true;
 			reported++;
 		}
@@ -167,6 +189,12 @@ void AddressBindingDescribe(uint64_t address) {
 	if (!found) {
 		std::printf("    binding report: no object ever bound there (%zu live, %zu released kept)\n",
 		            g_live.size(), g_released.size());
+	}
+	}
+	for (const auto image: images) {
+		if (g_image_user_reporter != nullptr) {
+			g_image_user_reporter(image);
+		}
 	}
 	std::fflush(stdout);
 }

@@ -139,6 +139,8 @@ public:
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
 	void OnImageUnregistered(ImageId id);
+	// Device-loss triage (addressBindingReport.h): the slots holding a view of the image.
+	static void ReportImageUsers(uint64_t image);
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
@@ -163,6 +165,8 @@ private:
 	// Slots of unregistered images per array, with the tick after which no command buffer reads
 	// them.
 	std::array<std::deque<std::pair<uint64_t, uint32_t>>, ImageArrays> m_free_slots;
+	// What each slot's descriptor holds now (WriteSlot), for device-loss triage.
+	std::array<std::vector<vk::ImageView>, ImageArrays> m_slot_views;
 	std::array<VulkanImage, Placeholders>   m_placeholders;
 	std::array<vk::ImageView, Placeholders> m_placeholder_views {};
 	vk::DescriptorPool      m_pool   = nullptr;
