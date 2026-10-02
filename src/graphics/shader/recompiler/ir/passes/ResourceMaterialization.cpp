@@ -1427,6 +1427,39 @@ void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& ru
 		    std::min(index.lo * stride + offset.lo + soffset.lo + write.immediate, size);
 		const uint64_t end =
 		    std::min(index.hi * stride + offset.hi + soffset.hi + write.immediate + 16u, size);
+		// Diagnostics: KYTY_WATCH_EXTENTS=<hash>[,<hash>...] (hex) prints every store's interval
+		// for those shaders (every 64th evaluation), to tell a wide store from a wide hull.
+		static const std::vector<uint64_t> watched_shaders = [] {
+			std::vector<uint64_t> result;
+			for (const char* value = std::getenv("KYTY_WATCH_EXTENTS");
+			     value != nullptr && *value;) {
+				char* end_ptr = nullptr;
+				result.push_back(std::strtoull(value, &end_ptr, 16));
+				value = end_ptr != nullptr && *end_ptr == ',' ? end_ptr + 1 : nullptr;
+			}
+			return result;
+		}();
+		if (!watched_shaders.empty() &&
+		    std::ranges::find(watched_shaders, program.shader_hash) != watched_shaders.end()) {
+			static std::atomic<uint64_t> evaluations {0};
+			if (evaluations.fetch_add(1, std::memory_order_relaxed) % 64u < 8u) {
+				std::fprintf(
+				    stderr,
+				    "extent shader=0x%016llx buffer=%u base=0x%llx size=0x%llx stride=%llu "
+				    "index=[%llu,%llu] offset=[%llu,%llu] soffset=[%llu,%llu] imm=%u -> "
+				    "[0x%llx,0x%llx)\n",
+				    static_cast<unsigned long long>(program.shader_hash), write.buffer,
+				    static_cast<unsigned long long>(descriptor.Base48()),
+				    static_cast<unsigned long long>(size), static_cast<unsigned long long>(stride),
+				    static_cast<unsigned long long>(index.lo),
+				    static_cast<unsigned long long>(index.hi),
+				    static_cast<unsigned long long>(offset.lo),
+				    static_cast<unsigned long long>(offset.hi),
+				    static_cast<unsigned long long>(soffset.lo),
+				    static_cast<unsigned long long>(soffset.hi), write.immediate,
+				    static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+			}
+		}
 		if (!extent.valid) {
 			extent = {.begin = begin, .end = end, .valid = true};
 		} else {
