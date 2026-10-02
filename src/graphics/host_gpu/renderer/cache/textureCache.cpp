@@ -2092,6 +2092,14 @@ void TextureCache::RunGarbageCollector() {
 	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 1);
 	m_other_cache_memory =
 	    combined.load(std::memory_order_relaxed) != 0 ? m_buffer_cache.UsedMemory() : 0;
+	// KYTY_GC_HEADROOM_MB (live, default 0): count this much more as used, so both collectors
+	// trim earlier. The thresholds come from the device budget at startup, but ~2.2 GiB outside
+	// the caches (staging rings, pipelines, ...) put the process over its budget while the caches
+	// were still below their critical mark (Wolverine run 31: device 9.89 of 9.88 GiB).
+	static auto& headroom = Common::LiveSwitches::Get("KYTY_GC_HEADROOM_MB", 0);
+	m_gc_headroom =
+	    static_cast<uint64_t>(std::max<int64_t>(0, headroom.load(std::memory_order_relaxed)))
+	    << 20u;
 	if (GcUsedMemory() < m_trigger_gc_memory) {
 		return;
 	}

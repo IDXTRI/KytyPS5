@@ -84,8 +84,10 @@ private:
 	// What the collector compares with its thresholds: own bytes, plus the buffer cache's with
 	// KYTY_GC_COMBINED (both caches share one device budget).
 	[[nodiscard]] uint64_t GcUsedMemory() const noexcept {
-		return m_total_used_memory + m_other_cache_memory;
+		return m_total_used_memory + m_other_cache_memory + m_gc_headroom;
 	}
+	// KYTY_GC_HEADROOM_MB, read per collection (see RunGarbageCollector).
+	uint64_t m_gc_headroom = 0;
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
 	struct ImageDownload;

@@ -1440,9 +1440,13 @@ void BufferCache::RunGarbageCollector() {
 	// Wolverine run 16 (paging, device usage 11.0 > budget 9.9 GiB): on trimmed to 9.8 GiB, GPU
 	// busy 86% -> 27%, 167 -> 117 ms/frame; a one-time stutter while it trims.
 	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 1);
+	// KYTY_GC_HEADROOM_MB: see TextureCache::RunGarbageCollector.
+	static auto&   headroom = Common::LiveSwitches::Get("KYTY_GC_HEADROOM_MB", 0);
 	const uint64_t used =
 	    m_total_used_memory +
-	    (combined.load(std::memory_order_relaxed) != 0 ? m_texture_cache.UsedMemory() : 0);
+	    (combined.load(std::memory_order_relaxed) != 0 ? m_texture_cache.UsedMemory() : 0) +
+	    (static_cast<uint64_t>(std::max<int64_t>(0, headroom.load(std::memory_order_relaxed)))
+	     << 20u);
 	if (used < m_trigger_gc_memory) {
 		return;
 	}
