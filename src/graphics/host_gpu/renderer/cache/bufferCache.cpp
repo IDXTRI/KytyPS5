@@ -285,7 +285,10 @@ bool AsyncWriteReadbackEnabled() {
 }
 
 bool AsyncReadReadbackEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READBACK", 0);
+	// Run 37 A/B at the Wolverine spot: readback time on the GPU thread 147 -> 113 ms/s, mean
+	// frame 73.5 -> 72.5 ms. The busiest buffer gains nothing: the GPU rewrites its pages before
+	// the download lands, so FinishWriteReadback falls back to the synchronous path.
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READBACK", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
