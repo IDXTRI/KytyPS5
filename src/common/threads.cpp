@@ -1,6 +1,7 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 
 #include <atomic>
 #include <cerrno>
@@ -233,6 +234,29 @@ void Thread::SleepNano(uint64_t nanos) {
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
 #endif
+}
+
+void Thread::SetCurrentPriority(int level) {
+#ifdef KYTY_WIN_CS
+	const int priority = level >= 2   ? THREAD_PRIORITY_HIGHEST
+	                     : level == 1 ? THREAD_PRIORITY_ABOVE_NORMAL
+	                                  : THREAD_PRIORITY_NORMAL;
+	SetThreadPriority(GetCurrentThread(), priority);
+#else
+	(void)level;
+#endif
+}
+
+void Thread::ApplyGpuThreadPriority() {
+	// The emulator's GPU-feeding threads are the bottleneck while ~40 guest threads share 16
+	// logical CPUs at normal priority; other emulators raise their GPU thread the same way.
+	static auto&           level   = LiveSwitches::Get("KYTY_GPU_THREAD_PRIORITY", 1);
+	thread_local int64_t   applied = -1;
+	const auto             wanted  = level.load(std::memory_order_relaxed);
+	if (wanted != applied) {
+		applied = wanted;
+		SetCurrentPriority(static_cast<int>(wanted));
+	}
 }
 
 bool Thread::IsMainThread() {

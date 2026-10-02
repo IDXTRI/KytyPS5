@@ -40,6 +40,9 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics);
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
+	// VK_EXT_device_address_binding_report (addressBindingReport.h).
+	vk::DebugUtilsMessengerEXT         address_binding_messenger             = nullptr;
+	bool                               address_binding_report_enabled        = false;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};

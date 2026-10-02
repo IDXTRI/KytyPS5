@@ -688,6 +688,7 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         should_stop    = false;
 		// Commands a gated slice left unsubmitted go to the GPU before this thread waits.
 		bool flush_pending = false;
+		Common::Thread::ApplyGpuThreadPriority();
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {

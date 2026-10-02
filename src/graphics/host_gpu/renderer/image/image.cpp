@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -718,6 +719,14 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+	}
+	if (graphics.address_binding_report_enabled) {
+		AddressBindingDescribeObject(
+		    reinterpret_cast<uint64_t>(static_cast<VkImage>(backing.image)),
+		    fmt::format("image guest=0x{:x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={}",
+		                info.data.address, info.data.size, info.extent.width, info.extent.height,
+		                info.extent.depth, static_cast<uint32_t>(info.pixel_format),
+		                info.resources.levels, info.resources.layers));
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,

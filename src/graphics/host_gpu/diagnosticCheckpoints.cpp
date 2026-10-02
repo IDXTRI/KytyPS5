@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/logging/log.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -100,6 +101,7 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerInvalid &&
 		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerFault) {
 			DescribeBufferDeviceAddress(static_cast<uint64_t>(address.reportedAddress));
+			AddressBindingDescribe(static_cast<uint64_t>(address.reportedAddress));
 		}
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {

@@ -4,6 +4,7 @@
 #include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -696,6 +697,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 	std::deque<std::unique_ptr<Chunk>> retained;
 	for (;;) {
 		std::unique_ptr<Chunk> chunk;
+		Common::Thread::ApplyGpuThreadPriority();
 		{
 			std::unique_lock lock(m_record_mutex);
 			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {

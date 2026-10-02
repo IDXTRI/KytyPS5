@@ -34,6 +34,12 @@ public:
 	static void SleepMicro(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
+	// Scheduling priority of the calling thread: 0 normal, 1 above normal, 2 highest
+	// (Windows only; elsewhere a no-op).
+	static void SetCurrentPriority(int level);
+	// Applies the live switch KYTY_GPU_THREAD_PRIORITY (default 1) to the calling thread when it
+	// changed since this thread last looked. For the threads that feed the host GPU.
+	static void ApplyGpuThreadPriority();
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.

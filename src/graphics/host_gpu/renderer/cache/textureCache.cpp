@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -378,6 +379,11 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	g_image_churn_stats.Note(image->info, false);
+	if (m_graphics.address_binding_report_enabled && image->backing.image != nullptr) {
+		AddressBindingAnnotate(reinterpret_cast<uint64_t>(static_cast<VkImage>(image->backing.image)),
+		                       image->bindless_pinned ? "deleted while bindless-pinned"
+		                                              : "deleted");
+	}
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
@@ -2205,6 +2211,11 @@ void TextureCache::RunGarbageCollector() {
 			// directly lost the device in Wolverine runs 54/55 once large images had dedicated
 			// memory (a read of the freed image, ReadInvalid outside every buffer).
 			if (owner->bindless_pinned) {
+				if (m_graphics.address_binding_report_enabled) {
+					AddressBindingAnnotate(
+					    reinterpret_cast<uint64_t>(static_cast<VkImage>(owner->backing.image)),
+					    "unpinned by the collector");
+				}
 				NoteBindlessStateChange(*owner);
 				owner->bindless_pinned = false;
 				if (on_bindless_unregister) {
