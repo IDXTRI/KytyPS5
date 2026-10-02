@@ -750,11 +750,25 @@ static bool CopyQueueReadbackEnabled() {
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
+// KYTY_COPY_QUEUE_INFLIGHT=1 (live, default 0): the copy-queue readback also serves buffers whose
+// last GPU write has not finished yet. Its submission already waits for the writer's tick on the
+// timeline semaphore, so only that work is waited for; before, such a readback recorded the copy
+// on the main queue and waited for everything recorded so far (run 31 readback stats: 180 of 406
+// readbacks of Wolverine's busiest buffer per 5 s). A writer still in the open command buffer is
+// submitted first.
+static bool CopyQueueInflightEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_COPY_QUEUE_INFLIGHT", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
 bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, uint64_t window_end) {
 	constexpr uint64_t StagingSize = 4ull * 1024 * 1024;
 	if (!CopyQueueReadbackEnabled() || m_graphics.readback_queue == nullptr ||
-	    !m_scheduler.IsFree(buffer.last_gpu_write_tick) ||
 	    OverlapsPendingWriteReadback(window_begin, window_end)) {
+		return false;
+	}
+	const bool writer_in_flight = !m_scheduler.IsFree(buffer.last_gpu_write_tick);
+	if (writer_in_flight && !CopyQueueInflightEnabled()) {
 		return false;
 	}
 	std::vector<vk::BufferCopy> copies;
@@ -778,6 +792,11 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	}
 	if (copies.empty() || total_size > StagingSize) {
 		return false;
+	}
+	if (writer_in_flight && buffer.last_gpu_write_tick >= m_scheduler.CurrentTick()) {
+		// The writer is in the open command buffer: submit it so the copy can wait for its tick.
+		KYTY_PROFILER_BLOCK("BufferCache::CopyQueueReadbackFlush");
+		m_scheduler.Flush();
 	}
 
 	KYTY_PROFILER_BLOCK("BufferCache::CopyQueueReadback");
