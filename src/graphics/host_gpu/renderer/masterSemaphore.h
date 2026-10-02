@@ -29,6 +29,10 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
+	// Refresh for a non-blocking "is it done yet?" check: with KYTY_TICK_POLL_US=N (live,
+	// default 0 = always) it asks the driver at most once every N microseconds and otherwise
+	// keeps the last known tick (still correct, only possibly older). Wait() is unaffected.
+	void Poll();
 	void Wait(uint64_t tick);
 
 private:
@@ -36,6 +40,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<int64_t>  m_last_poll_us {0};
 };
 
 } // namespace Libs::Graphics

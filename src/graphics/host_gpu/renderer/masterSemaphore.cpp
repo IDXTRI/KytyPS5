@@ -3,7 +3,12 @@
 #include <cinttypes>
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -25,7 +30,64 @@ MasterSemaphore::~MasterSemaphore() {
 	}
 }
 
+namespace {
+
+int64_t NowUs() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+// KYTY_TICK_STATS=1 (live): every 5 s, how often the GPU's timeline value was queried from the
+// driver (vkGetSemaphoreCounterValue, a kernel call on Windows) and how many polls
+// KYTY_TICK_POLL_US skipped.
+struct TickStats {
+	std::atomic<uint64_t> refreshes {0};
+	std::atomic<uint64_t> skipped {0};
+	std::atomic<int64_t>  report_us {0};
+};
+TickStats g_tick_stats;
+
+void NoteTickStats(bool refreshed) {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_TICK_STATS", 0);
+	if (enabled.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	(refreshed ? g_tick_stats.refreshes : g_tick_stats.skipped)
+	    .fetch_add(1, std::memory_order_relaxed);
+	const auto now  = NowUs();
+	auto       last = g_tick_stats.report_us.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_tick_stats.report_us.compare_exchange_strong(last, now);
+		return;
+	}
+	if (now - last >= 5'000'000 && g_tick_stats.report_us.compare_exchange_strong(last, now)) {
+		::printf("Tick polls (5 s): driver queries %llu, skipped %llu\n",
+		         static_cast<unsigned long long>(g_tick_stats.refreshes.exchange(0)),
+		         static_cast<unsigned long long>(g_tick_stats.skipped.exchange(0)));
+		std::fflush(stdout);
+	}
+}
+
+} // namespace
+
+void MasterSemaphore::Poll() {
+	static auto& poll_us  = Common::LiveSwitches::Get("KYTY_TICK_POLL_US", 0);
+	const auto   interval = poll_us.load(std::memory_order_relaxed);
+	if (interval > 0) {
+		const auto now  = NowUs();
+		const auto last = m_last_poll_us.load(std::memory_order_relaxed);
+		if (now - last < interval) {
+			NoteTickStats(false);
+			return;
+		}
+		m_last_poll_us.store(now, std::memory_order_relaxed);
+	}
+	Refresh();
+}
+
 void MasterSemaphore::Refresh() {
+	NoteTickStats(true);
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

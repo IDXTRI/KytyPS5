@@ -444,7 +444,7 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
 	}
-	m_master.Refresh();
+	m_master.Poll();
 	return m_master.IsFree(tick);
 }
 
