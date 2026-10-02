@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
 #include <atomic>
@@ -95,6 +96,11 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		     vk::to_string(address.addressType).c_str(),
 		     static_cast<uint64_t>(address.reportedAddress),
 		     static_cast<uint64_t>(address.addressPrecision));
+		if (address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerUnknown &&
+		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerInvalid &&
+		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerFault) {
+			DescribeBufferDeviceAddress(static_cast<uint64_t>(address.reportedAddress));
+		}
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
 		const auto& vendor = vendors[i];

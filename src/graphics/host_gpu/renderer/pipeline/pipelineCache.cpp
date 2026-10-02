@@ -919,6 +919,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// A program (or permutation) this session has not built yet: recompiled on the GPU
+		// thread. Wolverine run 54: the 0.3-0.7 s frames while turning were spent here.
+		KYTY_PROFILER_BLOCK("ProgramCache::Recompile", profiler::colors::RedA100);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;

@@ -9,7 +9,13 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -44,6 +50,26 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 }
 
 std::atomic_bool g_any_mapped_device_buffer {false};
+
+// Device address ranges of live buffers, and of the last destroyed ones, for device-loss triage
+// (DescribeBufferDeviceAddress). Buffers with a device address are created and destroyed a few
+// hundred times per second at most.
+struct AddressRange {
+	uint64_t size        = 0;
+	uint64_t cpu_address = 0;
+	uint64_t usage       = 0;
+	int64_t  destroyed_us = 0;
+};
+std::mutex                                       g_address_mutex;
+std::map<uint64_t, AddressRange>                 g_live_addresses;
+std::deque<std::pair<uint64_t, AddressRange>>    g_destroyed_addresses;
+constexpr size_t                                 DestroyedAddressHistory = 8192;
+
+int64_t NowUs() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
 
 [[nodiscard]] bool MappedDeviceBuffersRequested() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_MAPPED_DEVICE_BUFFERS", 0);
@@ -127,6 +153,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		std::scoped_lock lock {g_address_mutex};
+		g_live_addresses[m_device_address] = {size, cpu_address, static_cast<uint64_t>(usage), 0};
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -138,7 +166,50 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+void DescribeBufferDeviceAddress(uint64_t address) {
+	std::scoped_lock lock {g_address_mutex};
+	const auto       now   = NowUs();
+	bool             found = false;
+	if (auto it = g_live_addresses.upper_bound(address); it != g_live_addresses.begin()) {
+		--it;
+		if (address - it->first < it->second.size) {
+			std::printf("    in LIVE buffer va=0x%" PRIx64 " size=0x%" PRIx64 " guest=0x%" PRIx64
+			            " usage=%" PRIu64 " offset=0x%" PRIx64 "\n",
+			            it->first, it->second.size, it->second.cpu_address, it->second.usage,
+			            address - it->first);
+			found = true;
+		}
+	}
+	for (auto it = g_destroyed_addresses.rbegin(); it != g_destroyed_addresses.rend(); ++it) {
+		if (address >= it->first && address - it->first < it->second.size) {
+			std::printf("    in DESTROYED buffer va=0x%" PRIx64 " size=0x%" PRIx64 " guest=0x%" PRIx64
+			            " usage=%" PRIu64 " offset=0x%" PRIx64 ", destroyed %.1f ms ago\n",
+			            it->first, it->second.size, it->second.cpu_address, it->second.usage,
+			            address - it->first,
+			            static_cast<double>(now - it->second.destroyed_us) / 1000.0);
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		std::printf("    in no live buffer and none of the last %zu destroyed (%zu live)\n",
+		            g_destroyed_addresses.size(), g_live_addresses.size());
+	}
+	std::fflush(stdout);
+}
+
 Buffer::~Buffer() {
+	if (m_device_address != 0) {
+		std::scoped_lock lock {g_address_mutex};
+		if (auto it = g_live_addresses.find(m_device_address); it != g_live_addresses.end()) {
+			it->second.destroyed_us = NowUs();
+			g_destroyed_addresses.emplace_back(*it);
+			g_live_addresses.erase(it);
+			if (g_destroyed_addresses.size() > DestroyedAddressHistory) {
+				g_destroyed_addresses.pop_front();
+			}
+		}
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}

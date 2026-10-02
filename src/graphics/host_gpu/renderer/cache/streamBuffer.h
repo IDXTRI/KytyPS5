@@ -41,6 +41,10 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 // buffer exists; submissions then make device writes visible to the host.
 [[nodiscard]] bool AnyMappedDeviceBuffer() noexcept;
 
+// Device-loss triage: prints which buffer with a device address covers the faulting GPU
+// address, live or among the last destroyed ones (and how long ago), or that none does.
+void DescribeBufferDeviceAddress(uint64_t address);
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
