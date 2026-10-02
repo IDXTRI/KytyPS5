@@ -2263,15 +2263,13 @@ void TextureCache::ReportGcStats(uint64_t clock) {
 	const auto&      st  = m_gc_stats;
 	::printf("ImageGC (5 s): runs %" PRIu64 " (pressured %" PRIu64 "), visited %" PRIu64
 	         ", gone/depth %" PRIu64 ", pinned %" PRIu64 " (%.0f MiB), gpu kept %" PRIu64
-	         " (%.0f MiB), download failed %" PRIu64 ", freed %" PRIu64 " (%.0f MiB)
-",
+	         " (%.0f MiB), download failed %" PRIu64 ", freed %" PRIu64 " (%.0f MiB)\n",
 	         st.runs, st.pressured, st.visited, st.gone_or_depth, st.pinned,
 	         static_cast<double>(st.pinned_bytes) / MiB, st.gpu_kept,
 	         static_cast<double>(st.gpu_kept_bytes) / MiB, st.download_failed, st.freed,
 	         static_cast<double>(st.freed_bytes) / MiB);
 	::printf("ImageGC now: %" PRIu64 " images %.0f MiB (unused 16+ frames %.0f MiB), pinned %" PRIu64
-	         " %.0f MiB (unused 16+ frames %.0f MiB)
-",
+	         " %.0f MiB (unused 16+ frames %.0f MiB)\n",
 	         images, static_cast<double>(m_total_used_memory) / MiB,
 	         static_cast<double>(old_bytes) / MiB, pinned, static_cast<double>(pinned_bytes) / MiB,
 	         static_cast<double>(pinned_old_bytes) / MiB);
