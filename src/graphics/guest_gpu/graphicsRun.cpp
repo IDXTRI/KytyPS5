@@ -37,6 +37,71 @@
 
 namespace Libs::Graphics {
 
+// KYTY_OCCLUSION_STATS=1 (live): every 5 s, how the guest uses occlusion: counter dumps
+// (ZPASS_DONE), SET_PREDICATION by op, and the packets (draws/dispatches among them) that obey
+// predication, executed or skipped. Occlusion results are synthetic (always visible), so every
+// occlusion-predicated draw runs; this measures how much an implementation could save.
+namespace {
+struct OcclusionStats {
+	std::atomic<uint64_t> dumps {0};
+	std::atomic<uint64_t> predication_zpass {0};
+	std::atomic<uint64_t> predication_bool {0};
+	std::atomic<uint64_t> predication_off {0};
+	std::atomic<uint64_t> packets_executed {0};
+	std::atomic<uint64_t> draws_executed {0};
+	std::atomic<uint64_t> packets_skipped {0};
+	std::atomic<uint64_t> draws_skipped {0};
+	std::atomic<int64_t>  report_us {0};
+};
+OcclusionStats g_occlusion_stats;
+
+bool OcclusionStatsEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_OCCLUSION_STATS", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
+bool IsDrawOrDispatchPacket(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2: return true;
+		default: return false;
+	}
+}
+
+void ReportOcclusionStats() {
+	const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	auto last = g_occlusion_stats.report_us.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_occlusion_stats.report_us.compare_exchange_strong(last, now_us);
+		return;
+	}
+	if (now_us - last < 5'000'000 ||
+	    !g_occlusion_stats.report_us.compare_exchange_strong(last, now_us)) {
+		return;
+	}
+	auto& s = g_occlusion_stats;
+	::printf("Occlusion (5 s): dumps %llu, predication zpass %llu / bool %llu / off %llu, "
+	         "predicated packets run %llu (draws %llu), skipped %llu (draws %llu)\n",
+	         static_cast<unsigned long long>(s.dumps.exchange(0)),
+	         static_cast<unsigned long long>(s.predication_zpass.exchange(0)),
+	         static_cast<unsigned long long>(s.predication_bool.exchange(0)),
+	         static_cast<unsigned long long>(s.predication_off.exchange(0)),
+	         static_cast<unsigned long long>(s.packets_executed.exchange(0)),
+	         static_cast<unsigned long long>(s.draws_executed.exchange(0)),
+	         static_cast<unsigned long long>(s.packets_skipped.exchange(0)),
+	         static_cast<unsigned long long>(s.draws_skipped.exchange(0)));
+	std::fflush(stdout);
+}
+} // namespace
+
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
@@ -1015,6 +1080,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		if ((packet_header & 1u) != 0 && m_predication_op != 0 && OcclusionStatsEnabled()) {
+			const bool draw = IsDrawOrDispatchPacket(opcode);
+			if (ShouldSkipPredicatedPackets()) {
+				g_occlusion_stats.packets_skipped.fetch_add(1, std::memory_order_relaxed);
+				g_occlusion_stats.draws_skipped.fetch_add(draw ? 1 : 0, std::memory_order_relaxed);
+			} else {
+				g_occlusion_stats.packets_executed.fetch_add(1, std::memory_order_relaxed);
+				g_occlusion_stats.draws_executed.fetch_add(draw ? 1 : 0, std::memory_order_relaxed);
+			}
+			ReportOcclusionStats();
+		}
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
@@ -1113,6 +1189,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
                                       const volatile void* address, uint32_t count_in_dwords) {
 	(void)count_in_dwords;
 	uint64_t value = 0;
+	m_predication_op = op;
+	if (OcclusionStatsEnabled()) {
+		auto& counter = op == 0x01   ? g_occlusion_stats.predication_zpass
+		                : op == 0x03 ? g_occlusion_stats.predication_bool
+		                             : g_occlusion_stats.predication_off;
+		counter.fetch_add(1, std::memory_order_relaxed);
+		ReportOcclusionStats();
+	}
 
 	switch (op) {
 		case 0x00:
@@ -1136,6 +1220,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 					return;
 				}
 				value += end - begin;
+			}
+			// KYTY_OCCLUSION_CULL=1 (live, research only): treat every occlusion-predicated
+			// packet as occluded, as if the test said "nothing visible". Objects disappear; this
+			// is a ceiling for what real host occlusion queries could save.
+			static auto& cull = Common::LiveSwitches::Get("KYTY_OCCLUSION_CULL", 0);
+			if (cull.load(std::memory_order_relaxed) != 0) {
+				value = condition == 0x00 ? 1 : 0;
 			}
 		} break;
 		case 0x03:
@@ -1755,6 +1846,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",
 				     event_index, event_address);
+			}
+			if (OcclusionStatsEnabled()) {
+				g_occlusion_stats.dumps.fetch_add(1, std::memory_order_relaxed);
+				ReportOcclusionStats();
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {

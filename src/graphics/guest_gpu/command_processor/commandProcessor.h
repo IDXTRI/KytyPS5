@@ -186,6 +186,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// The op of the last SET_PREDICATION (0 = none), for KYTY_OCCLUSION_STATS.
+	uint32_t  m_predication_op              = 0;
 };
 
 } // namespace Libs::Graphics
