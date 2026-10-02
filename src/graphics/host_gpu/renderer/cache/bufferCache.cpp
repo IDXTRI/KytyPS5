@@ -396,6 +396,30 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
+void BufferCache::DescribeGuestPages(uint64_t address, uint64_t size) {
+	PageTable::PageRange pages {};
+	if (!PageTable::TryGetPageRange(address, size, pages)) {
+		return;
+	}
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto  page_address = static_cast<uint64_t>(page) << CACHING_PAGEBITS;
+		const auto* id           = m_page_table.Find(page);
+		const auto* buffer = id != nullptr && *id ? m_slot_buffers.try_get(*id) : nullptr;
+		if (buffer == nullptr) {
+			std::printf("      guest page 0x%" PRIx64 ": no buffer (table entry should be 0)\n",
+			            page_address);
+			continue;
+		}
+		const auto first_page = PageIndex(buffer->CpuAddress()) << CACHING_PAGEBITS;
+		std::printf("      guest page 0x%" PRIx64 ": buffer guest=0x%" PRIx64 " size=0x%" PRIx64
+		            " deleted=%d table va=0x%" PRIx64 "\n",
+		            page_address, buffer->CpuAddress(), buffer->Size(), buffer->is_deleted ? 1 : 0,
+		            buffer->HasDeviceAddress()
+		                ? buffer->BufferDeviceAddress() + (page_address - first_page)
+		                : 0);
+	}
+}
+
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, LruClock());
@@ -561,6 +585,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	SetGuestPageDescriber(
+	    [this](uint64_t address, uint64_t size) { DescribeGuestPages(address, size); });
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -1615,11 +1641,13 @@ void BufferCache::RunGarbageCollector() {
 	static auto&   gc_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_AGE", 120);
 	const uint64_t relaxed_age =
 	    static_cast<uint64_t>(std::max<int64_t>(2, gc_age.load(std::memory_order_relaxed)));
-	// KYTY_BUFFER_GC_CRITICAL_AGE (live, frames, default 2): the age above the critical mark.
+	// KYTY_BUFFER_GC_CRITICAL_AGE (live, frames, default 60): the age above the critical mark.
 	// Wolverine combat (run 49): the working set sat at 8.4-8.5 GiB, just over the critical mark,
-	// so the collector stayed aggressive and every 5 s deleted ~1000 buffers (~200 downloaded
-	// first, each waiting for the GPU) that were all created again (~2500).
-	static auto&   critical_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_CRITICAL_AGE", 2);
+	// so at age 2 the collector stayed aggressive and every 5 s deleted ~1000 buffers (~200
+	// downloaded first, each waiting for the GPU) that were all created again (~2500). Age 60
+	// cut that churn 10x with no frame-time loss (run 50); each deletion also risked the stale
+	// buffer reads behind the device losts of runs 55/57.
+	static auto&   critical_age = Common::LiveSwitches::Get("KYTY_BUFFER_GC_CRITICAL_AGE", 60);
 	const uint64_t aggressive_age =
 	    static_cast<uint64_t>(std::max<int64_t>(1, critical_age.load(std::memory_order_relaxed)));
 	const uint64_t age        = std::min<uint64_t>(aggressive ? aggressive_age : 4, clock);

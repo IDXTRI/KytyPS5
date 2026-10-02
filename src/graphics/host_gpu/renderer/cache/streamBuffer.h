@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <utility>
@@ -44,6 +45,9 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 // Device-loss triage: prints which buffer with a device address covers the faulting GPU
 // address, live or among the last destroyed ones (and how long ago), or that none does.
 void DescribeBufferDeviceAddress(uint64_t address);
+// Set by the buffer cache: prints which buffer owns each guest page of a range now (the host copy
+// of the BDA page table), for DescribeBufferDeviceAddress.
+void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer);
 
 class Buffer {
 public:

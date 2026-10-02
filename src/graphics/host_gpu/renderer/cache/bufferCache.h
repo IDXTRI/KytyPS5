@@ -116,6 +116,9 @@ public:
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
 	// KYTY_READBACK_STATS: the shader whose resources are bound next (GPU thread).
 	static void SetReadbackStatsShader(uint64_t hash);
+	// Device-loss triage: the buffer (and its device address) the host page table holds for each
+	// guest page of the range, i.e. what the BDA page table should contain.
+	void DescribeGuestPages(uint64_t address, uint64_t size);
 
 private:
 	friend struct BufferCacheTestAccess;

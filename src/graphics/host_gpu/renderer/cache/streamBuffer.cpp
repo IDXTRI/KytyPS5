@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -64,6 +65,7 @@ std::mutex                                       g_address_mutex;
 std::map<uint64_t, AddressRange>                 g_live_addresses;
 std::deque<std::pair<uint64_t, AddressRange>>    g_destroyed_addresses;
 constexpr size_t                                 DestroyedAddressHistory = 8192;
+std::function<void(uint64_t, uint64_t)>          g_guest_page_describer;
 
 int64_t NowUs() {
 	return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -166,8 +168,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer) {
+	g_guest_page_describer = std::move(describer);
+}
+
 void DescribeBufferDeviceAddress(uint64_t address) {
-	std::scoped_lock lock {g_address_mutex};
+	uint64_t         guest_address = 0;
+	uint64_t         guest_size    = 0;
+	std::unique_lock lock {g_address_mutex};
 	const auto       now   = NowUs();
 	bool             found = false;
 	if (auto it = g_live_addresses.upper_bound(address); it != g_live_addresses.begin()) {
@@ -187,13 +195,19 @@ void DescribeBufferDeviceAddress(uint64_t address) {
 			            it->first, it->second.size, it->second.cpu_address, it->second.usage,
 			            address - it->first,
 			            static_cast<double>(now - it->second.destroyed_us) / 1000.0);
-			found = true;
+			guest_address = it->second.cpu_address;
+			guest_size    = it->second.size;
+			found         = true;
 			break;
 		}
 	}
 	if (!found) {
 		std::printf("    in no live buffer and none of the last %zu destroyed (%zu live)\n",
 		            g_destroyed_addresses.size(), g_live_addresses.size());
+	}
+	lock.unlock();
+	if (guest_size != 0 && guest_address != 0 && g_guest_page_describer) {
+		g_guest_page_describer(guest_address, guest_size);
 	}
 	std::fflush(stdout);
 }
