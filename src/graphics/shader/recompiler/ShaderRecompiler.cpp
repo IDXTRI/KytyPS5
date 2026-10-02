@@ -20,6 +20,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <fmt/format.h>
@@ -32,6 +35,54 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
+
+// KYTY_SHADER_SUMMARY_DIR=<dir> (environment): one line per compiled program, appended to
+// <dir>/resources.txt: its images (descriptor source, indirect/bindless table plan), samplers
+// (bindless plan or not) and how many memory reads are planning-only. Two runs that differ in
+// one switch (e.g. KYTY_BINDLESS_SAMPLERS) can then be compared shader by shader.
+static void WriteResourceSummary(const IR::Program& ir) {
+	static const char* dir = std::getenv("KYTY_SHADER_SUMMARY_DIR");
+	if (dir == nullptr || dir[0] == '\0') {
+		return;
+	}
+	std::string line = fmt::format("0x{:016x} {}", ir.shader_hash, static_cast<uint32_t>(ir.stage));
+	for (size_t i = 0; i < ir.info.images.size(); i++) {
+		const auto& image  = ir.info.images[i];
+		const auto* source = image.source < ir.descriptor_sources.size()
+		                         ? &ir.descriptor_sources[image.source]
+		                         : nullptr;
+		line += fmt::format(" img{}:src{}", i, image.source);
+		if (source != nullptr && source->indirect_image.has_value()) {
+			const auto& indirect = *source->indirect_image;
+			line += fmt::format("/ind(b{},off{},sh{},m{:x})", indirect.bindless ? 1 : 0,
+			                    indirect.table_offset, indirect.key_shift, indirect.key_mask);
+		}
+		if (image.indirect_root != IR::ImageResource::NoIndirectImage) {
+			line += fmt::format("/root{}", image.indirect_root);
+		}
+	}
+	for (size_t i = 0; i < ir.info.samplers.size(); i++) {
+		const auto& sampler = ir.info.samplers[i];
+		const auto* source  = sampler.source < ir.descriptor_sources.size()
+		                          ? &ir.descriptor_sources[sampler.source]
+		                          : nullptr;
+		line += fmt::format(" smp{}:src{}{}", i, sampler.source,
+		                    source != nullptr && source->bindless_sampler.has_value() ? "/bindless"
+		                                                                               : "");
+	}
+	size_t planning_only = 0;
+	for (const auto& memory: ir.memory_info) {
+		planning_only += memory.planning_only ? 1u : 0u;
+	}
+	line += fmt::format(" mem{} plan_only{}\n", ir.memory_info.size(), planning_only);
+	static std::mutex mutex;
+	std::lock_guard   lock(mutex);
+	if (auto* file = std::fopen((std::string(dir) + "/resources.txt").c_str(), "ab");
+	    file != nullptr) {
+		std::fwrite(line.data(), 1, line.size(), file);
+		std::fclose(file);
+	}
+}
 
 namespace {
 
@@ -1015,6 +1066,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::CollectShaderInfo(ir, options.input_info);
 	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
 	IR::AllocateBindings(ir, push_data_start_dword);
+	WriteResourceSummary(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
