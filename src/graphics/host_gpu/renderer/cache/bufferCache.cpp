@@ -219,6 +219,15 @@ private:
 			         e->outcomes[Unmarked], e->outcomes[Downloaded], e->download_bytes / 1024,
 			         e->outcomes[NothingToDownload], e->outcomes[DirectRead], e->pages.size(),
 			         e->micros / 1000.0, e->forwarded, e->forwarded_micros / 1000.0);
+			if (e->pages.size() <= 16) {
+				std::vector<uint64_t> pages(e->pages.begin(), e->pages.end());
+				std::ranges::sort(pages);
+				::printf("    pages:");
+				for (const auto page: pages) {
+					::printf(" 0x%" PRIx64, page << 12u);
+				}
+				::printf("\n");
+			}
 			if (e->writer_finished + e->writer_running + e->writer_unknown == 0) {
 				continue;
 			}
@@ -1367,10 +1376,10 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 			first = seen.emplace(index, s_diag_shader_hash).second;
 		}
 		if (first && watched.fetch_add(1) < 128) {
-			LOGF("GPU write covers watched #%zu 0x%016" PRIx64 "+0x%" PRIx64
-			     ": range=0x%016" PRIx64 " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
-			     index, watch_begin, watch_size, vaddr, size, s_diag_shader_hash,
-			     s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
+			::printf("GPU write covers watched #%zu 0x%016" PRIx64 "+0x%" PRIx64
+			         ": range=0x%016" PRIx64 " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
+			         index, watch_begin, watch_size, vaddr, size, s_diag_shader_hash,
+			         s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
 		}
 	}
 }
