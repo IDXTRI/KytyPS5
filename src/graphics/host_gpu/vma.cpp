@@ -103,6 +103,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+void GraphicContext::GetDeviceAllocationStats(uint64_t& allocation_bytes,
+                                              uint64_t& block_bytes) const {
+	allocation_bytes = 0;
+	block_bytes      = 0;
+	if (allocator == nullptr) {
+		return;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (physical_device_memory_properties.memoryHeaps[heap].flags &
+		    vk::MemoryHeapFlagBits::eDeviceLocal) {
+			allocation_bytes += budgets[heap].statistics.allocationBytes;
+			block_bytes += budgets[heap].statistics.blockBytes;
+		}
+	}
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;

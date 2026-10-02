@@ -263,12 +263,17 @@ void RenderContext::RunGarbageCollector() {
 		if (now - report_time >= std::chrono::seconds(5)) {
 			report_time          = now;
 			constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+			uint64_t allocation_bytes = 0;
+			uint64_t block_bytes      = 0;
+			m_graphics.GetDeviceAllocationStats(allocation_bytes, block_bytes);
 			::printf("Memory: buffers %.2f GiB, images %.2f GiB, device usage %.2f GiB, "
-			         "budget %.2f GiB\n",
+			         "budget %.2f GiB, VMA allocations %.2f GiB in blocks %.2f GiB\n",
 			         static_cast<double>(m_buffer_cache.UsedMemory()) / GiB,
 			         static_cast<double>(m_texture_cache.UsedMemory()) / GiB,
 			         static_cast<double>(m_graphics.GetDeviceMemoryUsage()) / GiB,
-			         static_cast<double>(m_graphics.GetTotalMemoryBudget()) / GiB);
+			         static_cast<double>(m_graphics.GetTotalMemoryBudget()) / GiB,
+			         static_cast<double>(allocation_bytes) / GiB,
+			         static_cast<double>(block_bytes) / GiB);
 			std::fflush(stdout);
 			m_graphics.LogMemoryBudget();
 		}
