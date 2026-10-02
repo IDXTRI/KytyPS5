@@ -18,6 +18,8 @@ using LoadReader = bool (*)(uint64_t fault_vaddr, uint64_t vaddr, void* data, ui
 // MOVZX, MOVSX, MOVSXD, CMP and TEST with a memory operand, and SSE/AVX moves from memory into a
 // vector register. False, with the context untouched, for anything else or when `read` declines.
 [[nodiscard]] bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read);
+// Diagnostics: the mnemonic of the instruction at the context's RIP.
+[[nodiscard]] const char* DescribeInstruction(void* native_context);
 
 } // namespace Loader::X64InstructionEmulator
 

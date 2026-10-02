@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
@@ -24,12 +25,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -655,6 +661,67 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// KYTY_CLEAN_READ_STATS=1 (live, default 0): every 5 s, how guest read faults on GPU-protected
+// pages ended: completed from the backing store, declined because the bytes are GPU-written, or
+// not emulated (by mnemonic), which then go to the GPU thread as readbacks.
+namespace {
+
+thread_local int t_clean_read_result = 0; // 0 not read, 1 read, 2 declined
+
+bool CleanReadProbe(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	const bool ok =
+	    Libs::LibKernel::Memory::TryReadCleanFaultingBytes(fault_vaddr, vaddr, data, size);
+	t_clean_read_result = ok ? 1 : 2;
+	return ok;
+}
+
+class CleanReadStats {
+public:
+	static bool Enabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_CLEAN_READ_STATS", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+	void Add(bool emulated, int reader, const char* mnemonic) {
+		std::lock_guard lock(m_mutex);
+		if (emulated) {
+			m_emulated++;
+		} else if (reader == 2) {
+			m_declined++;
+		} else {
+			m_unsupported[mnemonic]++;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_report < std::chrono::seconds(5)) {
+			return;
+		}
+		uint64_t unsupported = 0;
+		for (const auto& [name, count]: m_unsupported) {
+			unsupported += count;
+		}
+		std::printf("Clean reads (5 s): %" PRIu64 " emulated, %" PRIu64 " GPU-written, %" PRIu64
+		            " not emulated:",
+		            m_emulated, m_declined, unsupported);
+		for (const auto& [name, count]: m_unsupported) {
+			std::printf(" %s x%" PRIu64, name.c_str(), count);
+		}
+		std::printf("\n");
+		m_emulated = m_declined = 0;
+		m_unsupported.clear();
+		m_report = now;
+	}
+
+private:
+	std::mutex                            m_mutex;
+	uint64_t                              m_emulated = 0;
+	uint64_t                              m_declined = 0;
+	std::map<std::string, uint64_t>       m_unsupported;
+	std::chrono::steady_clock::time_point m_report = std::chrono::steady_clock::now();
+};
+
+CleanReadStats g_clean_read_stats;
+
+} // namespace
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -679,11 +746,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
 		static const bool emulate_clean_reads =
 		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
-		if (access == GpuAccess::Read && emulate_clean_reads &&
-		    Loader::X64InstructionEmulator::TryEmulateLoad(
-		        info->native_context, info->access_violation_vaddr,
-		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
-			return true;
+		if (access == GpuAccess::Read && emulate_clean_reads) {
+			t_clean_read_result = 0;
+			const bool emulated = Loader::X64InstructionEmulator::TryEmulateLoad(
+			    info->native_context, info->access_violation_vaddr, &CleanReadProbe);
+			if (CleanReadStats::Enabled()) {
+				g_clean_read_stats.Add(emulated, t_clean_read_result,
+				                       emulated || t_clean_read_result != 0
+				                           ? ""
+				                           : Loader::X64InstructionEmulator::DescribeInstruction(
+				                                 info->native_context));
+			}
+			if (emulated) {
+				return true;
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

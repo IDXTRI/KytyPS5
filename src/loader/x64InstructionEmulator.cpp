@@ -1066,10 +1066,30 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 	return true;
 }
 
+const char* DescribeInstruction(void* native_context) {
+	auto* context = static_cast<PCONTEXT>(native_context);
+	if (context == nullptr) {
+		return "?";
+	}
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderDecodeFull(&LoadDecoder(), reinterpret_cast<const void*>(context->Rip),
+	                               ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands))) {
+		return "(undecodable)";
+	}
+	const char* name = ZydisMnemonicGetString(instruction.mnemonic);
+	return name != nullptr ? name : "?";
+}
+
 #else
 
 bool TryEmulateLoad(void* /*native_context*/, uint64_t /*fault_vaddr*/, LoadReader /*read*/) {
 	return false;
+}
+
+const char* DescribeInstruction(void* /*native_context*/) {
+	return "?";
 }
 
 #endif
