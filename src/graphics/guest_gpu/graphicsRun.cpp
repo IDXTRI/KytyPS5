@@ -1229,13 +1229,18 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				value = condition == 0x00 ? 1 : 0;
 			}
 		} break;
-		case 0x03:
-			if (wait_op != 0) {
+		case 0x03: {
+			// KYTY_BOOL_PREDICATION_WAIT (live, default 1): drain the GPU before reading a bool
+			// predicate whose packet sets the wait bit. Upstream 840b9f57 dropped the drain: the
+			// bit applies to Z-pass query readiness, and a value the GPU still owns is read
+			// through the page tracker's readback anyway. 0 skips the drain (A/B).
+			static auto& bool_wait = Common::LiveSwitches::Get("KYTY_BOOL_PREDICATION_WAIT", 1);
+			if (wait_op != 0 && bool_wait.load(std::memory_order_relaxed) != 0) {
 				BufferFlushAndWait();
 			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
-			break;
+		} break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
 	switch (condition) {
