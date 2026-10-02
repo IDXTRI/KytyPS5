@@ -983,11 +983,13 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
-	if (!is_write && OverlapsPendingWriteReadback(window_begin, window_end)) {
+	if (OverlapsPendingWriteReadback(window_begin, window_end)) {
 		// The page itself is not pending (checked above), but the window shares bytes with a
-		// landing readback: keep reads on the synchronous path there.
-		ReadMemoryOnGpu(vaddr, size, false);
-		return 0;
+		// landing readback (neighbouring pages read by other guest threads): download only the
+		// faulting pages. Before, reads went synchronous here (run 42: ~110 ms/s left on the GPU
+		// thread for Wolverine's busiest readback buffer).
+		window_begin = std::max(page_begin, buffer_begin);
+		window_end   = std::min(page_end, buffer_end);
 	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
