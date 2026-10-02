@@ -927,7 +927,7 @@ static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerReso
 			return value != nullptr ? std::atoi(value) : 0;
 		}();
 		int32_t     shift = 0;
-		const auto* def   = handle->Arg(0).ResolveInstruction();
+		const auto* def   = handle->Arg(0).Resolve().TryInstruction();
 		const auto immediate_u32 = [](const IR::Value& value, uint32_t expected) {
 			return value.IsImmediate() && value.GetType() == IR::Type::U32 &&
 			       value.U32() == expected;
