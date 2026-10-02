@@ -126,10 +126,7 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 }
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
-	// Mesh shaders read indirect draws' parameters through a device address
-	// (EmitMeshDrawParameter).
-	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
-	       state.program.stage == ShaderType::Mesh;
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {

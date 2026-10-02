@@ -689,15 +689,6 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
-// KYTY_MESH_INDIRECT_GPU=1 (live, default 0): indirect draws of mesh-shader pipelines convert
-// their arguments on the GPU (MeshIndirectArgs) instead of reading them on the CPU, which drained
-// the GPU whenever an earlier pass had written them (Wolverine run 43: ~54 a second, ~4 % of the
-// GPU thread).
-static bool MeshIndirectOnGpu() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_MESH_INDIRECT_GPU", 0);
-	return enabled.load(std::memory_order_relaxed) != 0;
-}
-
 struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
@@ -1132,9 +1123,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool mesh = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool quad =
 	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy;
-	// KYTY_MESH_INDIRECT_GPU: mesh draws keep their GPU-written arguments on the GPU
-	// (MeshIndirectArgs, in ExecutePreparedDrawResolved).
-	if (emit.indirect_args == 0 || (!mesh && !quad) || (mesh && !quad && MeshIndirectOnGpu())) {
+	if (emit.indirect_args == 0 || (!mesh && !quad)) {
 		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, emit, index_source,
 		                            primitive_restart_enable);
 		return;
@@ -1186,10 +1175,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	// KYTY_MESH_INDIRECT_GPU: the arguments stay on the GPU; MeshIndirectArgs below derives the
-	// workgroups and the mesh shader's parameters from them.
-	const bool mesh_indirect = mesh_active && emit.indirect_args != 0;
-	uint32_t   mesh_groups   = 0;
+	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
@@ -1202,20 +1188,18 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		if (!mesh_indirect) {
-			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-			if (primitives == 0 || draw.instance_count == 0) {
-				return;
-			}
-			mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-			        limits.maxMeshWorkGroupTotalCount) {
-				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-				     draw.instance_count);
-			}
+		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+		if (primitives == 0 || draw.instance_count == 0) {
+			return;
+		}
+		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+		        limits.maxMeshWorkGroupTotalCount) {
+			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+			     draw.instance_count);
 		}
 	}
 
@@ -1251,7 +1235,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	Buffer*  indirect_buffer = nullptr;
 	uint64_t indirect_offset = 0;
 	if (emit.indirect_args != 0) {
-		EXIT_IF((emit.indirect_args & 3u) != 0);
+		EXIT_IF(mesh_active || (emit.indirect_args & 3u) != 0);
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    emit.indirect_args, draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                         : sizeof(vk::DrawIndirectCommand),
@@ -1307,33 +1291,6 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
 		                          nullptr, 0, nullptr);
 	}
-	MeshIndirectArgs::Result mesh_converted {};
-	vk::DeviceAddress        mesh_parameters = 0;
-	if (mesh_active) {
-		if (m_mesh_indirect_args == nullptr) {
-			m_mesh_indirect_args = std::make_unique<MeshIndirectArgs>(
-			    m_context.GetGraphics(), m_context.GetCommandScheduler());
-		}
-		mesh_parameters = m_mesh_indirect_args->DummyParameters();
-	}
-	if (mesh_indirect) {
-		// Outside rendering (ended above for the indirect arguments): a compute pass.
-		const auto& mesh   = state.vertex_info[0].mesh;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		mesh_converted     = m_mesh_indirect_args->Convert(
-            vk_buffer, {.args           = indirect_buffer->BufferDeviceAddress() + indirect_offset,
-		                    .indexed        = draw.IsIndexed(),
-		                    .max_count      = draw.index_count,
-		                    .primitive_size = mesh.InputPrimitiveSize(),
-		                    .primitive_step = mesh.InputPrimitiveStep(),
-		                    .primitives_per_group = mesh.primitives_per_group,
-		                    .max_groups_x         = limits.maxMeshWorkGroupCount[0],
-		                    .max_groups_y         = limits.maxMeshWorkGroupCount[1],
-		                    .max_groups_total     = limits.maxMeshWorkGroupTotalCount,
-		                    .element_size  = draw.IsIndexed() ? index_source.guest_element_size : 0u,
-		                    .index_address = draw.IsIndexed() ? index_source.address : 0u});
-		mesh_parameters = mesh_converted.parameters;
-	}
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1343,17 +1300,12 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		// Dwords 6-7 address the draw's parameters as MeshIndirectArgs wrote them; the mesh
-		// shader reads them there when dword 0 is MeshIndirectMarker (EmitMeshDrawParameter).
 		const uint32_t draw_data[] {
-		    mesh_indirect ? ShaderRecompiler::IR::PushData::MeshIndirectMarker : draw.index_count,
+		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance,
-		    index_source.guest_element_size,
+		    emit.first_instance, index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u),
-		    static_cast<uint32_t>(mesh_parameters),
-		    static_cast<uint32_t>(mesh_parameters >> 32u)};
+		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
@@ -1383,10 +1335,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_indirect) {
-		vk_buffer.drawMeshTasksIndirectEXT(mesh_converted.command_buffer,
-		                                   mesh_converted.command_offset, 1, 16);
-	} else if (mesh_active) {
+	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit,
