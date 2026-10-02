@@ -1141,6 +1141,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// Research: mesh and legacy quad draws expand their counts on the host, so their
 	// GPU-written arguments are read here (a GPU-dirty page drains the queue first).
+	static std::atomic<uint32_t> cpu_reads_reported {0};
+	if (cpu_reads_reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("Indirect draw arguments read on the CPU: mesh=%u quad=%u indexed=%u "
+		            "args=0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
+		            mesh ? 1u : 0u, quad ? 1u : 0u, draw.IsIndexed() ? 1u : 0u, emit.indirect_args,
+		            state.vertex_info[0].stage.program->shader_hash);
+	}
 	auto resolved_draw  = draw;
 	auto resolved_emit  = emit;
 	auto resolved_index = index_source;
