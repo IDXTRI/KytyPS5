@@ -189,9 +189,24 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 	}
 	std::vector<vk::DescriptorImageInfo> infos;
 	infos.reserve(records.size() - first);
+	// KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY=1 (environment): take only the address modes (CLAMP_X/Y/Z)
+	// from the game's records and keep the fallback sampler's filtering and LOD range. Run 65: the
+	// full records turned Wolverine's terrain into flat colours while the moon needs its record's
+	// clamp; this tells the fields apart from the key -> record mapping.
+	static const bool clamp_only = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY");
+		return value != nullptr && value[0] == '1';
+	}();
 	for (size_t key = first; key < records.size(); key++) {
 		ShaderSamplerResource descriptor;
 		std::copy(records[key].begin(), records[key].end(), descriptor.fields);
+		if (clamp_only) {
+			const auto& fallback = ShaderRecompiler::IR::BindlessDefaultSampler;
+			descriptor.fields[0] = (fallback[0] & ~0x1ffu) | (records[key][0] & 0x1ffu);
+			descriptor.fields[1] = fallback[1];
+			descriptor.fields[2] = fallback[2];
+			descriptor.fields[3] = fallback[3];
+		}
 		if ((heap.flags & SamplerDepthCompare) == 0u) {
 			descriptor.fields[0] &= ~(0x7u << 12u);
 		}
