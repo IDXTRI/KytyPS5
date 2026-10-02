@@ -1067,6 +1067,23 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
 	IR::AllocateBindings(ir, push_data_start_dword);
 	WriteResourceSummary(ir);
+	// KYTY_IR_DUMP_DIR=<dir> (environment): the IR of every program with a bindless sampler plan
+	// goes to <dir>/<hash>.txt (Wolverine: compare the sampler address computation of shaders
+	// whose key needs no record shift with the others).
+	if (static const char* ir_dir = std::getenv("KYTY_IR_DUMP_DIR"); ir_dir != nullptr) {
+		const bool bindless_sampler = std::ranges::any_of(ir.info.samplers, [&](const auto& sampler) {
+			return sampler.source < ir.descriptor_sources.size() &&
+			       ir.descriptor_sources[sampler.source].bindless_sampler.has_value();
+		});
+		if (bindless_sampler) {
+			const auto text = MakeIrDump(translated.cfg_dump, ir);
+			const auto path = fmt::format("{}/{:016x}.txt", ir_dir, ir.shader_hash);
+			if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				std::fwrite(text.data(), 1, text.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
