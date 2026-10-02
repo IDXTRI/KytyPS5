@@ -856,6 +856,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 
 	std::string decoded_dump;
+	// KYTY_DECODED_DUMP_DIR=<dir> (environment): the decoded RDNA2 of every program that already has
+	// <dir>/<hash>.txt (from KYTY_IR_DUMP_DIR) goes to <dir>/<hash>.rdna.txt, with the original
+	// address arithmetic the tracking passes rewrite.
+	if (static const char* rdna_dir = std::getenv("KYTY_DECODED_DUMP_DIR"); rdna_dir != nullptr) {
+		const auto ir_path = fmt::format("{}/{:016x}.txt", rdna_dir, options.shader_hash);
+		if (auto* existing = std::fopen(ir_path.c_str(), "rb"); existing != nullptr) {
+			std::fclose(existing);
+			const auto text = Decoder::ProgramToString(decoded);
+			const auto path = fmt::format("{}/{:016x}.rdna.txt", rdna_dir, options.shader_hash);
+			if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				std::fwrite(text.data(), 1, text.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
 		if (options.early_dump) {
