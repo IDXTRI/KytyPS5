@@ -57,6 +57,12 @@ public:
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
+	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
+	                              uint32_t stride) const {
+		Run([=](vk::CommandBuffer command) {
+			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
+		});
+	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}

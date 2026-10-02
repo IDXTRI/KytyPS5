@@ -317,7 +317,11 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draws: count, vertex offset or first vertex, first instance, index element size,
+	// index address (2), and the device address (2) of these six as MeshIndirectArgs wrote them,
+	// which the mesh shader reads instead when dword 0 is MeshIndirectMarker.
+	static constexpr uint32_t        MeshDrawDwordCount = 8;
+	static constexpr uint32_t        MeshIndirectMarker = 0xffffffffu;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 

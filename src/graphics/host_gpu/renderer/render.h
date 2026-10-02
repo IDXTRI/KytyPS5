@@ -276,6 +276,7 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	std::unique_ptr<MeshIndirectArgs>       m_mesh_indirect_args;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

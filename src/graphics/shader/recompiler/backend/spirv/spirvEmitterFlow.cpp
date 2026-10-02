@@ -653,17 +653,44 @@ uint32_t EmitLaneId(EmitterState& state) {
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+	auto&      state = ctx.state;
+	const auto index = inst.Arg(0).U32();
+	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount - 2u) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	const auto push_dword = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	// An indirect draw's parameters were written on the GPU (MeshIndirectArgs): dword 0 holds
+	// PushData::MeshIndirectMarker and dwords 6-7 their address. A direct draw's address is a
+	// readable dummy, so the load is unconditional and only the select picks.
+	const auto u64     = TypeScalarU64(state);
+	const auto first   = push_dword(0);
+	const auto low     = Unary(state, spv::OpUConvert, u64, push_dword(6));
+	const auto high    = Unary(state, spv::OpUConvert, u64, push_dword(7));
+	const auto base    = Binary(state, spv::OpBitwiseOr, u64, low,
+	                            Binary(state, spv::OpShiftLeftLogical, u64, high,
+	                                   state.builder.Constant(spv::OpConstant, u64, 32u, 0u)));
+	const auto address = Binary(state, spv::OpIAdd, u64, base,
+	                            state.builder.Constant(spv::OpConstant, u64, index * 4u, 0u));
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          address);
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, pointer,
+	                          spv::MemoryAccessAlignedMask, 4u);
+	const auto indirect = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), indirect, first,
+	                          ConstantU32(state, IR::PushData::MeshIndirectMarker));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, indirect, loaded,
+	                          index == 0u ? first : push_dword(index));
 	return result;
 }
 
