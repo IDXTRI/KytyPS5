@@ -1109,6 +1109,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
+	// Diagnostics name this shader as the writer of the buffers bound below (KYTY_WATCH_GPU_WRITE,
+	// KYTY_READBACK_STATS); the shader looked up last can be another stage's or dispatch's.
+	DiagShaderScope diag(program.shader_hash);
+	BufferCache::SetReadbackStatsShader(program.shader_hash);
 
 	prepared.buffers.clear();
 	prepared.buffers.reserve(layout.memory_offset_count);
