@@ -997,8 +997,30 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 		// terrain gets a wrong record (its records alternate clamp/wrap; a clamped tiling texture
 		// is one flat colour); this tests an off-by-N table offset.
 		static auto& key_shift = Common::LiveSwitches::Get("KYTY_BINDLESS_SAMPLER_KEY_SHIFT", 0);
+		// KYTY_KEY_SHIFT_SKIP_BITS=k / KYTY_KEY_SHIFT_SKIP_VALUE=v (live, research): the shift
+		// skips shaders whose hash has v in its low k bits, to find by bisection which shaders
+		// need the unshifted records (Wolverine's moon).
+		static auto& skip_bits  = Common::LiveSwitches::Get("KYTY_KEY_SHIFT_SKIP_BITS", 0);
+		static auto& skip_value = Common::LiveSwitches::Get("KYTY_KEY_SHIFT_SKIP_VALUE", 0);
+		bool         skip_shift = false;
+		if (const auto bits = skip_bits.load(std::memory_order_relaxed); bits > 0 && bits < 64) {
+			const uint64_t mask = (uint64_t {1} << static_cast<uint32_t>(bits)) - 1u;
+			skip_shift          = (program.shader_hash & mask) ==
+			             (static_cast<uint64_t>(skip_value.load(std::memory_order_relaxed)) & mask);
+		}
+		{
+			static auto&                        dump_hashes = Common::LiveSwitches::Get(
+                "KYTY_BINDLESS_SAMPLER_SHADERS", 0);
+			static std::unordered_set<uint64_t> printed;
+			if (dump_hashes.load(std::memory_order_relaxed) != 0 &&
+			    printed.insert(program.shader_hash).second) {
+				::printf("Bindless sampler shader 0x%016llx\n",
+				         static_cast<unsigned long long>(program.shader_hash));
+				std::fflush(stdout);
+			}
+		}
 		if (const auto shift = key_shift.load(std::memory_order_relaxed);
-		    shift != 0 && region != 0 && entries != 0) {
+		    shift != 0 && !skip_shift && region != 0 && entries != 0) {
 			const auto magnitude = static_cast<uint32_t>(shift > 0 ? shift : -shift);
 			if (shift > 0 && magnitude < entries) {
 				region += magnitude;
