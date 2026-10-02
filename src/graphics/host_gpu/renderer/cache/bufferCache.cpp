@@ -293,6 +293,15 @@ bool AsyncWriteReadbackEnabled() {
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
+// KYTY_ASYNC_READ_SNAPSHOT=1 (live, default 0): see Memory::RequestServeFromBacking. Wolverine's
+// busiest readback buffer is rewritten by the GPU before the asynchronous download lands (run 41:
+// the writer was still running for 194 of 402 readbacks per 5 s); the guest never waits for it,
+// so it reads whatever the GPU had written by then, as the download captured.
+bool AsyncReadSnapshotEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READ_SNAPSHOT", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
 bool AsyncReadReadbackEnabled() {
 	// Run 37 A/B at the Wolverine spot: readback time on the GPU thread 147 -> 113 ms/s, mean
 	// frame 73.5 -> 72.5 ms. The busiest buffer gains nothing: the GPU rewrites its pages before
@@ -643,7 +652,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// KYTY_ASYNC_READBACK=1 (live, default 0) does the same for guest reads. Wolverine run 36
 	// (KYTY_READBACK_STATS): every readback at the spot came from a guest thread, and serving
 	// them synchronously cost the GPU thread ~1.3 s per 5 s, mostly waiting for the GPU.
-	if (!GuestGpu::IsGpuThread() &&
+	if (!GuestGpu::IsGpuThread() && !Libs::LibKernel::Memory::ForceSyncReadback() &&
 	    (is_write ? AsyncWriteReadbackEnabled() : AsyncReadReadbackEnabled())) {
 		uint64_t tick         = 0;
 		uint64_t window_begin = 0;
@@ -661,9 +670,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
 			}
+			bool redirtied = false;
 			gpu.SendCommandSync([&] {
-				FinishWriteReadback(vaddr, size, is_write, window_begin, window_end, tick);
+				redirtied = !FinishWriteReadback(vaddr, size, is_write, window_begin, window_end,
+				                                 tick, !is_write && AsyncReadSnapshotEnabled());
 			});
+			if (redirtied) {
+				// The download holds the bytes as of this read; the fault handler completes the
+				// load from them (KYTY_ASYNC_READ_SNAPSHOT).
+				Libs::LibKernel::Memory::RequestServeFromBacking();
+			}
 		}
 		return;
 	}
@@ -988,8 +1004,9 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 }
 
 // GPU thread, after the guest waited for the readback's tick and its publication.
-void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
-                                      uint64_t window_begin, uint64_t window_end, uint64_t tick) {
+bool BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
+                                      uint64_t window_begin, uint64_t window_end, uint64_t tick,
+                                      bool snapshot) {
 	KYTY_PROFILER_FUNCTION();
 	for (size_t i = 0; i < m_pending_write_readbacks.size(); i++) {
 		const auto& pending = m_pending_write_readbacks[i];
@@ -999,19 +1016,27 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_wri
 		}
 	}
 	if (!IsRegionRegistered(vaddr, size)) {
-		return;
+		return true;
 	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+		if (snapshot) {
+			// The GPU wrote the page again after the download was recorded: the backing store
+			// holds the bytes as of the guest's read, which the caller serves; the page stays
+			// GPU-owned and protected.
+			m_snapshot_reads++;
+			return false;
+		}
 		// The GPU wrote the window again while the download was landing, or another readback
 		// still covers the page: resolve this fault the synchronous way.
 		ReadMemoryOnGpu(vaddr, size, is_write);
-		return;
+		return true;
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
+	return true;
 }
 
 // GPU thread: waits for a pending readback's publication and, unless the GPU wrote its window

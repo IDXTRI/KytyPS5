@@ -963,6 +963,29 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+namespace {
+thread_local bool t_serve_from_backing  = false;
+thread_local bool t_force_sync_readback = false;
+} // namespace
+
+void RequestServeFromBacking() noexcept {
+	t_serve_from_backing = true;
+}
+
+bool TakeServeFromBacking() noexcept {
+	const bool serve     = t_serve_from_backing;
+	t_serve_from_backing = false;
+	return serve;
+}
+
+void SetForceSyncReadback(bool force) noexcept {
+	t_force_sync_readback = force;
+}
+
+bool ForceSyncReadback() noexcept {
+	return t_force_sync_readback;
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

@@ -133,6 +133,14 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// KYTY_ASYNC_READ_SNAPSHOT (BufferCache::ReadMemory): the faulting guest thread's read was
+// downloaded but the GPU wrote the page again before the guest could read it. The fault handler
+// then completes the load from the backing store (the bytes as of the read) and the page stays
+// protected; if it cannot emulate the load, it resolves the fault synchronously instead.
+void               RequestServeFromBacking() noexcept;
+[[nodiscard]] bool TakeServeFromBacking() noexcept;
+void               SetForceSyncReadback(bool force) noexcept;
+[[nodiscard]] bool ForceSyncReadback() noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

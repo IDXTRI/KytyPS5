@@ -762,6 +762,22 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			if (access == GpuAccess::Read && Libs::LibKernel::Memory::TakeServeFromBacking()) {
+				// KYTY_ASYNC_READ_SNAPSHOT: the download holds this read's bytes and the page
+				// stays protected, so the load completes from the backing store.
+				if (Loader::X64InstructionEmulator::TryEmulateLoad(
+				        info->native_context, info->access_violation_vaddr,
+				        [](uint64_t, uint64_t vaddr, void* data, uint64_t size) {
+					        return Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size);
+				        })) {
+					return true;
+				}
+				Libs::LibKernel::Memory::SetForceSyncReadback(true);
+				const bool resolved =
+				    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+				Libs::LibKernel::Memory::SetForceSyncReadback(false);
+				return resolved;
+			}
 			return true;
 		}
 	}
