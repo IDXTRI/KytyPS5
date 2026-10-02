@@ -928,13 +928,19 @@ static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerReso
 		}();
 		int32_t     shift = 0;
 		const auto* def   = handle->Arg(0).ResolveInstruction();
-		if (def != nullptr && def->NumArgs() == 2u) {
-			const auto amount = def->Arg(1).Resolve();
-			if (def->GetOpcode() == IR::ValueOpcode::ShiftRightLogical32 && amount.IsImmediate() &&
-			    amount.U32() == 16u) {
+		const auto immediate_u32 = [](const IR::Value& value, uint32_t expected) {
+			return value.IsImmediate() && value.GetType() == IR::Type::U32 &&
+			       value.U32() == expected;
+		};
+		if (def != nullptr && def->NumArgs() == 2u &&
+		    (def->GetOpcode() == IR::ValueOpcode::ShiftRightLogical32 ||
+		     def->GetOpcode() == IR::ValueOpcode::BitwiseAnd32)) {
+			const auto amount = def->Arg(1);
+			if (def->GetOpcode() == IR::ValueOpcode::ShiftRightLogical32 &&
+			    immediate_u32(amount, 16u)) {
 				shift = shift_high;
-			} else if (def->GetOpcode() == IR::ValueOpcode::BitwiseAnd32 && amount.IsImmediate() &&
-			           amount.U32() == 0x3fffu) {
+			} else if (def->GetOpcode() == IR::ValueOpcode::BitwiseAnd32 &&
+			           (immediate_u32(amount, 0x3fffu) || immediate_u32(def->Arg(0), 0x3fffu))) {
 				shift = shift_and14;
 			}
 		}
