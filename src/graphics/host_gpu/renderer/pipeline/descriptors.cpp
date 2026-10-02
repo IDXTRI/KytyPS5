@@ -993,6 +993,20 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 			region  = 0;
 			entries = 0;
 		}
+		// KYTY_BINDLESS_SAMPLER_KEY_SHIFT=N (live, research): key k selects record k + N. Run 72:
+		// terrain gets a wrong record (its records alternate clamp/wrap; a clamped tiling texture
+		// is one flat colour); this tests an off-by-N table offset.
+		static auto& key_shift = Common::LiveSwitches::Get("KYTY_BINDLESS_SAMPLER_KEY_SHIFT", 0);
+		if (const auto shift = key_shift.load(std::memory_order_relaxed);
+		    shift != 0 && region != 0 && entries != 0) {
+			const auto magnitude = static_cast<uint32_t>(shift > 0 ? shift : -shift);
+			if (shift > 0 && magnitude < entries) {
+				region += magnitude;
+				entries -= magnitude;
+			} else if (shift < 0 && magnitude < region) {
+				region -= magnitude;
+			}
+		}
 		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
 	}
 }
