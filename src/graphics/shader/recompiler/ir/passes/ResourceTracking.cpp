@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <bit>
 #include <fmt/format.h>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -22,6 +25,27 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// KYTY_SAMPLER_DUMP=1: print each shader that falls back to the default sampler, once, so a
+// title workaround (KYTY_CLAMP_SAMPLER_SHADERS) can name it.
+void NoteDefaultSamplerShader(uint64_t shader_hash, const char* stage) {
+	static const bool dump = [] {
+		const char* value = std::getenv("KYTY_SAMPLER_DUMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!dump) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	std::lock_guard                     lock(mutex);
+	if (seen.insert(shader_hash).second) {
+		::printf("Default sampler: shader 0x%016llx (%s)%s\n",
+		         static_cast<unsigned long long>(shader_hash), stage,
+		         &FallbackSamplerFor(shader_hash) != &FallbackSampler() ? " -> clamped" : "");
+		std::fflush(stdout);
+	}
+}
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
@@ -2438,8 +2462,9 @@ private:
 		if (!Frontend::TranslationNonFatal()) {
 			return;
 		}
-		// Trilinear, full LOD range; wraps unless KYTY_DEFAULT_SAMPLER_CLAMP (BindlessBindings.h).
-		const auto& DefaultSampler = FallbackSampler();
+		// Trilinear, full LOD range; wraps unless KYTY_DEFAULT_SAMPLER_CLAMP or the shader is in
+		// KYTY_CLAMP_SAMPLER_SHADERS (BindlessBindings.h).
+		const auto& DefaultSampler = FallbackSamplerFor(m_program.shader_hash);
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
@@ -2510,6 +2535,7 @@ private:
 				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
 				     "using a default sampler (%zu heap reads planning-only)\n",
 				     m_program.shader_hash, inst.Flags<MemoryFlags>().pc, stranded);
+				NoteDefaultSamplerShader(m_program.shader_hash, StageName(m_program.stage));
 			}
 		}
 	}
@@ -2576,7 +2602,8 @@ private:
 			// filtering and edge addressing can differ from the material's own sampler.
 			if (expected == ValueOpcode::GetSamplerResource && width == 4u &&
 			    Frontend::TranslationNonFatal()) {
-				const auto& DefaultSampler = FallbackSampler();
+				const auto& DefaultSampler = FallbackSamplerFor(m_program.shader_hash);
+				NoteDefaultSamplerShader(m_program.shader_hash, StageName(m_program.stage));
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					handle->SetArg(dword, Value(DefaultSampler[dword]));
 					descriptor.dwords[dword] = Value(DefaultSampler[dword]);

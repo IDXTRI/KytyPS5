@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -44,6 +46,40 @@ inline const std::array<uint32_t, 4>& FallbackSampler() {
 		return result;
 	}();
 	return words;
+}
+
+// Title workaround, separate from the generic fallback: KYTY_CLAMP_SAMPLER_SHADERS=hash,hash,...
+// (hex, environment) gives the shaders listed a clamping fallback sampler while every other
+// shader keeps the wrapping one. Wolverine's night sky draws its moon through an unresolved
+// bindless sampler; wrap tiles it across the sky, but terrain needs wrap.
+inline const std::array<uint32_t, 4>& FallbackSamplerFor(uint64_t shader_hash) {
+	static const std::unordered_set<uint64_t> clamped = [] {
+		std::unordered_set<uint64_t> result;
+		const char*                  list = std::getenv("KYTY_CLAMP_SAMPLER_SHADERS");
+		if (list != nullptr) {
+			std::string text(list);
+			size_t      start = 0;
+			while (start < text.size()) {
+				const auto end = text.find(',', start);
+				const auto item =
+				    text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+				if (!item.empty()) {
+					result.insert(std::strtoull(item.c_str(), nullptr, 16));
+				}
+				if (end == std::string::npos) {
+					break;
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	static const std::array<uint32_t, 4> clamp = [] {
+		auto result = BindlessDefaultSampler;
+		result[0]   = 2u | (2u << 3u) | (2u << 6u);
+		return result;
+	}();
+	return clamped.contains(shader_hash) ? clamp : FallbackSampler();
 }
 
 // Research: the tail of the feedback buffer holds loop-watchdog trip reports. Word
