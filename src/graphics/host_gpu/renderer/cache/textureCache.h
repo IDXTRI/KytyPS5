@@ -211,6 +211,8 @@ private:
 		uint64_t gone_or_depth = 0;
 		uint64_t pinned        = 0;
 		uint64_t pinned_bytes  = 0;
+		uint64_t unpinned       = 0;
+		uint64_t unpinned_bytes = 0;
 		uint64_t gpu_kept      = 0;
 		uint64_t gpu_kept_bytes = 0;
 		uint64_t download_failed = 0;

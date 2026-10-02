@@ -2181,11 +2181,10 @@ void TextureCache::RunGarbageCollector() {
 				m_gc_stats.gone_or_depth++;
 				continue;
 			}
-			// KYTY_BINDLESS_EVICT=1 (live, default): collect bindless images the shaders have not
+			// KYTY_BINDLESS_EVICT=1 (live, default): unpin bindless images the shaders have not
 			// sampled for KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their
-			// age), or KYTY_BINDLESS_EVICT_TIGHT_AGE (live, default 15) near the driver budget, not
-			// only images draws bind. Their keys become pending again and load anew when sampled,
-			// so the age stays well above the few frames feedback snapshots lag.
+			// age), or KYTY_BINDLESS_EVICT_TIGHT_AGE (live, default 15) near the driver budget. The
+			// age stays well above the few frames feedback snapshots lag.
 			static auto& evict_pinned = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT", 1);
 			static auto& evict_age    = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_AGE", 60);
 			static auto& tight_age = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_TIGHT_AGE", 15);
@@ -2196,6 +2195,22 @@ void TextureCache::RunGarbageCollector() {
 			     m_lru_cache.TickOf(owner->lru_id) + pinned_age > clock)) {
 				m_gc_stats.pinned++;
 				m_gc_stats.pinned_bytes += owner->AccountedSize();
+				continue;
+			}
+			// Unpinning points its table slots back at the placeholder and makes its keys pending,
+			// but keeps the image: it is collected like any other once unused for the normal age,
+			// and a key sampled again in between resolves to it without a reload. Freeing it here
+			// directly lost the device in Wolverine runs 54/55 once large images had dedicated
+			// memory (a read of the freed image, ReadInvalid outside every buffer).
+			if (owner->bindless_pinned) {
+				NoteBindlessStateChange(*owner);
+				owner->bindless_pinned = false;
+				if (on_bindless_unregister) {
+					on_bindless_unregister(id);
+				}
+				TouchImage(*owner);
+				m_gc_stats.unpinned++;
+				m_gc_stats.unpinned_bytes += owner->AccountedSize();
 				continue;
 			}
 			if (owner->IsGpuModified()) {
@@ -2292,10 +2307,12 @@ void TextureCache::ReportGcStats(uint64_t clock) {
 	constexpr double MiB = 1024.0 * 1024.0;
 	const auto&      st  = m_gc_stats;
 	::printf("ImageGC (5 s): runs %" PRIu64 " (pressured %" PRIu64 "), visited %" PRIu64
-	         ", gone/depth %" PRIu64 ", pinned %" PRIu64 " (%.0f MiB), gpu kept %" PRIu64
+	         ", gone/depth %" PRIu64 ", pinned %" PRIu64 " (%.0f MiB), unpinned %" PRIu64
+	         " (%.0f MiB), gpu kept %" PRIu64
 	         " (%.0f MiB), download failed %" PRIu64 ", freed %" PRIu64 " (%.0f MiB)\n",
 	         st.runs, st.pressured, st.visited, st.gone_or_depth, st.pinned,
-	         static_cast<double>(st.pinned_bytes) / MiB, st.gpu_kept,
+	         static_cast<double>(st.pinned_bytes) / MiB, st.unpinned,
+	         static_cast<double>(st.unpinned_bytes) / MiB, st.gpu_kept,
 	         static_cast<double>(st.gpu_kept_bytes) / MiB, st.download_failed, st.freed,
 	         static_cast<double>(st.freed_bytes) / MiB);
 	::printf("ImageGC now: %" PRIu64 " images %.0f MiB (unused 16+ frames %.0f MiB), pinned %" PRIu64
