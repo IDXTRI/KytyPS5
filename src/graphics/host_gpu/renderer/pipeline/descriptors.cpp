@@ -890,6 +890,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
 	table.WriteSlot(heap.binding, slot, view, layout);
 	heap.slots[key]         = slot;
+	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;
 	image->usage.texture    = true;
 	heap.resolved.push_back(binding.image_id);
@@ -920,9 +921,10 @@ void RenderExecutor::ResolveBindlessRequests() {
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget   = 128;
 	uint32_t           resolved = 0;
+	m_bindless_used.clear();
 	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
 		m_bindless_requests.clear();
-		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
+		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests, m_bindless_used);
 		for (const auto key: m_bindless_requests) {
 			if (heap.settled[key] != 0) {
 				continue;
@@ -933,6 +935,9 @@ void RenderExecutor::ResolveBindlessRequests() {
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
 		}
 	}
+	// Shaders sampled these since the last snapshot; draws never bind them, so this is the only
+	// place their age in the texture cache is refreshed.
+	m_context.GetTextureCache().TouchImages(m_bindless_used);
 	table.RecordFeedbackSnapshot(scheduler);
 }
 

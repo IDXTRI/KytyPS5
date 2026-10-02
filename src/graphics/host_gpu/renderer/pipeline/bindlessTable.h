@@ -74,6 +74,7 @@ public:
 		std::vector<uint32_t>               slots;    // per key; 0 = not resolved
 		std::vector<uint8_t>                settled;  // per key; resolved, or known placeholder
 		std::vector<ImageId>                resolved; // images to keep readable for draws
+		std::vector<ImageId>                images;   // per key; the image a resolved key samples
 		// What RenderExecutor::CommitBindings last checked: g_bindless_state_generation then, and
 		// how many resolved images. Unchanged since, only the images resolved after need a look.
 		uint64_t checked_generation = 0;
@@ -87,7 +88,7 @@ public:
 	                                     uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
-	// 0 when the array is full (slots are not reused yet).
+	// 0 when the array is full. Slots of dropped images are reused once the GPU is past them.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
@@ -100,8 +101,9 @@ public:
 	// Whether the GPU has executed the recorded copy; never waits.
 	[[nodiscard]] bool SnapshotReady(CommandScheduler& scheduler);
 	void               ConsumeSnapshot() noexcept { m_snapshot_tick = 0; }
-	// Pending keys flagged in the snapshot; their flags are cleared.
-	void TakeRequests(const Heap& heap, std::vector<uint32_t>& keys);
+	// Pending keys flagged in the snapshot, and the images of resolved keys sampled since the last
+	// call (shaders mark both); their flags are cleared.
+	void TakeRequests(const Heap& heap, std::vector<uint32_t>& keys, std::vector<ImageId>& used);
 	// Logs the loop-watchdog trip reports shaders appended since the last call
 	// (BindlessBindings.h), then clears the count.
 	void DrainWatchdogReports(uint64_t frame);
@@ -152,11 +154,15 @@ private:
 	}
 
 	GraphicContext&         m_graphics;
+	CommandScheduler&       m_scheduler;
 	std::deque<Heap>        m_heaps;
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors};
+	// Slots of unregistered images per array, with the tick after which no command buffer reads
+	// them.
+	std::array<std::deque<std::pair<uint64_t, uint32_t>>, ImageArrays> m_free_slots;
 	std::array<VulkanImage, Placeholders>   m_placeholders;
 	std::array<vk::ImageView, Placeholders> m_placeholder_views {};
 	vk::DescriptorPool      m_pool   = nullptr;

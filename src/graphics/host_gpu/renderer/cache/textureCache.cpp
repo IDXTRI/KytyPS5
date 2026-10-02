@@ -410,6 +410,15 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+void TextureCache::TouchImages(std::span<const ImageId> ids) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: ids) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+			TouchImage(*image);
+		}
+	}
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
@@ -2163,7 +2172,18 @@ void TextureCache::RunGarbageCollector() {
 				m_gc_stats.gone_or_depth++;
 				continue;
 			}
-			if (owner->bindless_pinned) {
+			// KYTY_BINDLESS_EVICT=1 (live): collect bindless images the shaders have not sampled for
+			// KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their age), not
+			// only images draws bind. Their keys become pending again and load anew when sampled,
+			// so the age stays well above the few frames feedback snapshots lag and covers a turn
+			// of the camera.
+			static auto& evict_pinned = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT", 0);
+			static auto& evict_age    = Common::LiveSwitches::Get("KYTY_BINDLESS_EVICT_AGE", 60);
+			const auto   pinned_age   = static_cast<uint64_t>(
+			    std::max<int64_t>(8, evict_age.load(std::memory_order_relaxed)));
+			if (owner->bindless_pinned &&
+			    (evict_pinned.load(std::memory_order_relaxed) == 0 ||
+			     m_lru_cache.TickOf(owner->lru_id) + pinned_age > clock)) {
 				m_gc_stats.pinned++;
 				m_gc_stats.pinned_bytes += owner->AccountedSize();
 				continue;

@@ -21,7 +21,7 @@
 namespace Libs::Graphics {
 
 BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_graphics(graphics) {
+    : m_graphics(graphics), m_scheduler(scheduler) {
 	if (!graphics.bindless_enabled) {
 		return;
 	}
@@ -397,6 +397,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	m_next_region += capacity;
 	heap.slots.resize(capacity, 0u);
 	heap.settled.resize(capacity, 0u);
+	heap.images.resize(capacity);
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
 	for (uint32_t key = 0; key < capacity; key++) {
@@ -443,7 +444,16 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
-	if (binding >= ImageArrays || m_next_slot[binding] >= m_images_per_array) {
+	if (binding >= ImageArrays) {
+		return 0;
+	}
+	auto& free = m_free_slots[binding];
+	if (!free.empty() && m_scheduler.IsFree(free.front().first)) {
+		const auto slot = free.front().second;
+		free.pop_front();
+		return slot;
+	}
+	if (m_next_slot[binding] >= m_images_per_array) {
 		return 0;
 	}
 	return m_next_slot[binding]++;
@@ -502,18 +512,24 @@ bool BindlessTable::SnapshotReady(CommandScheduler& scheduler) {
 	return m_snapshot_tick != 0 && scheduler.IsFree(m_snapshot_tick);
 }
 
-void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
+void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys,
+                                 std::vector<ImageId>& used) {
 	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
 	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
 	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t),
 	                                heap.entries * sizeof(uint32_t));
 	bool cleared = false;
 	for (uint32_t key = 0; key < heap.entries; key++) {
-		if (snapshot[heap.region + key] != 0) {
+		const auto flag = snapshot[heap.region + key];
+		if (flag != 0) {
 			// A flag the GPU sets again after the snapshot may be lost here; a key that is
-			// still pending is flagged again by the next draw that samples it.
+			// still pending (or in use) is flagged again by the next draw that samples it.
 			feedback[heap.region + key] = 0;
-			keys.push_back(key);
+			if (flag == ShaderRecompiler::IR::BindlessFlagPending) {
+				keys.push_back(key);
+			} else if (flag == ShaderRecompiler::IR::BindlessFlagUsed && heap.images[key]) {
+				used.push_back(heap.images[key]);
+			}
 			cleared = true;
 		}
 	}
@@ -591,7 +607,10 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		if (heap->slots[key] != 0) {
 			WriteSlot(heap->binding, heap->slots[key], m_placeholder_views[heap->binding],
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			// Command buffers recorded so far may still sample the slot.
+			m_free_slots[heap->binding].emplace_back(m_scheduler.CurrentTick(), heap->slots[key]);
 		}
+		heap->images[key]  = {};
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;
 		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);

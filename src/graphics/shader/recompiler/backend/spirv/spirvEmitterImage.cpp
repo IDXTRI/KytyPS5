@@ -765,8 +765,9 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 // The bindless slot of the image handle's key: translation[region + key] when the key is inside
 // the heap's entry count (both from the flattened SRT, patched by the host), otherwise and while
 // the texture is pending, slot 0 (the placeholder). A pending key is flagged in the feedback
-// buffer for the host to resolve; every lane that reads an entry sees the same translation, so
-// the unconditional store never races with a different value.
+// buffer for the host to resolve, a resident one as used (the texture cache keeps it); every
+// lane that reads an entry sees the same translation, so the unconditional store never races
+// with a different value.
 static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& image,
                              IR::Value image_arg) {
 	auto&       state  = ctx.state;
@@ -797,7 +798,8 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	if (state.bindless_feedback_variable != 0) {
 		const auto pending_flag = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), pending_flag, pending,
-		                          ConstantU32(state, 1u), ConstantU32(state, 0u));
+		                          ConstantU32(state, IR::BindlessFlagPending),
+		                          ConstantU32(state, IR::BindlessFlagUsed));
 		// Research diagnostics: a key outside its heap leaves itself (with the top bit set) in
 		// feedback word 0, which belongs to no heap.
 		const auto marked_key = Binary(state, spv::OpBitwiseOr, TypeU32(state), key,

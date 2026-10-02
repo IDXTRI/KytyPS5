@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,6 +77,8 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Marks the images as used now (bindless textures the shaders sampled).
+	void TouchImages(std::span<const ImageId> ids);
 	void RunGarbageCollector();
 	// Bytes of device memory the cached images account for.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }

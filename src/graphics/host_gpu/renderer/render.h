@@ -269,6 +269,7 @@ private:
 	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<ImageId>                  m_bindless_used;
 	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

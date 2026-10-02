@@ -18,6 +18,9 @@ inline constexpr uint32_t BindlessFeedback       = 5;
 inline constexpr uint32_t BindlessSamplers       = 6;
 // A translation entry for a key whose texture is not resident yet; the shader samples slot 0.
 inline constexpr uint32_t BindlessPending        = 0xffffffffu;
+// Feedback flags a shader stores per key it samples: the texture is pending, or resident and used.
+inline constexpr uint32_t BindlessFlagPending    = 1;
+inline constexpr uint32_t BindlessFlagUsed       = 2;
 // The S# a sampler without a usable heap entry gets: wrap on every axis, trilinear, full LOD range.
 inline constexpr std::array<uint32_t, 4> BindlessDefaultSampler {
     0x00000000u,                             // wrap on every axis
