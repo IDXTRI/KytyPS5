@@ -912,7 +912,37 @@ static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerReso
 	auto&       state  = ctx.state;
 	const auto* handle = sampler_arg.ResolveInstruction();
 	EXIT_IF(handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0);
-	const auto key  = ctx.Def(handle->Arg(0));
+	auto       key  = ctx.Def(handle->Arg(0));
+	// Research (Wolverine, run 74): the record a key selects is off by a per-shader amount. A
+	// material word packs two sampler indices; KYTY_KEY_SHIFT_HIGH / KYTY_KEY_SHIFT_AND14
+	// (environment) add a record offset to keys taken from its high half (x >> 16) or its low 14
+	// bits (x & 0x3fff), to test whether the extraction form decides it.
+	{
+		static const int32_t shift_high = [] {
+			const char* value = std::getenv("KYTY_KEY_SHIFT_HIGH");
+			return value != nullptr ? std::atoi(value) : 0;
+		}();
+		static const int32_t shift_and14 = [] {
+			const char* value = std::getenv("KYTY_KEY_SHIFT_AND14");
+			return value != nullptr ? std::atoi(value) : 0;
+		}();
+		int32_t     shift = 0;
+		const auto* def   = handle->Arg(0).ResolveInstruction();
+		if (def != nullptr && def->NumArgs() == 2u) {
+			const auto amount = def->Arg(1).Resolve();
+			if (def->GetOpcode() == IR::ValueOpcode::ShiftRightLogical32 && amount.IsImmediate() &&
+			    amount.U32() == 16u) {
+				shift = shift_high;
+			} else if (def->GetOpcode() == IR::ValueOpcode::BitwiseAnd32 && amount.IsImmediate() &&
+			           amount.U32() == 0x3fffu) {
+				shift = shift_and14;
+			}
+		}
+		if (shift != 0) {
+			key = Binary(state, spv::OpIAdd, TypeU32(state), key,
+			             ConstantU32(state, static_cast<uint32_t>(shift)));
+		}
+	}
 	const auto Load = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
