@@ -986,6 +986,13 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 			region  = heap->region;
 			entries = region != 0 ? static_cast<uint32_t>(heap->records.size()) : 0u;
 		}
+		// KYTY_BINDLESS_SAMPLER_SLOTS_OFF=1 (live, research): patch an empty range, so every key
+		// selects slot 0 (the default sampler) while the rest of the bindless sampler path stays.
+		static auto& slots_off = Common::LiveSwitches::Get("KYTY_BINDLESS_SAMPLER_SLOTS_OFF", 0);
+		if (slots_off.load(std::memory_order_relaxed) != 0) {
+			region  = 0;
+			entries = 0;
+		}
 		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
 	}
 }
