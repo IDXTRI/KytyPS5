@@ -2100,9 +2100,11 @@ void TextureCache::RunGarbageCollector() {
 	m_gc_headroom =
 	    static_cast<uint64_t>(std::max<int64_t>(0, headroom.load(std::memory_order_relaxed)))
 	    << 20u;
+	ReportGcStats(clock);
 	if (GcUsedMemory() < m_trigger_gc_memory) {
 		return;
 	}
+	m_gc_stats.runs++;
 	if (m_gc_budget_frame != clock) {
 		m_gc_budget_frame       = clock;
 		m_gc_freed_bytes_frame  = 0;
@@ -2145,6 +2147,9 @@ void TextureCache::RunGarbageCollector() {
 			candidates.push_back(id);
 			return candidates.size() >= visit_limit || candidates.size() >= 4096;
 		});
+		if (pressured || aggressive) {
+			m_gc_stats.pressured++;
+		}
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -2152,11 +2157,15 @@ void TextureCache::RunGarbageCollector() {
 			if (!(pressured || aggressive)) {
 				--deletions;
 			}
+			m_gc_stats.visited++;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				m_gc_stats.gone_or_depth++;
 				continue;
 			}
 			if (owner->bindless_pinned) {
+				m_gc_stats.pinned++;
+				m_gc_stats.pinned_bytes += owner->AccountedSize();
 				continue;
 			}
 			if (owner->IsGpuModified()) {
@@ -2166,12 +2175,17 @@ void TextureCache::RunGarbageCollector() {
 				    (!(pressured || aggressive) ||
 				     (m_gc_written_back_bytes_frame != 0 &&
 				      m_gc_written_back_bytes_frame + owner->info.data.size > WriteBackPerFrame))) {
+					m_gc_stats.gpu_kept++;
+					m_gc_stats.gpu_kept_bytes += owner->AccountedSize();
 					continue;
 				}
 				if (safe && !pressured) {
+					m_gc_stats.gpu_kept++;
+					m_gc_stats.gpu_kept_bytes += owner->AccountedSize();
 					continue;
 				}
 				if (safe && !DownloadImageMemory(id)) {
+					m_gc_stats.download_failed++;
 					continue;
 				}
 				if (safe && owner->info.IsTiled()) {
@@ -2180,6 +2194,8 @@ void TextureCache::RunGarbageCollector() {
 			}
 			const auto freed = owner->AccountedSize();
 			FreeImage(id);
+			m_gc_stats.freed++;
+			m_gc_stats.freed_bytes += freed;
 			if (pressured || aggressive) {
 				--deletions;
 				m_gc_freed_images_frame++;
@@ -2202,6 +2218,65 @@ void TextureCache::RunGarbageCollector() {
 	if (GcUsedMemory() >= m_critical_gc_memory) {
 		collect(true);
 	}
+}
+
+// KYTY_IMAGE_GC_STATS=1 (live): every 5 s, what the image collector visited, why it kept each
+// candidate, and how many bytes bindless-pinned images hold (pinned images are never collected).
+void TextureCache::ReportGcStats(uint64_t clock) {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_IMAGE_GC_STATS", 0);
+	if (enabled.load(std::memory_order_relaxed) == 0) {
+		m_gc_stats = {};
+		return;
+	}
+	const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	if (m_gc_stats_report_us == 0) {
+		m_gc_stats_report_us = static_cast<uint64_t>(now_us);
+		return;
+	}
+	if (static_cast<uint64_t>(now_us) - m_gc_stats_report_us < 5'000'000) {
+		return;
+	}
+	m_gc_stats_report_us = static_cast<uint64_t>(now_us);
+	uint64_t images = 0;
+	uint64_t pinned = 0;
+	uint64_t pinned_bytes = 0;
+	uint64_t pinned_old_bytes = 0;
+	uint64_t old_bytes = 0;
+	m_lru_cache.ForEachItemBelow(UINT64_MAX, [&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			return;
+		}
+		images++;
+		const auto size = image->AccountedSize();
+		const bool old  = m_lru_cache.TickOf(image->lru_id) + 16 <= clock;
+		old_bytes += old ? size : 0;
+		if (image->bindless_pinned) {
+			pinned++;
+			pinned_bytes += size;
+			pinned_old_bytes += old ? size : 0;
+		}
+	});
+	constexpr double MiB = 1024.0 * 1024.0;
+	const auto&      st  = m_gc_stats;
+	::printf("ImageGC (5 s): runs %" PRIu64 " (pressured %" PRIu64 "), visited %" PRIu64
+	         ", gone/depth %" PRIu64 ", pinned %" PRIu64 " (%.0f MiB), gpu kept %" PRIu64
+	         " (%.0f MiB), download failed %" PRIu64 ", freed %" PRIu64 " (%.0f MiB)
+",
+	         st.runs, st.pressured, st.visited, st.gone_or_depth, st.pinned,
+	         static_cast<double>(st.pinned_bytes) / MiB, st.gpu_kept,
+	         static_cast<double>(st.gpu_kept_bytes) / MiB, st.download_failed, st.freed,
+	         static_cast<double>(st.freed_bytes) / MiB);
+	::printf("ImageGC now: %" PRIu64 " images %.0f MiB (unused 16+ frames %.0f MiB), pinned %" PRIu64
+	         " %.0f MiB (unused 16+ frames %.0f MiB)
+",
+	         images, static_cast<double>(m_total_used_memory) / MiB,
+	         static_cast<double>(old_bytes) / MiB, pinned, static_cast<double>(pinned_bytes) / MiB,
+	         static_cast<double>(pinned_old_bytes) / MiB);
+	std::fflush(stdout);
+	m_gc_stats = {};
 }
 
 void TextureCache::ProcessDownloadImages() {

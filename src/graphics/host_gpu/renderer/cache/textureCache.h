@@ -200,6 +200,23 @@ private:
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// KYTY_IMAGE_GC_STATS: what the collector visited and why it kept each candidate.
+	struct GcStats {
+		uint64_t runs          = 0;
+		uint64_t pressured     = 0;
+		uint64_t visited       = 0;
+		uint64_t gone_or_depth = 0;
+		uint64_t pinned        = 0;
+		uint64_t pinned_bytes  = 0;
+		uint64_t gpu_kept      = 0;
+		uint64_t gpu_kept_bytes = 0;
+		uint64_t download_failed = 0;
+		uint64_t freed         = 0;
+		uint64_t freed_bytes   = 0;
+	};
+	GcStats  m_gc_stats {};
+	uint64_t m_gc_stats_report_us = 0;
+	void     ReportGcStats(uint64_t clock);
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
