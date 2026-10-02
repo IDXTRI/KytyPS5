@@ -284,6 +284,11 @@ bool AsyncWriteReadbackEnabled() {
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
+bool AsyncReadReadbackEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READBACK", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
 // A guest fault on GPU-written memory downloads an aligned window around the faulting bytes, so
 // nearby accesses share one GPU drain. KYTY_READBACK_WINDOW_KB (a live switch; a power of two,
 // at least the tracker page) changes its width for A/B measurements. The default, 2 MiB, measured
@@ -623,12 +628,19 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// download and submits it; the faulting guest thread waits for that submission, and a second
 	// command lifts the window's GPU ownership, or resolves the fault synchronously if the GPU
 	// wrote there again in the meantime.
-	if (is_write && !GuestGpu::IsGpuThread() && AsyncWriteReadbackEnabled()) {
+	// KYTY_ASYNC_READBACK=1 (live, default 0) does the same for guest reads. Wolverine run 36
+	// (KYTY_READBACK_STATS): every readback at the spot came from a guest thread, and serving
+	// them synchronously cost the GPU thread ~1.3 s per 5 s, mostly waiting for the GPU.
+	if (!GuestGpu::IsGpuThread() &&
+	    (is_write ? AsyncWriteReadbackEnabled() : AsyncReadReadbackEnabled())) {
 		uint64_t tick         = 0;
 		uint64_t window_begin = 0;
 		uint64_t window_end   = 0;
-		gpu.SendCommandSync(
-		    [&] { tick = BeginWriteReadback(vaddr, size, window_begin, window_end); });
+		gpu.SendCommandSync([&] {
+			ReadbackStats::s_forwarded = true;
+			tick = BeginWriteReadback(vaddr, size, is_write, window_begin, window_end);
+			ReadbackStats::s_forwarded = false;
+		});
 		if (tick != 0) {
 			{
 				KYTY_PROFILER_BLOCK("BufferCache::WaitWriteReadback");
@@ -637,8 +649,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
 			}
-			gpu.SendCommandSync(
-			    [&] { FinishWriteReadback(vaddr, size, window_begin, window_end, tick); });
+			gpu.SendCommandSync([&] {
+				FinishWriteReadback(vaddr, size, is_write, window_begin, window_end, tick);
+			});
 		}
 		return;
 	}
@@ -901,10 +914,15 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 }
 
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
-uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t& window_begin,
-                                         uint64_t& window_end) {
+uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
+                                         uint64_t& window_begin, uint64_t& window_end) {
 	KYTY_PROFILER_FUNCTION();
-	ReadbackStats::Scope stats(vaddr, true);
+	if (!is_write && !IsRegionRegistered(vaddr, size)) {
+		// A read of an unregistered region: the synchronous path finds its buffer.
+		ReadMemoryOnGpu(vaddr, size, false);
+		return 0;
+	}
+	ReadbackStats::Scope stats(vaddr, is_write);
 	if (!IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -925,7 +943,9 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
 		stats.SetOutcome(ReadbackStats::Unmarked);
 		return 0;
 	}
@@ -935,9 +955,17 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (!is_write && OverlapsPendingWriteReadback(window_begin, window_end)) {
+		// The page itself is not pending (checked above), but the window shares bytes with a
+		// landing readback: keep reads on the synchronous path there.
+		ReadMemoryOnGpu(vaddr, size, false);
+		return 0;
+	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
 		return 0;
 	}
 	stats.SetOutcome(ReadbackStats::Downloaded);
@@ -948,8 +976,8 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t
 }
 
 // GPU thread, after the guest waited for the readback's tick and its publication.
-void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin,
-                                      uint64_t window_end, uint64_t tick) {
+void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
+                                      uint64_t window_begin, uint64_t window_end, uint64_t tick) {
 	KYTY_PROFILER_FUNCTION();
 	for (size_t i = 0; i < m_pending_write_readbacks.size(); i++) {
 		const auto& pending = m_pending_write_readbacks[i];
@@ -966,10 +994,12 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, uint64_t wi
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
 		// The GPU wrote the window again while the download was landing, or another readback
 		// still covers the page: resolve this fault the synchronous way.
-		ReadMemoryOnGpu(vaddr, size, true);
+		ReadMemoryOnGpu(vaddr, size, is_write);
 		return;
 	}
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
 }
 
 // GPU thread: waits for a pending readback's publication and, unless the GPU wrote its window

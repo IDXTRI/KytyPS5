@@ -183,10 +183,12 @@ private:
 		uint64_t end   = 0;
 		uint64_t tick  = 0;
 	};
-	[[nodiscard]] uint64_t BeginWriteReadback(uint64_t vaddr, uint64_t size, uint64_t& window_begin,
-	                                          uint64_t& window_end);
-	void                   FinishWriteReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin,
-	                                           uint64_t window_end, uint64_t tick);
+	// The asynchronous readback of a guest thread's fault (KYTY_ASYNC_WRITE_READBACK for writes,
+	// KYTY_ASYNC_READBACK for reads).
+	[[nodiscard]] uint64_t BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
+	                                          uint64_t& window_begin, uint64_t& window_end);
+	void FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write, uint64_t window_begin,
+	                         uint64_t window_end, uint64_t tick);
 	void                   CompletePendingWriteReadback(size_t index);
 	void                   CompletePendingWriteReadbacks(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool     OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const;
