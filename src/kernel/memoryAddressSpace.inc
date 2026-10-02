@@ -1127,7 +1127,13 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
-		const auto         process           = GetCurrentProcess();
+		// Other threads (the profiler, networking) allocate while this scan runs, and one of their
+		// allocations can land in a range VirtualQuery has just reported free (2026-10-02: five
+		// of ~20 launches failed so). Such a range is queried again: the newcomer then shows up
+		// as occupied and is skipped like any other.
+		constexpr int MaxReserveRetries = 64;
+		int           reserve_retries   = 0;
+		const auto    process           = GetCurrentProcess();
 		for (const auto& [guest_start, guest_end]: regions) {
 			auto next_addr = guest_start;
 			while (next_addr < guest_end) {
@@ -1149,6 +1155,9 @@ private:
 					    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 					    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 					if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+						if (ptr == nullptr && ++reserve_retries <= MaxReserveRetries) {
+							continue; // query next_addr again
+						}
 						EXIT("failed to reserve guest address space at 0x%016" PRIx64
 						     ", size 0x%016" PRIx64 "\n",
 						     reserve_start, reserve_end - reserve_start);
