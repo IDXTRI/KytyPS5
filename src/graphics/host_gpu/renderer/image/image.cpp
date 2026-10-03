@@ -763,6 +763,10 @@ Image::~Image() {
 		}
 	}
 	if (backing.image != nullptr) {
+		if (m_graphics.address_binding_report_enabled) {
+			AddressBindingAnnotate(reinterpret_cast<uint64_t>(static_cast<VkImage>(backing.image)),
+			                       "Image object destroyed");
+		}
 		m_graphics.DeleteImage(backing);
 	}
 }

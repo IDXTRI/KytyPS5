@@ -1728,8 +1728,64 @@ void BufferCache::VerifyBdaPageTable() {
 	m_bda_verify_tick = m_scheduler.CurrentTick();
 }
 
+// KYTY_BUFFER_AUDIT=1 (live, research, PLAN.md P1.3): every 10 s, what the buffer cache holds —
+// count and size histogram, and the largest buffers with their guest range, frames since use
+// and whether textures live in the same memory — to find buffer memory worth collecting.
+void BufferCache::AuditBuffers() {
+	static auto& audit = Common::LiveSwitches::Get("KYTY_BUFFER_AUDIT", 0);
+	static auto  last  = std::chrono::steady_clock::now();
+	const auto   now   = std::chrono::steady_clock::now();
+	if (audit.load(std::memory_order_relaxed) == 0 || now - last < std::chrono::seconds(10)) {
+		return;
+	}
+	last = now;
+	constexpr std::array<uint64_t, 6> Limits {1u << 20u, 4u << 20u, 16u << 20u, 64u << 20u,
+	                                          256u << 20u, UINT64_MAX};
+	std::array<uint64_t, Limits.size()> counts {};
+	std::array<uint64_t, Limits.size()> bytes {};
+	std::vector<BufferId>               ids;
+	uint64_t                            total = 0;
+	for (const auto& [address, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		const auto  size   = buffer.Size();
+		const auto  bucket = static_cast<size_t>(
+		    std::ranges::find_if(Limits, [&](uint64_t limit) { return size < limit; }) -
+		    Limits.begin());
+		counts[bucket]++;
+		bytes[bucket] += size;
+		total += size;
+		ids.push_back(id);
+	}
+	static constexpr const char* Names[] = {"<1M", "<4M", "<16M", "<64M", "<256M", ">=256M"};
+	std::printf("Buffer audit: %zu buffers, %.2f GiB:", ids.size(),
+	            static_cast<double>(total) / (1u << 30u));
+	for (size_t i = 0; i < Limits.size(); i++) {
+		std::printf(" %s %" PRIu64 " (%.0f MiB)", Names[i], counts[i],
+		            static_cast<double>(bytes[i]) / (1u << 20u));
+	}
+	std::printf("\n");
+	std::ranges::sort(ids, [&](BufferId a, BufferId b) {
+		return m_slot_buffers[a].Size() > m_slot_buffers[b].Size();
+	});
+	const auto clock = LruClock();
+	for (size_t i = 0; i < std::min<size_t>(ids.size(), 12); i++) {
+		const auto& buffer = m_slot_buffers[ids[i]];
+		const auto  idle   = clock - std::min(clock, m_lru_cache.TickOf(buffer.lru_id));
+		std::printf("  0x%011" PRIx64 " %7.1f MiB idle %4" PRIu64 " frames%s%s\n", buffer.CpuAddress(),
+		            static_cast<double>(buffer.Size()) / (1u << 20u), idle,
+		            m_texture_cache.HasImagesInRegion(buffer.CpuAddress(), buffer.Size())
+		                ? " shares memory with textures"
+		                : "",
+		            m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())
+		                ? " GPU-written"
+		                : "");
+	}
+	std::fflush(stdout);
+}
+
 void BufferCache::RunGarbageCollector() {
 	VerifyBdaPageTable();
+	AuditBuffers();
 	m_gc_tick++;
 	const auto clock = LruClock();
 	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images

@@ -222,6 +222,7 @@ private:
 		uint64_t          pages           = 0;
 	};
 	void VerifyBdaPageTable();
+	void AuditBuffers();
 	// Writes the BDA entries of `pages` pages from packed page `first_page`: consecutive
 	// addresses from `first_address`, or zeros (0), allocating and releasing chunks.
 	void WriteBdaEntries(uint64_t first_page, uint64_t pages, vk::DeviceAddress first_address);

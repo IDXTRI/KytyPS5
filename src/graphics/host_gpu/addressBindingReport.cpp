@@ -32,7 +32,7 @@ struct ObjectInfo {
 };
 
 constexpr size_t ReleasedHistory = 65536;
-constexpr size_t EventsPerObject = 8;
+constexpr size_t EventsPerObject = 16;
 constexpr size_t ObjectHistory   = 65536;
 
 std::mutex                                g_mutex;
@@ -159,8 +159,15 @@ void AddressBindingNote(uint32_t object_type, uint64_t handle, uint64_t base, ui
 void AddressBindingDescribeObject(uint64_t handle, std::string description) {
 	std::scoped_lock lock {g_mutex};
 	auto&            object = Object(handle);
-	object.description      = std::move(description);
-	object.events.clear();
+	// A recycled Vulkan image keeps its history across owners (the image pool hands the same
+	// handle to a new Image): clearing it hid which owner released it.
+	if (!object.description.empty() && object.description != description) {
+		object.events.emplace_back("(previous owner: " + object.description + ")");
+		if (object.events.size() > EventsPerObject) {
+			object.events.pop_front();
+		}
+	}
+	object.description = std::move(description);
 }
 
 void AddressBindingAnnotate(uint64_t handle, const char* event) {

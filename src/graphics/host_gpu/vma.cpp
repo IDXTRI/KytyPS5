@@ -18,6 +18,7 @@
 #include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -54,7 +55,7 @@ bool GraphicContext::CreateAllocator() {
 	// texture and buffer churn, 256 MiB blocks held 5.7 GiB of allocations in 8.8 GiB of blocks
 	// while the device was over its budget (run 95: Windows paged 2-4 GB to system memory).
 	// 64 MiB: 0.45-0.7 GiB trapped (run 96), old spot 7 -> 15-16 fps.
-	uint64_t block_megabytes = 64;
+	uint64_t block_megabytes = 256; // 64 once the deleted-image read (PLAN P3) is fixed
 	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
 		block_megabytes = std::strtoull(value, nullptr, 10);
 	}
@@ -222,6 +223,10 @@ void GraphicContext::TrimImagePool(uint64_t cap_bytes, bool all) {
 	                 now - m_image_pool[keep_from].parked > MaxAge) &&
 	                now - m_image_pool[keep_from].parked >= quarantine))) {
 		auto& entry = m_image_pool[keep_from];
+		if (address_binding_report_enabled) {
+			AddressBindingAnnotate(reinterpret_cast<uint64_t>(static_cast<VkImage>(entry.image)),
+			                       "destroyed by the pool trim");
+		}
 		vmaDestroyImage(allocator, entry.image, entry.allocation);
 		m_image_pool_bytes -= entry.bytes;
 		keep_from++;
@@ -236,6 +241,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	auto             result       = vk::Result::eErrorUnknown;
+	bool             from_pool    = false;
 	if (image_info.pNext == nullptr && image_info.initialLayout == vk::ImageLayout::eUndefined &&
 	    ImageRecycleMegabytes() > 0) {
 		const auto       key = PoolKey(image_info);
@@ -245,9 +251,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			if (it->key == key) {
 				native_image     = it->image;
 				image.allocation = it->allocation;
+				if (address_binding_report_enabled) {
+					AddressBindingAnnotate(reinterpret_cast<uint64_t>(native_image),
+					                       "taken from the image pool");
+				}
 				m_image_pool_bytes -= it->bytes;
 				m_image_pool.erase(std::next(it).base());
-				result = vk::Result::eSuccess;
+				result    = vk::Result::eSuccess;
+				from_pool = true;
 				break;
 			}
 		}
@@ -314,6 +325,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		LogMemoryBudget();
 		return false;
 	}
+	if (!from_pool && address_binding_report_enabled) {
+		AddressBindingAnnotate(reinterpret_cast<uint64_t>(native_image), "created");
+	}
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -364,11 +378,19 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 			std::scoped_lock lock(m_image_pool_mutex);
 			m_image_pool.push_back({PoolKey(info), image.image, image.allocation, allocation.size,
 			                        std::chrono::steady_clock::now()});
+			if (address_binding_report_enabled) {
+				AddressBindingAnnotate(reinterpret_cast<uint64_t>(static_cast<VkImage>(image.image)),
+				                       reusable ? "parked in the image pool" : "held (quarantine)");
+			}
 			m_image_pool_bytes += allocation.size;
 		}
 		image.image      = nullptr;
 		image.allocation = nullptr;
 	} else {
+		if (address_binding_report_enabled) {
+			AddressBindingAnnotate(reinterpret_cast<uint64_t>(static_cast<VkImage>(image.image)),
+			                       "destroyed directly");
+		}
 		vmaDestroyImage(allocator, image.image, image.allocation);
 		image.image      = nullptr;
 		image.allocation = nullptr;
