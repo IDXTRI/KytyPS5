@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -1563,7 +1564,92 @@ uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
+// KYTY_BDA_VERIFY=N (live, seconds, 0 = off, research): every N seconds the GPU's BDA page table
+// entries of all live buffers are copied to host memory and compared with the addresses
+// ChangeRegister wrote. Wolverine run 88 lost the device reading a buffer page through the
+// address of a buffer destroyed 316 s earlier, while the host's view of the table named the
+// live buffer that replaced it: this tells a GPU table out of step from a stale reference
+// elsewhere. Mismatches print the guest page, both addresses and what owned the stale one.
+void BufferCache::VerifyBdaPageTable() {
+	static auto& interval = Common::LiveSwitches::Get("KYTY_BDA_VERIFY", 0);
+	if (m_bda_verify_tick != 0) {
+		if (!m_scheduler.IsFree(m_bda_verify_tick)) {
+			return;
+		}
+		auto& download = *m_bda_verify_download;
+		if (!download.IsCoherent()) {
+			download.Invalidate(0, download.Size());
+		}
+		const auto* data       = download.Mapped().data();
+		uint64_t    pages      = 0;
+		uint64_t    mismatches = 0;
+		for (const auto& run: m_bda_verify_runs) {
+			for (uint64_t i = 0; i < run.pages; i++) {
+				vk::DeviceAddress actual = 0;
+				std::memcpy(&actual, data + run.download_offset + i * sizeof(actual), sizeof(actual));
+				const auto expected = run.first_address + (i << CACHING_PAGEBITS);
+				pages++;
+				if (actual == expected) {
+					continue;
+				}
+				if (mismatches++ < 16) {
+					std::printf("BDA verify: guest page 0x%" PRIx64 " GPU table 0x%" PRIx64
+					            " expected 0x%" PRIx64 "\n",
+					            run.guest_address + (i << CACHING_PAGEBITS), actual, expected);
+					if (actual != 0) {
+						AddressBindingDescribe(actual);
+					}
+				}
+			}
+		}
+		std::printf("BDA verify: %" PRIu64 " pages of %zu buffers, %" PRIu64 " mismatches\n", pages,
+		            m_bda_verify_runs.size(), mismatches);
+		std::fflush(stdout);
+		m_bda_verify_tick = 0;
+		m_bda_verify_last = std::chrono::steady_clock::now();
+		return;
+	}
+	const auto seconds = interval.load(std::memory_order_relaxed);
+	if (seconds <= 0 ||
+	    std::chrono::steady_clock::now() - m_bda_verify_last < std::chrono::seconds(seconds)) {
+		return;
+	}
+	m_bda_verify_runs.clear();
+	uint64_t bytes = 0;
+	for (const auto& [address, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		PageTable::PageRange range {};
+		if (!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), range)) {
+			continue;
+		}
+		const auto pages = static_cast<uint64_t>(range.last_exclusive - range.first);
+		m_bda_verify_runs.push_back({
+		    .guest_address   = PageIndex(buffer.CpuAddress()) << CACHING_PAGEBITS,
+		    .table_offset    = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress),
+		    .download_offset = bytes,
+		    .first_address   = buffer.BufferDeviceAddress(),
+		    .pages           = pages,
+		});
+		bytes += pages * sizeof(vk::DeviceAddress);
+	}
+	if (bytes == 0) {
+		return;
+	}
+	if (m_bda_verify_download == nullptr || m_bda_verify_download->Size() < bytes) {
+		m_bda_verify_download = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eTransferDst, bytes * 2);
+	}
+	for (const auto& run: m_bda_verify_runs) {
+		m_bda_verify_download->CopyFrom(m_scheduler.Current(), m_bda_pagetable_buffer,
+		                                run.table_offset, run.download_offset,
+		                                run.pages * sizeof(vk::DeviceAddress));
+	}
+	m_bda_verify_tick = m_scheduler.CurrentTick();
+}
+
 void BufferCache::RunGarbageCollector() {
+	VerifyBdaPageTable();
 	m_gc_tick++;
 	const auto clock = LruClock();
 	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images

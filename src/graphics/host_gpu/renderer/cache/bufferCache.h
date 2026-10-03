@@ -11,7 +11,9 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <chrono>
 #include <map>
+#include <memory>
 #include <shared_mutex>
 #include <span>
 #include <utility>
@@ -200,9 +202,23 @@ private:
 	void                   CompletePendingWriteReadbacks(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool     OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const;
 
+	// KYTY_BDA_VERIFY (research): compares the GPU's BDA page table with the host's expectation.
+	struct BdaVerifyRun {
+		uint64_t          guest_address   = 0;
+		uint64_t          table_offset    = 0;
+		uint64_t          download_offset = 0;
+		vk::DeviceAddress first_address   = 0;
+		uint64_t          pages           = 0;
+	};
+	void VerifyBdaPageTable();
+
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
+	std::unique_ptr<Buffer>                            m_bda_verify_download;
+	std::vector<BdaVerifyRun>                          m_bda_verify_runs;
+	uint64_t                                           m_bda_verify_tick = 0;
+	std::chrono::steady_clock::time_point              m_bda_verify_last {};
 	Buffer                                             m_gds_buffer;
 	Buffer                                             m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
