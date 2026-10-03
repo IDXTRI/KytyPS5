@@ -684,7 +684,27 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t index = static_cast<uint32_t>(program.info.samplers.size());
 	     index < sampler_plan.sampler_count; index++) {
-		snapshot.samplers.push_back(snapshot.samplers[sampler_plan.bindings[index].source]);
+		const auto source = sampler_plan.bindings[index].source;
+		snapshot.samplers.push_back(snapshot.samplers[source]);
+		if (source >= specialization.samplers.size() || !specialization.samplers[source].bindless) {
+			continue;
+		}
+		// A bindless sampler's copy for another image class (point filtering, integer border)
+		// gets its own mapping words and heap use, so the host mirrors the heap with that class's
+		// flags. Sharing the float copy left integer and converted images linearly filtered
+		// (undefined in Vulkan; Wolverine's tree bark sampled white).
+		const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+		specialization.samplers.resize(index + 1u);
+		specialization.samplers[index] = {.bindless = true, .bindless_mapping_offset = mapping_offset};
+		const auto heap = std::ranges::find(snapshot.bindless_sampler_heaps, source,
+		                                    &BindlessSamplerHeapUse::sampler);
+		if (heap != snapshot.bindless_sampler_heaps.end()) {
+			auto use           = *heap;
+			use.sampler        = index;
+			use.mapping_offset = mapping_offset;
+			snapshot.bindless_sampler_heaps.push_back(use);
+		}
 	}
 	ImageRemap(specialization).Apply(snapshot.images);
 	return true;
@@ -710,12 +730,6 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		bool       first   = true;
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
-			// A bindless sampler is one slot of the host's table for all of its uses: its other
-			// classes share the first one's binding rather than adding copies.
-			if (!first && base.samplers[index].bindless) {
-				mapping[type] = index;
-				continue;
-			}
 			const auto target = first ? index : plan.sampler_count++;
 			if (target >= ShaderInfo::MaxSamplers) return false;
 			mapping[type]         = target;
@@ -1689,7 +1703,13 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			samplers.push_back(program.info.samplers[binding.source]);
+			// From the specialized source: a bindless copy without its own mapping words keeps
+			// the source's.
+			samplers.push_back(samplers[binding.source]);
+			if (index < specialization.samplers.size() && specialization.samplers[index].bindless) {
+				samplers[index].bindless                = specialization.samplers[index].bindless;
+				samplers[index].bindless_mapping_offset = specialization.samplers[index].bindless_mapping_offset;
+			}
 		}
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
