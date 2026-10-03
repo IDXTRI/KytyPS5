@@ -167,6 +167,9 @@ private:
 	std::array<std::deque<std::pair<uint64_t, uint32_t>>, ImageArrays> m_free_slots;
 	// What each slot's descriptor holds now (WriteSlot), for device-loss triage.
 	std::array<std::vector<vk::ImageView>, ImageArrays> m_slot_views;
+	// The image each slot's view belonged to when it was written: a view handle the driver
+	// reuses for another image after the first is destroyed would otherwise hide the slot.
+	std::array<std::vector<uint64_t>, ImageArrays> m_slot_view_images;
 	std::array<VulkanImage, Placeholders>   m_placeholders;
 	std::array<vk::ImageView, Placeholders> m_placeholder_views {};
 	vk::DescriptorPool      m_pool   = nullptr;

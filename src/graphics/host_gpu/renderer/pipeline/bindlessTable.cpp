@@ -533,14 +533,18 @@ void BindlessTable::ReportImageUsers(uint64_t image) {
 	auto& table = *g_reported_table;
 	int   found = 0;
 	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
-		const auto& views = table.m_slot_views[binding];
+		const auto& views  = table.m_slot_views[binding];
+		const auto& images = table.m_slot_view_images[binding];
 		for (uint32_t slot = 0; slot < views.size(); slot++) {
 			const auto view = reinterpret_cast<uint64_t>(static_cast<VkImageView>(views[slot]));
-			if (view == 0 || AddressBindingImageOfView(view) != image) {
+			const bool now  = view != 0 && AddressBindingImageOfView(view) == image;
+			const bool when_written = slot < images.size() && images[slot] == image;
+			if (!now && !when_written) {
 				continue;
 			}
 			found++;
-			std::printf("      bindless slot %u/%u still holds a view of it", binding, slot);
+			std::printf("      bindless slot %u/%u still holds a view of it%s", binding, slot,
+			            now ? "" : " (its view handle now names another image)");
 			for (auto& heap: table.m_heaps) {
 				if (heap.binding != binding) {
 					continue;
@@ -572,6 +576,20 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 			views.resize(slot + 1);
 		}
 		views[slot] = view;
+		if (m_graphics.address_binding_report_enabled) {
+			auto& images = m_slot_view_images[binding];
+			if (images.size() <= slot) {
+				images.resize(slot + 1);
+			}
+			if (images[slot] != 0) {
+				AddressBindingAnnotate(images[slot], "bindless slot overwritten");
+			}
+			images[slot] = AddressBindingImageOfView(
+			    reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
+			if (images[slot] != 0) {
+				AddressBindingAnnotate(images[slot], "bindless slot written");
+			}
+		}
 	}
 	const vk::DescriptorImageInfo info {nullptr, view, layout};
 	vk::WriteDescriptorSet        write {};
