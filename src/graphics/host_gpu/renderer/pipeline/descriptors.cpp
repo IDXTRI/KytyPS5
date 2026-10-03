@@ -33,6 +33,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <unordered_map>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
@@ -1259,6 +1262,44 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		// A deleted image (unregistered, its slot erased once the GPU passes the deletion tick) must
+		// not be bound: a later command buffer would read it after its memory is gone.
+		if (!image.registered && !image.info.data.Empty()) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 32) {
+				std::printf("Binding a deleted image: shader 0x%016llx img%u guest 0x%" PRIx64
+				            " %ux%u layers %u image %p\n",
+				            static_cast<unsigned long long>(program.shader_hash), i,
+				            image.info.data.address, image.info.extent.width,
+				            image.info.extent.height, image.info.resources.layers,
+				            static_cast<void*>(static_cast<VkImage>(image.backing.image)));
+				std::fflush(stdout);
+			}
+		}
+		// KYTY_TRACE_PS=<hash> (environment, research): prints each change of the images a
+		// program binds (guest range, size, Vulkan image, registered), to follow a read of a
+		// freed image back to the binding that handed it out (Wolverine device losts, run 92).
+		static const uint64_t trace_hash = [] {
+			const char* value = std::getenv("KYTY_TRACE_PS");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		if (trace_hash != 0 && program.shader_hash == trace_hash) {
+			static std::unordered_map<uint64_t, VkImage> last;
+			const auto vk_image = static_cast<VkImage>(image.backing.image);
+			auto&      previous = last[(static_cast<uint64_t>(i) << 56u) ^ program.shader_hash];
+			if (previous != vk_image) {
+				previous = vk_image;
+				std::printf("Trace PS 0x%016llx img%u: guest 0x%" PRIx64 " size 0x%" PRIx64
+				            " %ux%ux%u layers %u fmt %u image %p registered %d tick %" PRIu64 "\n",
+				            static_cast<unsigned long long>(program.shader_hash), i,
+				            image.info.data.address, image.info.data.size, image.info.extent.width,
+				            image.info.extent.height, image.info.extent.depth, image.info.resources.layers,
+				            static_cast<uint32_t>(image.info.pixel_format),
+				            static_cast<void*>(vk_image), image.registered ? 1 : 0,
+				            m_context.GetCommandScheduler().CurrentTick());
+				std::fflush(stdout);
+			}
+		}
 	}
 }
 
