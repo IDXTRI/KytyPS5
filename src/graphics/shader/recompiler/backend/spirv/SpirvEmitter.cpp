@@ -424,6 +424,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 		}
 	}
+	// Loop watchdog reports store the lane (EmitLoopWatchdog); after the upstream merge such
+	// a program may have no other lane use (CS 0x1ca15ea9516b599e exited at boot).
+	requirements.subgroup_local_invocation_id |= program.info.watchdog_reports;
 	if (requirements.function_lds && !function_lds_unbounded &&
 	    function_lds_bytes < 8192u * sizeof(uint32_t)) {
 		requirements.function_lds_dwords =
