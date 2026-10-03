@@ -1487,9 +1487,16 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
+	// Device-loss triage: the checkpoint names the pixel shader (declared hash) in arg4; the first
+	// instance moves to arg1. Wolverine's stale texture reads (runs 88-90) all came from instanced
+	// DrawIndexAuto 1024/1280 draws.
+	const uint64_t ps_hash =
+	    m_context.GetGraphics().diagnostic_checkpoints_enabled && sh_ctx.GetPs().ps_regs.data_addr != 0
+	        ? ShaderDeclaredHash(sh_ctx.GetPs().ps_regs.data_addr)
+	        : 0;
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
-	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
-	                    args.first_instance);
+	                    args.vertex_count, args.first_instance, args.first_vertex,
+	                    args.instance_count, ps_hash);
 
 	Common::LockGuard lock = m_context.LockMutexProfiled();
 	if (args.vertex_count == 0 || args.instance_count == 0) {
