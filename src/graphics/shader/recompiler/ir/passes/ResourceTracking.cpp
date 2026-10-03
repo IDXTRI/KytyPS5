@@ -2423,6 +2423,23 @@ private:
 		if (!m_program.bindless_images || !enabled) {
 			return;
 		}
+		// KYTY_BINDLESS_SAMPLERS_HASH_BITS=k / _HASH_VALUE=v (environment, research): only programs
+		// whose hash has v in its low k bits get bindless samplers (bisection for the shaders that
+		// break Wolverine's trees).
+		static const uint64_t hash_bits = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_HASH_BITS");
+			return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+		}();
+		static const uint64_t hash_value = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_HASH_VALUE");
+			return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+		}();
+		if (hash_bits > 0 && hash_bits < 64) {
+			const uint64_t mask = (uint64_t {1} << hash_bits) - 1u;
+			if ((m_program.shader_hash & mask) != (hash_value & mask)) {
+				return;
+			}
+		}
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
