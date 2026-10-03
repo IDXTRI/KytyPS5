@@ -1387,8 +1387,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (reported.insert(reader_hash ^ (writer_hash << 1u) ^ reinterpret_cast<uintptr_t>(what))
 		        .second) {
 			LOGF("Warning: scalar resource reads overlap %s: reader 0x%016" PRIx64 " reads 0x%" PRIx64
-			     "+0x%" PRIx64 ", writer 0x%016" PRIx64 " writes 0x%" PRIx64 "+0x%" PRIx64 "
-",
+			     "+0x%" PRIx64 ", writer 0x%016" PRIx64 " writes 0x%" PRIx64 "+0x%" PRIx64 "\n",
 			     what, reader_hash, address, size, writer_hash, written_address, written_size);
 		}
 	};

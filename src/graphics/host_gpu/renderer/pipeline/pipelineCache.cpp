@@ -604,7 +604,6 @@ struct PipelineCache::ProgramCache {
 		ShaderReadChunks::ReadLog                    log;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<std::pair<uint64_t, uint64_t>>   specialization_reads;
 		uint64_t                                     last_use = 0;
 	};
 	struct SourceEntry {
@@ -641,9 +640,6 @@ struct PipelineCache::ProgramCache {
 			    ReadsUnchanged(slot.log, reads)) {
 				entry.resources      = slot.resources;
 				entry.specialization = slot.specialization;
-				if (entry.resource_plan.capture_specialization_reads) {
-					entry.resource_plan.specialization_reads = slot.specialization_reads;
-				}
 				slot.last_use = memo_clock;
 				memo_hits++;
 				ReportMemo();
@@ -670,10 +666,6 @@ struct PipelineCache::ProgramCache {
 			slot->log            = std::move(log);
 			slot->resources      = entry.resources;
 			slot->specialization = entry.specialization;
-			slot->specialization_reads.clear();
-			if (entry.resource_plan.capture_specialization_reads) {
-				slot->specialization_reads = entry.resource_plan.specialization_reads;
-			}
 			slot->last_use = memo_clock;
 		}
 		ReportMemo();

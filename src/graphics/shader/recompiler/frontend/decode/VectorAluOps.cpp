@@ -213,8 +213,6 @@ struct VopcOpcodeInfo {
 };
 
 constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
-    {0x22u, Opcode::V_CMP_EQ_F64, false},  {0x23u, Opcode::V_CMP_LE_F64, false},
-    {0x33u, Opcode::V_CMPX_LE_F64, false}, {0x36u, Opcode::V_CMPX_GE_F64, false},
     {0x00u, Opcode::V_CMP_F_F32},          {0x01u, Opcode::V_CMP_LT_F32},
     {0x02u, Opcode::V_CMP_EQ_F32},         {0x03u, Opcode::V_CMP_LE_F32},
     {0x04u, Opcode::V_CMP_GT_F32},         {0x05u, Opcode::V_CMP_LG_F32},
@@ -836,10 +834,6 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 
 bool IsVopcFloatCompareOpcode(Opcode opcode) {
 	switch (opcode) {
-		case Opcode::V_CMP_EQ_F64:
-		case Opcode::V_CMP_LE_F64:
-		case Opcode::V_CMPX_LE_F64:
-		case Opcode::V_CMPX_GE_F64:
 		case Opcode::V_CMP_F_F32:
 		case Opcode::V_CMP_LT_F32:
 		case Opcode::V_CMP_EQ_F32:
@@ -1521,12 +1515,6 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_LE_U64:
 		case Opcode::V_CMPX_NE_U64:
-		case Opcode::V_CMPX_LT_I16:
-		case Opcode::V_CMPX_EQ_I16:
-		case Opcode::V_CMPX_LE_I16:
-		case Opcode::V_CMPX_GT_I16:
-		case Opcode::V_CMPX_NE_I16:
-		case Opcode::V_CMPX_GE_I16:
 		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_EQ_U16:
 		case Opcode::V_CMPX_GT_U16:
