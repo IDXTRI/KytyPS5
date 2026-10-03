@@ -1683,9 +1683,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto filter = (control >> 26u) & 3u;
 			// MipNone always selects the base level. Explicit point gathers currently require
 			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
+			// Wolverine fork: upstream fails the specialization here, which skips the draw (625
+			// shaders by Wolverine's title screen). The gather reads the mip its explicit LOD
+			// selects, as with point filtering; linear mip blending and LOD biases are ignored.
 			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					std::fprintf(stderr, "Warning: explicit-LOD gather with linear mip filtering or LOD "
+					                     "bias is approximated with the selected mip (shader 0x%016llx)\n",
+					             static_cast<unsigned long long>(program.shader_hash));
+				}
 			}
 		}
 	}

@@ -2169,8 +2169,10 @@ void TestGatherLodSamplerValidation() {
         user_data[10] = control;
         ResourceSnapshot snapshot;
         ResourceSpecialization specialization;
-        const bool supported = !explicit_lod || (control >> 26u) == 0 ||
-                               control == (1u << 26u);
+        // Wolverine fork: linear mip filtering and LOD biases are approximated with the selected
+        // mip instead of failing the specialization (which skipped the draw).
+        const bool supported = true;
+        (void)explicit_lod;
         Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                    specialization) == supported,
               "explicit gather accepted an unsupported sampler or rejected a valid one");
