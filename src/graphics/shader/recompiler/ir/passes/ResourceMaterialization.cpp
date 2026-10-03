@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <unordered_set>
 
@@ -687,6 +688,32 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto source = sampler_plan.bindings[index].source;
 		snapshot.samplers.push_back(snapshot.samplers[source]);
 		if (source >= specialization.samplers.size() || !specialization.samplers[source].bindless) {
+			continue;
+		}
+		// KYTY_BINDLESS_SAMPLER_COPY_LOG=1 (environment, research): print each program and class
+		// that gets a bindless copy once. KYTY_BINDLESS_SAMPLER_COPIES=0 (environment, research):
+		// copies bind the fallback sampler (with their class's filtering) instead of the heap.
+		static const bool copy_log = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLER_COPY_LOG");
+			return value != nullptr && value[0] == '1';
+		}();
+		static const bool copies = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLER_COPIES");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (copy_log) {
+			static std::mutex                                      mutex;
+			static std::unordered_set<uint64_t>                    printed;
+			const std::lock_guard                                  lock(mutex);
+			if (printed.insert(program.shader_hash * 8u + index).second) {
+				::printf("Bindless sampler copy: shader 0x%016llx stage %u sampler %u <- %u class %u\n",
+				         static_cast<unsigned long long>(program.shader_hash),
+				         static_cast<uint32_t>(program.stage), index, source,
+				         static_cast<uint32_t>(sampler_plan.bindings[index].type));
+				std::fflush(stdout);
+			}
+		}
+		if (!copies) {
 			continue;
 		}
 		// A bindless sampler's copy for another image class (point filtering, integer border)
@@ -1703,13 +1730,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			// From the specialized source: a bindless copy without its own mapping words keeps
-			// the source's.
-			samplers.push_back(samplers[binding.source]);
-			if (index < specialization.samplers.size() && specialization.samplers[index].bindless) {
-				samplers[index].bindless                = specialization.samplers[index].bindless;
-				samplers[index].bindless_mapping_offset = specialization.samplers[index].bindless_mapping_offset;
-			}
+			// A bindless copy has its own mapping words; without them it binds the fallback
+			// sampler like a bound one.
+			samplers.push_back(program.info.samplers[binding.source]);
+			const bool bindless =
+			    index < specialization.samplers.size() && specialization.samplers[index].bindless;
+			samplers[index].bindless                = bindless;
+			samplers[index].bindless_mapping_offset =
+			    bindless ? specialization.samplers[index].bindless_mapping_offset : 0u;
 		}
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
