@@ -12,7 +12,7 @@ clang-cl Release build. Run with
 
 | Scene | Before | Now |
 |---|---|---|
-| Gameplay spot, standing still | ~11 fps | ~17-20 fps |
+| Gameplay spot, standing still | ~17-20 fps | ~20-30 fps |
 | Main menu | ~28 fps | ~30-31 fps |
 
 Every change was measured with same-process A/B (live switches, Tracy), and only changes with a
