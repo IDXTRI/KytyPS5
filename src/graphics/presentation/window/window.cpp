@@ -70,6 +70,8 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
 		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
+		// Pads without a touchpad (Xbox layout): View/Back acts as a touchpad click.
+		case SDL_GAMEPAD_BUTTON_BACK: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
@@ -330,6 +332,11 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		}
+		if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
+			// Games that read the touch points (not only the button bit) see a finger in the
+			// middle of the touchpad while View/Back is held.
+			Controller::SetTouchPad(f.id, 0, f.down, 0.5f, 0.5f);
 		}
 	}
 
