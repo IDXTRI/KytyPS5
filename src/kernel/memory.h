@@ -208,6 +208,10 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Fault safety net: a CPU access the guest mapping allows hit a page whose host protection no
+// tracker owns any more (orphaned watch state). Restores the guest protection on its 16 KiB page;
+// true when the access may be retried.
+bool RepairOrphanedProtection(uint64_t vaddr, bool write);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

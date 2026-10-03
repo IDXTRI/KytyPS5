@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <bit>
 #include <cstddef>
 #include <cstdlib>
@@ -3835,6 +3837,34 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
+bool RepairOrphanedProtection(uint64_t vaddr, bool write) {
+	if (g_virtual_ranges == nullptr || g_guest_address_space == nullptr) {
+		return false;
+	}
+	VirtualRanges::Range range {};
+	if (!g_virtual_ranges->Query(vaddr, 0, &range) || !IsCommittedRangeType(range.type) ||
+	    (range.protection & (write ? PROT_CPU_WRITE : PROT_CPU_READ)) == 0) {
+		return false; // The guest's own mapping forbids it: a real fault.
+	}
+	constexpr uint64_t GuestPageSize = 0x4000;
+	const auto         page          = vaddr & ~(GuestPageSize - 1u);
+	const auto         mode = (range.protection & PROT_CPU_WRITE) != 0 ? VirtualMemory::Mode::ReadWrite
+	                                                                   : VirtualMemory::Mode::Read;
+	if (!g_guest_address_space->ProtectTransient(page, GuestPageSize, mode)) {
+		return false;
+	}
+	static std::atomic<uint32_t> reported = 0;
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("Memory: restored %s access to orphaned protected page 0x%016" PRIx64
+		     " (guest prot 0x%x, no tracker owns it)\n",
+		     write ? "write" : "read", page, range.protection);
+		std::printf("Memory: restored %s access to orphaned protected page 0x%016" PRIx64 "\n",
+		            write ? "write" : "read", page);
+		std::fflush(stdout);
+	}
+	return true;
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

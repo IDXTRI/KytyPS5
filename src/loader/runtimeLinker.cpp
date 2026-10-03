@@ -806,8 +806,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// so no handler owns it any more. Retry the instruction then. Wolverine run 96: the Render
 		// Thread's memcpy (vmovntps) into texture memory faulted at a page start and was reported
 		// as unhandled.
+		// Otherwise the page may carry a transient watch protection no tracker owns any more while
+		// the guest mapping allows the access (Wolverine run 101: the Render Thread's memcpy into
+		// texture memory the GPU side no longer lists as mapped). Restore it and retry.
 		if (access != GpuAccess::Execute &&
-		    IsAccessibleNow(info->access_violation_vaddr, access == GpuAccess::Write)) {
+		    (IsAccessibleNow(info->access_violation_vaddr, access == GpuAccess::Write) ||
+		     Libs::LibKernel::Memory::RepairOrphanedProtection(info->access_violation_vaddr,
+		                                                        access == GpuAccess::Write))) {
 			thread_local uint64_t retried_address = 0;
 			thread_local uint32_t retries         = 0;
 			retries         = retried_address == info->access_violation_vaddr ? retries + 1 : 0;
