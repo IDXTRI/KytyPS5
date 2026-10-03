@@ -79,6 +79,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -14057,6 +14058,24 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
+      // Two-level table (BufferCache::BDA_CHUNK_BITS): chunks are handed out in order.
+      std::map<uint64_t, uint64_t> chunks;
+      const auto write_entry = [&](uint64_t page, vk::DeviceAddress address) {
+        const auto directory = page >> BufferCache::BDA_CHUNK_BITS;
+        const auto [chunk, inserted] = chunks.try_emplace(
+            directory, BufferCache::BDA_DIRECTORY_ENTRIES +
+                           chunks.size() * BufferCache::BDA_CHUNK_PAGES);
+        if (inserted) {
+          cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                           directory * sizeof(vk::DeviceAddress),
+                           sizeof(chunk->second), &chunk->second);
+        }
+        const auto element =
+            chunk->second + (page & (BufferCache::BDA_CHUNK_PAGES - 1));
+        cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                         element * sizeof(vk::DeviceAddress), sizeof(address),
+                         &address);
+      };
       for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
@@ -14070,9 +14089,7 @@ public:
         auto address = buffer.device_address + backing - page_offset;
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
-          cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
-                           (page + mapped) * sizeof(vk::DeviceAddress),
-                           sizeof(address), &address);
+          write_entry(page + mapped, address);
           address += BufferCache::CACHING_PAGESIZE;
         }
       }

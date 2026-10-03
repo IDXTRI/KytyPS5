@@ -1402,15 +1402,34 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                           address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
-	const auto entry_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
-	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
-	                          page);
-	const auto base = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
-	const auto missing =
-	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
+	const auto page = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	// Two-level table (BufferCache::BDA_CHUNK_BITS): the directory entry holds 0 or the element
+	// index of the chunk with this page's buffer address.
+	const auto table_entry = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
+		                          pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, value, pointer);
+		return value;
+	};
+	const auto directory = Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+	                              ConstantU32(state, BufferCache::BDA_CHUNK_BITS));
+	const auto chunk     = table_entry(directory);
+	const auto no_chunk =
+	    Binary(state, spv::OpIEqual, TypeBool(state), chunk, ConstantDeviceAddress(state, 0));
+	const auto in_chunk =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), page,
+	           ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_CHUNK_PAGES - 1u)));
+	const auto element =
+	    Select(state, TypeU32(state), no_chunk, directory,
+	           Binary(state, spv::OpIAdd, TypeU32(state),
+	                  Unary(state, spv::OpUConvert, TypeU32(state), chunk), in_chunk));
+	const auto base    = table_entry(element);
+	const auto missing = Binary(
+	    state, spv::OpLogicalOr, TypeBool(state), no_chunk,
+	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0)));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();

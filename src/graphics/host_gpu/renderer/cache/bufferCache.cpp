@@ -369,7 +369,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
-	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
@@ -378,13 +377,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_total_used_memory += buffer.Size();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
-		std::vector<vk::DeviceAddress> addresses;
-		addresses.reserve(size_pages);
-		for (uint64_t i = 0; i < size_pages; ++i) {
-			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
-		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		WriteBdaEntries(PageIndex(buffer.CpuAddress()), size_pages, buffer.BufferDeviceAddress());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -392,9 +385,68 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		WriteBdaEntries(PageIndex(buffer.CpuAddress()), size_pages, 0);
 		buffer.is_deleted = true;
+	}
+}
+
+void BufferCache::WriteBdaEntries(uint64_t first_page, uint64_t pages,
+                                  vk::DeviceAddress first_address) {
+	constexpr auto Entry = sizeof(vk::DeviceAddress);
+	EXIT_IF(first_page + pages > CACHING_NUMPAGES);
+	if (m_bda_directory.empty()) {
+		m_bda_directory.assign(BDA_DIRECTORY_ENTRIES, 0);
+		m_bda_chunk_live.assign(BDA_CHUNK_COUNT, 0);
+		m_bda_free_chunks.resize(BDA_CHUNK_COUNT);
+		for (uint32_t slot = 0; slot < BDA_CHUNK_COUNT; slot++) {
+			m_bda_free_chunks[slot] = static_cast<uint32_t>(BDA_CHUNK_COUNT - 1u - slot);
+		}
+	}
+	std::vector<vk::DeviceAddress> addresses;
+	for (uint64_t page = first_page; page < first_page + pages;) {
+		const auto directory = page >> BDA_CHUNK_BITS;
+		const auto run_end   = std::min(first_page + pages, (directory + 1u) << BDA_CHUNK_BITS);
+		const auto count     = run_end - page;
+		auto&      slot_plus = m_bda_directory[directory];
+		if (first_address != 0 && slot_plus == 0) {
+			if (m_bda_free_chunks.empty()) {
+				EXIT("BufferCache: BDA chunk pool exhausted (%" PRIu64 " chunks of %" PRIu64
+				     " MiB guest space); raise BDA_CHUNK_COUNT\n",
+				     BDA_CHUNK_COUNT, (BDA_CHUNK_PAGES << CACHING_PAGEBITS) >> 20u);
+			}
+			slot_plus = m_bda_free_chunks.back() + 1u;
+			m_bda_free_chunks.pop_back();
+			m_bda_chunks_peak = std::max(
+			    m_bda_chunks_peak, static_cast<uint32_t>(BDA_CHUNK_COUNT - m_bda_free_chunks.size()));
+			const vk::DeviceAddress chunk_element =
+			    BDA_DIRECTORY_ENTRIES + uint64_t {slot_plus - 1u} * BDA_CHUNK_PAGES;
+			WriteDataBuffer(m_bda_pagetable_buffer, directory * Entry, &chunk_element, Entry);
+		}
+		if (slot_plus != 0) {
+			const auto slot    = slot_plus - 1u;
+			const auto element = BDA_DIRECTORY_ENTRIES + uint64_t {slot} * BDA_CHUNK_PAGES +
+			                     (page & (BDA_CHUNK_PAGES - 1u));
+			if (first_address != 0) {
+				addresses.resize(count);
+				for (uint64_t i = 0; i < count; i++) {
+					addresses[i] = first_address + ((page - first_page + i) << CACHING_PAGEBITS);
+				}
+				WriteDataBuffer(m_bda_pagetable_buffer, element * Entry, addresses.data(),
+				                count * Entry);
+				m_bda_chunk_live[slot] += static_cast<uint32_t>(count);
+			} else {
+				m_bda_pagetable_buffer.Fill(element * Entry, count * Entry, 0);
+				EXIT_IF(m_bda_chunk_live[slot] < count);
+				m_bda_chunk_live[slot] -= static_cast<uint32_t>(count);
+				if (m_bda_chunk_live[slot] == 0) {
+					// Its pages are all zero again: the chunk can serve another region.
+					m_bda_pagetable_buffer.Fill(directory * Entry, Entry, 0);
+					m_bda_free_chunks.push_back(slot);
+					slot_plus = 0;
+				}
+			}
+		}
+		page = run_end;
 	}
 }
 
@@ -1585,10 +1637,18 @@ void BufferCache::VerifyBdaPageTable() {
 		uint64_t    pages      = 0;
 		uint64_t    mismatches = 0;
 		uint64_t    stale      = 0;
+		const auto table_entry = [&](uint64_t element) {
+			vk::DeviceAddress value = 0;
+			std::memcpy(&value, data + element * sizeof(value), sizeof(value));
+			return value;
+		};
 		for (const auto& run: m_bda_verify_runs) {
 			for (uint64_t i = 0; i < run.pages; i++) {
-				vk::DeviceAddress actual = 0;
-				std::memcpy(&actual, data + run.download_offset + i * sizeof(actual), sizeof(actual));
+				// Through the GPU's own directory, as a shader reads it.
+				const auto page  = PageIndex(run.guest_address + (i << CACHING_PAGEBITS));
+				const auto chunk = table_entry(page >> BDA_CHUNK_BITS);
+				const auto actual =
+				    chunk != 0 ? table_entry(chunk + (page & (BDA_CHUNK_PAGES - 1u))) : 0;
 				const auto expected = m_bda_verify_expected[run.first_address + i];
 				pages++;
 				if (actual == expected) {
@@ -1607,8 +1667,11 @@ void BufferCache::VerifyBdaPageTable() {
 			}
 		}
 		std::printf("BDA verify: %" PRIu64 " pages in %zu registered ranges, %" PRIu64
-		            " mismatches (%" PRIu64 " stale on pages without a buffer)\n",
-		            pages, m_bda_verify_runs.size(), mismatches, stale);
+		            " mismatches (%" PRIu64 " stale on pages without a buffer); chunks %zu in use,"
+		            " peak %u of %" PRIu64 "\n",
+		            pages, m_bda_verify_runs.size(), mismatches, stale,
+		            static_cast<size_t>(BDA_CHUNK_COUNT - m_bda_free_chunks.size()),
+		            m_bda_chunks_peak, BDA_CHUNK_COUNT);
 		std::fflush(stdout);
 		m_bda_verify_tick = 0;
 		m_bda_verify_last = std::chrono::steady_clock::now();
@@ -1654,16 +1717,14 @@ void BufferCache::VerifyBdaPageTable() {
 	if (bytes == 0) {
 		return;
 	}
-	if (m_bda_verify_download == nullptr || m_bda_verify_download->Size() < bytes) {
+	// The whole two-level table (directory + chunk pool) in one copy.
+	if (m_bda_verify_download == nullptr) {
 		m_bda_verify_download = std::make_unique<Buffer>(
 		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		    vk::BufferUsageFlagBits::eTransferDst, bytes * 2);
+		    vk::BufferUsageFlagBits::eTransferDst, BDA_PAGETABLE_SIZE);
 	}
-	for (const auto& run: m_bda_verify_runs) {
-		m_bda_verify_download->CopyFrom(m_scheduler.Current(), m_bda_pagetable_buffer,
-		                                run.table_offset, run.download_offset,
-		                                run.pages * sizeof(vk::DeviceAddress));
-	}
+	m_bda_verify_download->CopyFrom(m_scheduler.Current(), m_bda_pagetable_buffer, 0, 0,
+	                                BDA_PAGETABLE_SIZE);
 	m_bda_verify_tick = m_scheduler.CurrentTick();
 }
 

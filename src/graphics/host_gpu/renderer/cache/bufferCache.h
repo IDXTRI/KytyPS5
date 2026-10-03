@@ -33,8 +33,19 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The BDA page table is two-level: a directory with one entry per BDA_CHUNK_PAGES guest pages
+	// (64 MiB of guest space), holding 0 or the element index of a chunk of per-page buffer
+	// addresses. Chunks come from a fixed pool behind the directory, taken when a buffer first
+	// covers their region and returned when the last one leaves. The flat table was 768 MiB of
+	// device memory (8 bytes per 16 KiB page of the 1.5 TiB guest space), almost all zeros.
+	static constexpr uint32_t BDA_CHUNK_BITS        = 12;
+	static constexpr uint64_t BDA_CHUNK_PAGES       = uint64_t {1} << BDA_CHUNK_BITS;
+	static constexpr uint64_t BDA_DIRECTORY_ENTRIES = CACHING_NUMPAGES >> BDA_CHUNK_BITS;
+	static constexpr uint64_t BDA_CHUNK_COUNT       = 2048;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    (BDA_DIRECTORY_ENTRIES + BDA_CHUNK_COUNT * BDA_CHUNK_PAGES) * sizeof(vk::DeviceAddress);
+	static_assert((CACHING_NUMPAGES & (BDA_CHUNK_PAGES - 1)) == 0);
+	static_assert(BDA_DIRECTORY_ENTRIES + BDA_CHUNK_COUNT * BDA_CHUNK_PAGES < (uint64_t {1} << 32u));
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -211,6 +222,13 @@ private:
 		uint64_t          pages           = 0;
 	};
 	void VerifyBdaPageTable();
+	// Writes the BDA entries of `pages` pages from packed page `first_page`: consecutive
+	// addresses from `first_address`, or zeros (0), allocating and releasing chunks.
+	void WriteBdaEntries(uint64_t first_page, uint64_t pages, vk::DeviceAddress first_address);
+	std::vector<uint32_t> m_bda_directory;   // per directory entry: chunk slot + 1, 0 = none
+	std::vector<uint32_t> m_bda_chunk_live;  // per chunk slot: pages with an address
+	std::vector<uint32_t> m_bda_free_chunks; // chunk slots, taken from the back
+	uint32_t              m_bda_chunks_peak = 0;
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
