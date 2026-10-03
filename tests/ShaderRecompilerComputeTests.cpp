@@ -37261,6 +37261,12 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
+  // The tests cover upstream's BVH translation; the emulator skips those programs by default.
+#ifdef _WIN32
+  _putenv("KYTY_SKIP_BVH_DISPATCHES=0");
+#else
+  setenv("KYTY_SKIP_BVH_DISPATCHES", "0", 1);
+#endif
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);

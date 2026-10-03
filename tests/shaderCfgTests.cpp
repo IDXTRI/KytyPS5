@@ -10886,7 +10886,8 @@ void TestMeshInputAssembly() {
     }
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 9u,
+              // Fast launch: the instance alone; the shader adds its start-instance SGPR.
+              vgprs[test.fast_launch ? 6 : 8] == (test.fast_launch ? 2u : 9u),
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
@@ -14662,6 +14663,12 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace Libs::Graphics
 
 int main() {
+  // The tests cover upstream's BVH translation; the emulator skips those programs by default.
+#ifdef _WIN32
+  _putenv("KYTY_SKIP_BVH_DISPATCHES=0");
+#else
+  setenv("KYTY_SKIP_BVH_DISPATCHES", "0", 1);
+#endif
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
