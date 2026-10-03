@@ -22,6 +22,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -153,8 +154,13 @@ static bool GraphicsRunDebugDumpEnabled() {
 // preceding GPU work has executed instead of when it was recorded. A label written at record time
 // tells the guest its per-frame memory is free while the GPU has not read it yet; the next frame's
 // data then mixes into this one. The scheduler's completion thread writes it, so nothing waits.
+// On by default in this build (PR #937 runs Wolverine with it; the launcher sets no environment);
+// KYTY_LABELS_AFTER_GPU=0 turns it off.
 static bool LabelsAfterGpu() {
-	static const bool enabled = std::getenv("KYTY_LABELS_AFTER_GPU") != nullptr;
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LABELS_AFTER_GPU");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	return enabled;
 }
 
