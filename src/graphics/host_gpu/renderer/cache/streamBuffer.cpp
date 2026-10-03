@@ -107,6 +107,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_BUFFER_TAIL_PAD_KB=N (live, research): guest-memory buffers get N KiB of device memory
+	// past their end. A shader access is translated through the BDA page of its first byte only,
+	// so one that runs past a buffer's last page reads whatever allocation follows it. Wolverine
+	// runs 88-97 lost the device reading released or live *images* at such addresses.
+	static auto& tail_pad_kb = Common::LiveSwitches::Get("KYTY_BUFFER_TAIL_PAD_KB", 0);
+	if (const auto pad = tail_pad_kb.load(std::memory_order_relaxed);
+	    pad > 0 && cpu_address != 0 && usage == MemoryUsage::DeviceLocal) {
+		buffer_info.size = size + (static_cast<uint64_t>(pad) << 10u);
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
