@@ -126,7 +126,10 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
-		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
+		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission "
+		     "(stage %u, shader 0x%016llx)\n",
+		     static_cast<uint32_t>(state.program.stage),
+		     static_cast<unsigned long long>(state.program.shader_hash));
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
