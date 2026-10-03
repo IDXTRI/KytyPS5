@@ -204,13 +204,22 @@ GraphicContext::PoolKey(const vk::ImageCreateInfo& info) {
 }
 
 void GraphicContext::TrimImagePool(uint64_t cap_bytes, bool all) {
-	constexpr auto   MaxAge = std::chrono::seconds(2);
+	constexpr auto MaxAge = std::chrono::seconds(2);
+	// KYTY_IMAGE_QUARANTINE_MS=N (live, default 0, workaround): a parked image keeps its memory at
+	// least N ms whatever the cap. Wolverine reads some deleted images 2-12 s later through a
+	// descriptor not yet found (runs 88-95); inside its old memory that read is harmless, after
+	// the memory is released (dedicated allocations) it loses the device.
+	static auto&     quarantine_ms = Common::LiveSwitches::Get("KYTY_IMAGE_QUARANTINE_MS", 0);
+	const auto       quarantine =
+	    std::chrono::milliseconds(std::max<int64_t>(0, quarantine_ms.load(std::memory_order_relaxed)));
 	const auto       now    = std::chrono::steady_clock::now();
 	std::scoped_lock lock(m_image_pool_mutex);
 	// Oldest first: entries are appended as they are parked.
 	size_t keep_from = 0;
-	while (keep_from < m_image_pool.size() && (all || m_image_pool_bytes > cap_bytes ||
-	                                           now - m_image_pool[keep_from].parked > MaxAge)) {
+	while (keep_from < m_image_pool.size() &&
+	       (all || ((m_image_pool_bytes > cap_bytes ||
+	                 now - m_image_pool[keep_from].parked > MaxAge) &&
+	                now - m_image_pool[keep_from].parked >= quarantine))) {
 		auto& entry = m_image_pool[keep_from];
 		vmaDestroyImage(allocator, entry.image, entry.allocation);
 		m_image_pool_bytes -= entry.bytes;
@@ -329,7 +338,10 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 
 	const auto megabytes = ImageRecycleMegabytes();
 	const auto cap       = static_cast<uint64_t>(std::max<int64_t>(megabytes, 0)) << 20u;
-	if (megabytes > 0 && image.recyclable) {
+	static auto& quarantine_ms = Common::LiveSwitches::Get("KYTY_IMAGE_QUARANTINE_MS", 0);
+	const bool   quarantine    = quarantine_ms.load(std::memory_order_relaxed) > 0;
+	const bool   reusable      = megabytes > 0 && image.recyclable;
+	if (reusable || quarantine) {
 		vk::ImageCreateInfo info {};
 		info.flags       = image.flags;
 		info.imageType   = image.image_type;
@@ -341,6 +353,10 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		info.tiling      = image.tiling;
 		info.usage       = image.usage;
 		info.sharingMode = image.sharing;
+		if (!reusable) {
+			// Only held for the quarantine: a key no CreateImage asks for.
+			info.imageType = static_cast<vk::ImageType>(0x7fffffff);
+		}
 		VmaAllocationInfo allocation {};
 		vmaGetAllocationInfo(allocator, image.allocation, &allocation);
 		{
@@ -356,7 +372,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		image.image      = nullptr;
 		image.allocation = nullptr;
 	}
-	TrimImagePool(cap, megabytes <= 0);
+	TrimImagePool(cap, megabytes <= 0 && !quarantine);
 }
 
 } // namespace Libs::Graphics
