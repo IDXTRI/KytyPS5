@@ -589,6 +589,27 @@ static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity
 }
 
 // Probe diagnostic ranges without raising another fault.
+// Whether the page holding addr can now be read (or written): a fault handler races with threads
+// that change page protection.
+static bool IsAccessibleNow(uint64_t addr, bool write) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (addr == 0 || VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) == 0 ||
+	    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		return false;
+	}
+	if (!write) {
+		return true;
+	}
+	return (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+	                       PAGE_EXECUTE_WRITECOPY)) != 0;
+#else
+	(void)addr;
+	(void)write;
+	return false;
+#endif
+}
+
 static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	if (addr == 0 || size == 0) {
 		return false;
@@ -779,6 +800,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				return resolved;
 			}
 			return true;
+		}
+		// The page may have become accessible after the fault was raised and before the handlers
+		// above looked: another thread unprotected it (an image untracked, a range synchronized),
+		// so no handler owns it any more. Retry the instruction then. Wolverine run 96: the Render
+		// Thread's memcpy (vmovntps) into texture memory faulted at a page start and was reported
+		// as unhandled.
+		if (access != GpuAccess::Execute &&
+		    IsAccessibleNow(info->access_violation_vaddr, access == GpuAccess::Write)) {
+			thread_local uint64_t retried_address = 0;
+			thread_local uint32_t retries         = 0;
+			retries         = retried_address == info->access_violation_vaddr ? retries + 1 : 0;
+			retried_address = info->access_violation_vaddr;
+			if (retries < 64) {
+				return true;
+			}
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
