@@ -874,10 +874,12 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	value.dword_count  = 8u;
 	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
 	heap.settled[key]  = 1;
+	heap.descriptors[key] = {};
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
+	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	if (!BindlessCompatible(descriptor, heap.binding)) {
 		table.SetTranslation(heap, key, 0u);
@@ -911,6 +913,53 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	return true;
 }
 
+uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
+	// From Senaxx 0563e10e. The guest rewrites heap entries as it streams textures out and others
+	// in. A key settled from the old T# kept sampling the old texture and kept it pinned in the
+	// texture cache for the rest of the run (Senaxx: 14-21 keys, 44-65 MB in the jungle). Each
+	// frame a window of every heap is read in one go and compared; a changed key is settled again
+	// into a new slot, and an image no key refers to any more is unpinned so the cache can collect
+	// it. A heap of 64 Ki keys is covered in 32 frames.
+	constexpr uint32_t Window        = 2048;
+	auto&              table         = m_context.GetBindlessTable();
+	auto&              texture_cache = m_context.GetTextureCache();
+	uint32_t           resolved      = 0;
+	for (auto& heap: table.Heaps()) {
+		const auto keys = static_cast<uint32_t>(heap.settled.size());
+		if (keys == 0) {
+			continue;
+		}
+		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
+		const uint32_t count = std::min(Window, keys - begin);
+		m_bindless_window.resize(count);
+		const auto address  = heap.base + heap.table_offset + static_cast<uint64_t>(begin) * 32u;
+		const bool readable = Libs::LibKernel::Memory::TryReadBacking(
+		    address, m_bindless_window.data(), static_cast<uint64_t>(count) * 32u);
+		uint32_t next = begin + count;
+		for (uint32_t i = 0; readable && i < count; i++) {
+			const auto key = begin + i;
+			if (heap.settled[key] == 0 || heap.descriptors[key] == m_bindless_window[i]) {
+				continue;
+			}
+			if (resolved >= budget) {
+				next = key; // look at it again next frame
+				break;
+			}
+			const auto old_image = heap.images[key];
+			if (table.ReleaseKey(heap, key)) {
+				if (auto* image = texture_cache.m_slot_images.try_get(old_image);
+				    image != nullptr && image->bindless_pinned) {
+					NoteBindlessStateChange(*image);
+					image->bindless_pinned = false;
+				}
+			}
+			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+		}
+		heap.revalidate_cursor = next >= keys ? 0u : next;
+	}
+	return resolved;
+}
+
 void RenderExecutor::ResolveBindlessRequests() {
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
 	if (frame == m_bindless_frame) {
@@ -932,7 +981,10 @@ void RenderExecutor::ResolveBindlessRequests() {
 	table.ConsumeSnapshot();
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget   = 128;
-	uint32_t           resolved = 0;
+	// KYTY_BINDLESS_REVALIDATE=0 (live, default 1) leaves changed heap entries settled.
+	static auto& revalidate = Common::LiveSwitches::Get("KYTY_BINDLESS_REVALIDATE", 1);
+	uint32_t resolved =
+	    revalidate.load(std::memory_order_relaxed) != 0 ? RevalidateBindlessKeys(Budget) : 0u;
 	m_bindless_used.clear();
 	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
 		m_bindless_requests.clear();
