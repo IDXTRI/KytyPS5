@@ -339,6 +339,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSMax32:
 		case IR::ValueOpcode::SharedAtomicSMax32: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMax32:
+		case IR::ValueOpcode::ImageAtomicUMax64:
 		case IR::ValueOpcode::BufferAtomicUMax32:
 		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32:
@@ -361,6 +362,8 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
                              uint32_t scope) {
 	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
 	const auto old    = ctx.state.builder.AllocateId();
+	const bool wide   = inst.GetType() == IR::Type::U64;
+	const auto type   = wide ? TypeScalarU64(ctx.state) : TypeU32(ctx.state);
 	if (opcode == spv::OpAtomicCompareExchange) {
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
@@ -369,12 +372,13 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
 		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
-		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(opcode, TypeU32(ctx.state), old, pointer,
+		auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (wide) value = Unary(ctx.state, spv::OpBitcast, type, value);
+		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
 	}
-	return old;
+	return wide ? Unary(ctx.state, spv::OpBitcast, TypeU64(ctx.state), old) : old;
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {

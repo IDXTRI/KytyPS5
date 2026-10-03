@@ -1479,17 +1479,11 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    return EmitValueOrDefaultIfCondition(
 		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
-			        const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state),
-			                                 ctx.Arg(inst, inst.NumArgs() - 2));
-			        const auto old   = state.builder.AllocateId();
-			        state.builder.AddFunction(
-			            SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
-			            EmitStorageBufferElementPointer(state, resource, index,
-			                                            TypeStorageBufferU64ElementPointer(state)),
-			            ConstantU32(state, spv::ScopeDevice),
-			            ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+			        const auto pointer = EmitStorageBufferElementPointer(
+			            state, resource, index, TypeStorageBufferU64ElementPointer(state));
+			        const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
 			        EmitAtomicMemoryBarrier(state, mem.kind);
-			        return Unary(state, spv::OpBitcast, TypeU64(state), old);
+			        return old;
 		        });
 	    });
 }

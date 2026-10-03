@@ -319,6 +319,7 @@ inline constexpr auto EmitImageAtomicSMin32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMin32    = EmitImage;
 inline constexpr auto EmitImageAtomicSMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
+inline constexpr auto EmitImageAtomicUMax64    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;

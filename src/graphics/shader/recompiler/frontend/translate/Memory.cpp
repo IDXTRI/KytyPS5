@@ -568,7 +568,9 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 		                  ir.GetExec()},
 		                 flags);
 	} else {
-		result = ir.Emit(opcode, {resource, address, ReadU32(data), ir.GetExec()}, flags);
+		const IR::Value value =
+		    memory.data_bits == 64u ? IR::Value(ReadU64(data)) : IR::Value(ReadU32(data));
+		result = ir.Emit(opcode, {resource, address, value, ir.GetExec()}, flags);
 	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
@@ -706,8 +708,16 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageGatherRaw, {resource, sampler, address},
-	                              AddMemoryInfo(memory, inst.pc));
+	const bool has_lod = (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
+	// LOD selection consumes these words on the GPU after descriptor handles are stripped.
+	const auto result = ir.Emit(
+	    IR::ValueOpcode::ImageGatherRaw,
+	    {resource, sampler, address,
+	     has_lod ? resource.Instruction()->Arg(1) : IR::Value(0u),
+	     has_lod ? resource.Instruction()->Arg(3) : IR::Value(0u),
+	     has_lod ? sampler.Instruction()->Arg(1) : IR::Value(0u),
+	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u)},
+	    AddMemoryInfo(memory, inst.pc));
 	for (uint32_t index = 0; index < memory.data_dwords; index++) {
 		WriteOperand(OffsetOperand(inst.dst, index),
 		             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(index)}));
@@ -1044,7 +1054,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32);
+			return IMAGE_ATOMIC(inst, inst.data_bits == 64u ? IR::ValueOpcode::ImageAtomicUMax64
+			                                                : IR::ValueOpcode::ImageAtomicUMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_AND:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32);
 		case Decoder::Opcode::IMAGE_ATOMIC_OR:

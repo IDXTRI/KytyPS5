@@ -2127,6 +2127,58 @@ void TestFmaskLoadSpecialization() {
         "rebinding FMASK as a texture reused the metadata specialization");
 }
 
+void TestGatherLodSamplerValidation() {
+  for (const bool explicit_lod : {false, true}) {
+    for (const bool reverse : {false, true}) {
+      Fixture fixture;
+      std::array<Value, 8> image_words;
+      std::array<Value, 4> sampler_words;
+      for (uint32_t i = 0; i < image_words.size(); i++)
+        image_words[i] = fixture.UserData(i);
+      for (uint32_t i = 0; i < sampler_words.size(); i++)
+        sampler_words[i] = fixture.UserData(i + 8);
+      for (uint32_t i = 0; i < 2; i++) {
+        const bool lod = explicit_lod && i == (reverse ? 0u : 1u);
+        MemoryInfo memory;
+        memory.kind = ResourceKind::Image;
+        memory.image_dimension = Decoder::ImageDimension::Dim2D;
+        memory.image_sample_flags = lod ? Decoder::ImageSampleFlagLod
+                                        : Decoder::ImageSampleFlagLevelZero;
+        fixture.Emit(ValueOpcode::ImageGatherRaw,
+                     {fixture.Image(image_words), fixture.Sampler(sampler_words),
+                      fixture.ImageAddress(), image_words[1], image_words[3],
+                      sampler_words[1], sampler_words[2]},
+                     fixture.AddMemory(memory, i * 4));
+      }
+      fixture.PlanAndTrack();
+      auto plan = ExtractResourcePlan(fixture.program);
+      Check(plan.info.samplers.size() == 1 &&
+                plan.info.samplers[0].gather_lod == explicit_lod,
+            "shared sampler lost explicit gather validation or restricted LZ gather");
+      std::array<uint32_t, 12> user_data{};
+      user_data[0] = 0x1000u;
+      user_data[1] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+      user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      user_data[9] = 0xfff000u;
+      constexpr std::array sampler_controls{
+          0u, 0x4001u, 1u << 26u, (1u << 26u) | 256u,
+          (1u << 26u) | (1u << 14u), 2u << 26u, 3u << 26u};
+      for (const auto control : sampler_controls) {
+        user_data[10] = control;
+        ResourceSnapshot snapshot;
+        ResourceSpecialization specialization;
+        const bool supported = !explicit_lod || (control >> 26u) == 0 ||
+                               control == (1u << 26u);
+        Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                                   specialization) == supported,
+              "explicit gather accepted an unsupported sampler or rejected a valid one");
+      }
+    }
+  }
+}
+
 void TestDynamicStorageMipTracking() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -2162,7 +2214,7 @@ void TestDynamicStorageMipTracking() {
   const auto &images = fixture.program.info.images;
   Check(images.size() == 2 && images[0].mip_mode == ImageMipMode::None &&
             images[0].mip_count == 1 &&
-            images[1].mip_mode == ImageMipMode::DynamicStorage &&
+            images[1].mip_mode == ImageMipMode::Dynamic &&
             images[1].mip_count == 1,
         "storage mip writes did not share one dynamic logical resource");
   Check(plain.first.Instruction()->Flags<uint32_t>() == 0 &&
@@ -3395,15 +3447,15 @@ void TestShaderInfoAndBindingLayout() {
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
-  Check(ImageBindingCount == 43u &&
+  Check(ImageBindingCount == 48u &&
             static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 45u &&
-            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 46u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 51u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 52u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
+            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -3426,12 +3478,13 @@ void TestImageBindingAbi() {
   uint32_t index = 0;
   const auto CheckBinding =
       [&](ImageResourceClass resource_class, NumericClass numeric_class,
-          Decoder::ImageDimension dimension, bool atomic, bool comparison = false) {
+          Decoder::ImageDimension dimension, bool atomic, bool comparison = false, bool atomic64 = false) {
         ImageResource image;
         image.resource_class = resource_class;
         image.numeric_class = numeric_class;
         image.dimension = dimension;
         image.atomic = atomic;
+        image.atomic64 = atomic64;
         image.depth_compare = comparison;
         const auto kind = DescriptorBindingForImage(image);
         Check(kind.has_value() &&
@@ -3465,6 +3518,10 @@ void TestImageBindingAbi() {
   for (const auto dimension : storage_dimensions) {
     CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
                  true);
+  }
+  for (const auto dimension : storage_dimensions) {
+    CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
+                 true, false, true);
   }
   Check(index == ImageBindingCount, "image descriptor ABI case count changed");
 
@@ -3664,6 +3721,7 @@ int main() {
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
+    Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);

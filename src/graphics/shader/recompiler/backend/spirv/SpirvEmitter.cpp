@@ -46,7 +46,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			Fail(program, "native shader plan has an invalid image class");
 		}
 		present[static_cast<size_t>(*kind)] = true;
-		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::DynamicStorage;
+		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::Dynamic;
 		const auto count   = dynamic ? program.info.images[i].mip_count : 1u;
 		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
 			Fail(program, "native shader plan has an invalid image mip descriptor count");

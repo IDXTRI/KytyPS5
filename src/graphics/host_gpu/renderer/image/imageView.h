@@ -90,8 +90,11 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	if (resource.numeric_class != Prospero::TextureNumericClass::Float && resource.depth_compare) {
 		return false;
 	}
-	return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
-	       !resource.written && !resource.atomic;
+	return ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
+	         resource.mip_count == 1u) ||
+	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+	         resource.mip_count != 0u)) &&
+	       resource.read && !resource.written && !resource.atomic;
 }
 
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,
@@ -114,7 +117,7 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
 	         resource.mip_count == 1u) ||
-	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&
 	         resource.mip_count != 0u)) &&
 	       resource.written &&
 	       (!resource.atomic ||

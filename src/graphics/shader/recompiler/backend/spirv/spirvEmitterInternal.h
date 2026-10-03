@@ -19,6 +19,7 @@
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -337,13 +338,16 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+
 uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
-
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
+                          uint32_t mip = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
@@ -543,6 +547,45 @@ uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
 uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
+template <typename Fn>
+auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,
+                        uint32_t result_type, Fn&& emit) {
+	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
+	EXIT_IF(mip_count == 0u);
+	const auto merge_label = state.builder.AllocateId();
+	std::vector<uint32_t> labels(mip_count);
+	std::vector<uint32_t> words {spv::OpSwitch, mip_lod, merge_label};
+	for (uint32_t mip = 0; mip < mip_count; mip++) {
+		labels[mip] = state.builder.AllocateId();
+		words.push_back(mip);
+		words.push_back(labels[mip]);
+	}
+	if constexpr (has_result) {
+		words[2] = labels.front();
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(words);
+	std::vector<uint32_t> phi;
+	if constexpr (has_result) {
+		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
+	}
+	for (uint32_t mip = 0; mip < mip_count; mip++) {
+		EmitLabel(state, labels[mip]);
+		if constexpr (has_result) {
+			phi.push_back(emit(mip));
+			phi.push_back(state.current_label);
+		} else {
+			emit(mip);
+		}
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+	}
+	EmitLabel(state, merge_label);
+	if constexpr (has_result) {
+		state.builder.AddFunction(phi);
+		return phi[2];
+	}
+}
+
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();

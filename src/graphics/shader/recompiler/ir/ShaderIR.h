@@ -129,7 +129,7 @@ struct BufferResource {
 	bool operator==(const BufferResource& other) const = default;
 };
 
-enum class ImageMipMode { None, DynamicStorage };
+enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
@@ -148,6 +148,7 @@ struct ImageResource {
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
+	bool                          atomic64          = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
@@ -172,6 +173,7 @@ struct SamplerResource {
 	// bindless sampler array with the region base and entry count at bindless_mapping_offset.
 	bool     bindless                = false;
 	uint32_t bindless_mapping_offset = 0;
+	bool     gather_lod            = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -301,7 +303,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -314,8 +316,8 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -392,7 +394,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
 				return std::nullopt;
 			}
-			base = AtomicUintBinding;
+			base = AtomicUintBinding + (image.atomic64 ? 5u : 0u);
 		} else {
 			switch (image.numeric_class) {
 				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;

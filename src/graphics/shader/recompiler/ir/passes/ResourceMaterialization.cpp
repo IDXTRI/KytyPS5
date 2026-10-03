@@ -128,8 +128,8 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
-uint32_t StorageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
-	if (image.mip_mode != ImageMipMode::DynamicStorage || NullImageDescriptor(descriptor)) {
+uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
+	if (image.mip_mode != ImageMipMode::Dynamic || NullImageDescriptor(descriptor)) {
 		return 1;
 	}
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
@@ -488,10 +488,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
-		image.mip_count = StorageMipCount(base, descriptor);
+		image.mip_count = ImageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
-			    fmt::format("storage image descriptor {} has an invalid mip range", i));
+			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
@@ -522,10 +522,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 		// --no-float-image-atomics turns the R32 float case off.
-		const bool float_atomic =
-		    float_image_atomics && base.atomic && format == Prospero::BufferFormat::k32Float;
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt &&
-		    format != Prospero::BufferFormat::k32SInt && !float_atomic) {
+		const bool float_atomic = float_image_atomics && base.atomic && !base.atomic64 &&
+		                          format == Prospero::BufferFormat::k32Float;
+		if (base.atomic &&
+		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		                   : format != Prospero::BufferFormat::k32UInt &&
+		                         format != Prospero::BufferFormat::k32SInt && !float_atomic)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -1675,6 +1677,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 		if (!evaluate(source_index, snapshot.samplers[i])) {
 			return FailIndirect(__LINE__);
+		}
+		if (program.info.samplers[i].gather_lod) {
+			const auto control = snapshot.samplers[i].dwords[2];
+			const auto filter = (control >> 26u) & 3u;
+			// MipNone always selects the base level. Explicit point gathers currently require
+			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
+			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
+				return SpecializationFail(
+				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
+			}
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());

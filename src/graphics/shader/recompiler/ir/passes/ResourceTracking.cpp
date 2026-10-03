@@ -2867,15 +2867,20 @@ private:
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
-		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
-		                       ? ImageMipMode::DynamicStorage
-		                       : ImageMipMode::None;
+		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
+		                      memory.data_bits == 64u;
+		const bool dynamic_mip =
+		    (resource_class == ImageResourceClass::Storage && memory.image_has_mip) ||
+		    (op == ValueOpcode::ImageGatherRaw &&
+		     (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u);
+		const auto mip = dynamic_mip ? ImageMipMode::Dynamic : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -2891,6 +2896,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -3119,6 +3125,9 @@ private:
 				Fail(flags.pc, "sampler resource limit exceeded");
 				return;
 			}
+			m_info.samplers[sampler].gather_lod |=
+			    op == ValueOpcode::ImageGatherRaw &&
+			    (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
 			AddHandlePatch(sampler_handle, sampler, flags.pc);
 			AddSampledPair(resource, sampler, flags.pc);
 		}

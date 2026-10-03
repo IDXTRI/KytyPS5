@@ -228,6 +228,7 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicUMax32:
+		case ValueOpcode::ImageAtomicUMax64:
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
