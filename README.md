@@ -1,3 +1,38 @@
+# KytyPS5: Marvel's Wolverine build
+
+> [!NOTE]
+> **This is a fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) tuned for Marvel's Wolverine**
+> (PPSA03671, version 01.001.005). It is not the official KytyPS5 repository; for other games
+> and the latest KytyPS5, use [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
+
+**[Download the latest Wolverine build](https://github.com/IDXTRI/KytyPS5/releases/latest)**
+(Windows x64). Extract it, run `Play Wolverine.bat` and enter the folder that contains the game's
+`eboot.bin`. The `README.md` inside the download covers recommended settings, known issues and
+troubleshooting. You need your own dump of the game: no game files, keys or firmware are
+included.
+
+**Status:** test release. The opening areas are playable at roughly 12-30 fps on a Ryzen 7
+7800X3D + RTX 4070 Ti, with visual glitches (flickering shadows, a tiled moon) and occasional GPU
+crashes. Ray-traced effects are skipped.
+
+**What this fork adds** on top of KytyPS5 (release 2026-10-03, f53e5d2):
+
+- the Marvel's Wolverine work from KytyPS5 PR #937;
+- lower VRAM use (about 10-11 GB instead of 12.7 GB), GPU fault handling and safer texture
+  memory reuse;
+- streamed-texture updates, Wolverine fixes on the new KytyPS5 code, Xbox View button as the PS5
+  touchpad, and Wolverine's settings as defaults.
+
+**Credits:** KytyPS5 and its contributors; **Mac (itsmemac), Senaxx and Ali Almohaya** for the
+Marvel's Wolverine work (PR #937) and Senaxx's later fixes; **Jetsku** for the SPIR-V
+Function-array shrink pass; **DXTR** for this build.
+
+Not affiliated with Sony Interactive Entertainment, Insomniac Games or Marvel.
+
+---
+
+*The original KytyPS5 README follows.*
+
 # KytyPS5
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
