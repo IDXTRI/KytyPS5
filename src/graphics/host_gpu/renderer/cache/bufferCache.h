@@ -217,6 +217,9 @@ private:
 	FaultManager                                       m_fault_manager;
 	std::unique_ptr<Buffer>                            m_bda_verify_download;
 	std::vector<BdaVerifyRun>                          m_bda_verify_runs;
+	std::vector<vk::DeviceAddress>                     m_bda_verify_expected;
+	// Guest ranges any buffer ever covered (KYTY_BDA_VERIFY checks their pages for stale entries).
+	RangeSet                                           m_bda_ever_registered;
 	uint64_t                                           m_bda_verify_tick = 0;
 	std::chrono::steady_clock::time_point              m_bda_verify_last {};
 	Buffer                                             m_gds_buffer;

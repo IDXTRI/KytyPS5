@@ -374,6 +374,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_bda_ever_registered.Add(buffer.CpuAddress(), size_pages << CACHING_PAGEBITS);
 		m_total_used_memory += buffer.Size();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
@@ -1583,27 +1584,31 @@ void BufferCache::VerifyBdaPageTable() {
 		const auto* data       = download.Mapped().data();
 		uint64_t    pages      = 0;
 		uint64_t    mismatches = 0;
+		uint64_t    stale      = 0;
 		for (const auto& run: m_bda_verify_runs) {
 			for (uint64_t i = 0; i < run.pages; i++) {
 				vk::DeviceAddress actual = 0;
 				std::memcpy(&actual, data + run.download_offset + i * sizeof(actual), sizeof(actual));
-				const auto expected = run.first_address + (i << CACHING_PAGEBITS);
+				const auto expected = m_bda_verify_expected[run.first_address + i];
 				pages++;
 				if (actual == expected) {
 					continue;
 				}
+				stale += expected == 0 ? 1u : 0u;
 				if (mismatches++ < 16) {
 					std::printf("BDA verify: guest page 0x%" PRIx64 " GPU table 0x%" PRIx64
-					            " expected 0x%" PRIx64 "\n",
-					            run.guest_address + (i << CACHING_PAGEBITS), actual, expected);
+					            " expected 0x%" PRIx64 "%s\n",
+					            run.guest_address + (i << CACHING_PAGEBITS), actual, expected,
+					            expected == 0 ? " (no buffer: stale entry)" : "");
 					if (actual != 0) {
 						AddressBindingDescribe(actual);
 					}
 				}
 			}
 		}
-		std::printf("BDA verify: %" PRIu64 " pages of %zu buffers, %" PRIu64 " mismatches\n", pages,
-		            m_bda_verify_runs.size(), mismatches);
+		std::printf("BDA verify: %" PRIu64 " pages in %zu registered ranges, %" PRIu64
+		            " mismatches (%" PRIu64 " stale on pages without a buffer)\n",
+		            pages, m_bda_verify_runs.size(), mismatches, stale);
 		std::fflush(stdout);
 		m_bda_verify_tick = 0;
 		m_bda_verify_last = std::chrono::steady_clock::now();
@@ -1614,24 +1619,38 @@ void BufferCache::VerifyBdaPageTable() {
 	    std::chrono::steady_clock::now() - m_bda_verify_last < std::chrono::seconds(seconds)) {
 		return;
 	}
+	// Every guest range ever registered, not only live buffers: a page whose buffer is gone must
+	// read 0. Expected values are taken now, in recording order with the copy below.
 	m_bda_verify_runs.clear();
+	m_bda_verify_expected.clear();
 	uint64_t bytes = 0;
-	for (const auto& [address, id]: m_buffers) {
-		const auto& buffer = m_slot_buffers[id];
+	m_bda_ever_registered.ForEach([&](uint64_t start, uint64_t end) {
 		PageTable::PageRange range {};
-		if (!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), range)) {
-			continue;
+		if (!PageTable::TryGetPageRange(start, end - start, range)) {
+			return;
 		}
 		const auto pages = static_cast<uint64_t>(range.last_exclusive - range.first);
 		m_bda_verify_runs.push_back({
-		    .guest_address   = PageIndex(buffer.CpuAddress()) << CACHING_PAGEBITS,
-		    .table_offset    = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress),
+		    .guest_address   = start,
+		    .table_offset    = PageIndex(start) * sizeof(vk::DeviceAddress),
 		    .download_offset = bytes,
-		    .first_address   = buffer.BufferDeviceAddress(),
+		    .first_address   = m_bda_verify_expected.size(),
 		    .pages           = pages,
 		});
+		for (size_t page = range.first; page < range.last_exclusive; ++page) {
+			const auto* id     = m_page_table.Find(page);
+			const auto* buffer = id != nullptr && *id ? m_slot_buffers.try_get(*id) : nullptr;
+			vk::DeviceAddress expected = 0;
+			if (buffer != nullptr && buffer->HasDeviceAddress()) {
+				const auto page_address = static_cast<uint64_t>(page) << CACHING_PAGEBITS;
+				const auto first_page   = PageIndex(buffer->CpuAddress()) << CACHING_PAGEBITS;
+				const auto packed_page  = PageIndex(page_address) << CACHING_PAGEBITS;
+				expected                = buffer->BufferDeviceAddress() + (packed_page - first_page);
+			}
+			m_bda_verify_expected.push_back(expected);
+		}
 		bytes += pages * sizeof(vk::DeviceAddress);
-	}
+	});
 	if (bytes == 0) {
 		return;
 	}
