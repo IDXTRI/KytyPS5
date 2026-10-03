@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <iterator>
 
 namespace Libs::Graphics {
@@ -47,6 +48,17 @@ bool GraphicContext::CreateAllocator() {
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+	}
+	// KYTY_VMA_BLOCK_MB=N (environment, research): device memory blocks of N MiB instead of VMA's
+	// 256. A block returns to the driver only when it is empty; with Wolverine's texture and
+	// buffer churn, run 95 held 5.7 GiB of allocations in 8.8 GiB of blocks while the device was
+	// over its budget (Windows paged ~2-4 GB to system memory). Smaller blocks trap less.
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
+		const auto megabytes = std::strtoull(value, nullptr, 10);
+		if (megabytes >= 4 && megabytes <= 1024) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(megabytes) << 20u;
+			LOGF("VMA: %llu MiB blocks\n", static_cast<unsigned long long>(megabytes));
+		}
 	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
