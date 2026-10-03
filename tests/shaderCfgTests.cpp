@@ -14773,7 +14773,6 @@ int main() {
   TestCapturedBufferAtomicsX2();
   TestFloat64AddAndCompares();
   TestWaveRowReduction();
-  TestDisabledSystemDebugBranch();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

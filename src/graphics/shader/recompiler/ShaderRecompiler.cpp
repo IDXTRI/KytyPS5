@@ -28,6 +28,7 @@
 #include <fmt/format.h>
 #include <map>
 #include <climits>
+#include <cstring>
 #include <cstdlib>
 #include <optional>
 #include <set>
@@ -828,6 +829,31 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+
+	// Wolverine fork: KYTY_SKIP_BVH_DISPATCHES (default 1; 0 executes them) keeps skipping the
+	// programs with BVH intersections, as before upstream 337f4320 implemented them. Wolverine
+	// dispatches such compute programs (CS 0x29be8047c4e86afe) and ran with them skipped; the
+	// software traversal is untested in it and upstream's BVH GPU test loses the device here.
+	static const bool skip_bvh = [] {
+		const char* value = std::getenv("KYTY_SKIP_BVH_DISPATCHES");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (skip_bvh &&
+	    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.family == Decoder::Family::MIMG &&
+		           (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u);
+	    })) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: skipping dispatches of shaders with BVH intersections (shader=0x{:016x});"
+			    " KYTY_SKIP_BVH_DISPATCHES=0 executes them.\n",
+			    options.shader_hash));
+		}
+		TranslateResult skipped;
+		skipped.unsupported = true;
+		return skipped;
+	}
 
 	std::string decoded_dump;
 	// KYTY_DECODED_DUMP_DIR=<dir> (environment): the decoded RDNA2 of every program that already has

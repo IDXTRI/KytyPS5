@@ -3199,8 +3199,11 @@ void TestGuardedScalarDescriptorReads() {
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "disabled feature speculatively dereferenced its null BVH table");
         memory.data.words[7] = 1;
-        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
-              "active feature accepted an unreadable BVH table");
+        // Wolverine fork: a scalar read through a null base evaluates to 0 instead of failing
+        // (SrtWalker::EvaluateRawRead; CS 0x0b4b91abfed42248 guards its load with a null test the
+        // host cannot always decide). The reachable read is still attempted exactly once.
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
+              "active feature did not read its BVH table once through the null base");
       }
       memory.data.words[0x40 / 4] = 0x1080u;
       memory.data.watched_address = 0x10a8u;
@@ -3366,8 +3369,14 @@ void TestNestedBindlessDescriptorPhi(bool other_reads_heap) {
   fixture.Emit(ValueOpcode::ReferenceU32,
                {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
   if (other_reads_heap) {
-    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-               "a heap read at another record offset was taken as a free branch");
+    // Upstream 7804eef9 lowers a phi of host-evaluable descriptors to a finite set of sources:
+    // here every branch's key is user data, so the third record offset is a candidate, not a
+    // free branch (before the merge this shape was rejected).
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    Check(indirect && (indirect->bindless || indirect->sources.size() == 3),
+          "a heap read at another record offset was not kept as its own candidate");
     return;
   }
   fixture.PlanAndTrack();

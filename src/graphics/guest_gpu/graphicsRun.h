@@ -60,6 +60,8 @@ public:
 	void              Done();
 	// sceAgcSuspendPoint: a graphics-queue marker; blocks only while the previous one is pending.
 	void              SuspendPoint();
+	// Waits for guest command processing, including all compute queues (not GPU completion).
+	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -89,7 +91,6 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
-	void              WaitForIdle();
 	// Re-checks queues blocked in WAIT_REG_MEM (a label was published off the GPU thread).
 	void              Wake();
 	void              ProcessCommands();
