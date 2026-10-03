@@ -99,7 +99,12 @@ bool DriverCacheSignatureMatches(std::string_view cached, std::string_view curre
 	if (cached == current) {
 		return true;
 	}
-	static const bool any_revision = std::getenv("KYTY_PIPELINE_CACHE_ANY_REVISION") != nullptr;
+	// On by default in this build (updates and the launcher keep the warm cache);
+	// KYTY_PIPELINE_CACHE_ANY_REVISION=0 turns it off.
+	static const bool any_revision = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_ANY_REVISION");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	if (!any_revision) {
 		return false;
 	}
