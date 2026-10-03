@@ -25,6 +25,9 @@ void AddressBindingAnnotate(uint64_t handle, const char* event);
 // refers to one of its views.
 void AddressBindingNoteView(uint64_t view, uint64_t image);
 [[nodiscard]] uint64_t AddressBindingImageOfView(uint64_t view);
+// A draw wrote a view of the image into its descriptor set (GPU thread); the report lists the
+// recent draws that bound a released image.
+void AddressBindingNoteDescriptor(uint64_t image, uint64_t shader_hash);
 // Set by the bindless table: prints the slots (and keys) whose descriptor holds a view of the
 // image.
 void AddressBindingSetImageUserReporter(void (*reporter)(uint64_t image));

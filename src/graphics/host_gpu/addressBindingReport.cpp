@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/addressBindingReport.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -45,6 +47,47 @@ int64_t NowUs() {
 	return std::chrono::duration_cast<std::chrono::microseconds>(
 	           std::chrono::steady_clock::now().time_since_epoch())
 	    .count();
+}
+
+// The images draws wrote into descriptor sets, newest overwriting oldest (GPU thread writes;
+// read only by the device-loss report).
+struct DescriptorUse {
+	uint64_t image       = 0;
+	uint64_t shader_hash = 0;
+	int64_t  time_us     = 0;
+};
+constexpr size_t                     DescriptorRing = 1u << 20u;
+std::vector<DescriptorUse>           g_descriptor_ring(DescriptorRing);
+std::atomic<uint64_t>                g_descriptor_next {0};
+
+void PrintDescriptorUses(uint64_t image) {
+	const auto now   = NowUs();
+	const auto total = std::min<uint64_t>(g_descriptor_next.load(), DescriptorRing);
+	uint64_t   count = 0;
+	int64_t    first = 0;
+	int64_t    last  = 0;
+	std::map<uint64_t, uint64_t> shaders;
+	for (uint64_t i = 0; i < total; i++) {
+		const auto& use = g_descriptor_ring[i];
+		if (use.image != image) {
+			continue;
+		}
+		count++;
+		first = first == 0 ? use.time_us : std::min(first, use.time_us);
+		last  = std::max(last, use.time_us);
+		shaders[use.shader_hash]++;
+	}
+	if (count == 0) {
+		std::printf("      no draw descriptor bound it in the last %" PRIu64 " image bindings\n", total);
+		return;
+	}
+	std::printf("      draw descriptors bound it %" PRIu64 " times, first %.1f ms ago, last %.1f ms ago:",
+	            count, static_cast<double>(now - first) / 1000.0,
+	            static_cast<double>(now - last) / 1000.0);
+	for (const auto& [hash, uses]: shaders) {
+		std::printf(" 0x%016" PRIx64 " x%" PRIu64, hash, uses);
+	}
+	std::printf("\n");
 }
 
 const char* ObjectTypeName(uint32_t type) {
@@ -195,8 +238,14 @@ void AddressBindingDescribe(uint64_t address) {
 		if (g_image_user_reporter != nullptr) {
 			g_image_user_reporter(image);
 		}
+		PrintDescriptorUses(image);
 	}
 	std::fflush(stdout);
+}
+
+void AddressBindingNoteDescriptor(uint64_t image, uint64_t shader_hash) {
+	const auto index = g_descriptor_next.fetch_add(1, std::memory_order_relaxed) % DescriptorRing;
+	g_descriptor_ring[index] = {image, shader_hash, NowUs()};
 }
 
 } // namespace Libs::Graphics

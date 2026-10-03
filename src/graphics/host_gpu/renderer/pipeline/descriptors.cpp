@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -1498,9 +1499,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto image_start  = m_descriptor_images.size();
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
+				const bool note = m_context.GetGraphics().address_binding_report_enabled;
 				for (const auto resource: binding.resources) {
-					m_descriptor_images.push_back(MakeImageInfo(
-					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
+					const auto& texture = descriptors.images.at(resource);
+					m_descriptor_images.push_back(
+					    MakeImageInfo(texture, m_image_occurrences.at(resource)++));
+					if (note) {
+						if (const auto* image =
+						        m_context.GetTextureCache().m_slot_images.try_get(texture.image_id);
+						    image != nullptr) {
+							AddressBindingNoteDescriptor(
+							    reinterpret_cast<uint64_t>(static_cast<VkImage>(image->backing.image)),
+							    program.shader_hash);
+						}
+					}
 				}
 			} else {
 				switch (binding.kind) {
