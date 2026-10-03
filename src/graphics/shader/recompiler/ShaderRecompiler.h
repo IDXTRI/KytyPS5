@@ -36,7 +36,6 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
-	bool        skip_dispatch = false;
 	// Research: user-data dwords (indices into CompileOptions::user_data) that held the targets
 	// of inlined calls. The program is valid only while they hold the same values.
 	std::vector<uint32_t> call_target_user_data;

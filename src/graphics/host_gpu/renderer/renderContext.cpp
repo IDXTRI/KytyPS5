@@ -200,6 +200,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.
+");
+		m_bda_logged = true;
+	}
 	// Every cached buffer is synchronized so a global-memory shader sees the CPU's writes.
 	// That walk touched every buffer per dispatch (a quarter of the GPU thread in the
 	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.

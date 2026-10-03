@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -133,7 +134,6 @@ public:
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
-	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
 
 	template <typename T>
@@ -152,66 +152,29 @@ public:
 	}
 
 private:
+	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
+	static constexpr uint8_t InlineArity = 4;
+	static constexpr uint8_t PhiArity = UINT8_MAX;
+
 	ValueOpcode         opcode;
+	uint8_t             num_args;
+	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	std::vector<Value>  args;
-	std::vector<Block*> phi_blocks;
+	union {
+		std::array<Value, InlineArity> fixed_args {};
+		std::vector<Value> large_args;
+		std::vector<std::pair<Block*, Value>> phi_args;
+	};
 	std::vector<Use>    uses;
 };
 
-// The accessors the IR passes and the resource walker call for every operand, inline: out of
-// line they were a fifth of the GPU thread's resource walk (calls, no LTO).
-inline bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-inline bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-inline bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-inline bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
-inline Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
-inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
-}
-
-inline uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
-inline size_t Inst::NumArgs() const {
-	return args.size();
-}
-
-inline Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= args.size());
-	return args[index];
-}
-
-inline ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
+static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

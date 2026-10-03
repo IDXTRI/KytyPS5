@@ -91,6 +91,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	// A subgroup larger than a host mesh workgroup may be (VK_EXT_mesh_shader limits) runs its
 	// waves in this many sequential passes of equal size, each on the whole workgroup.
 	uint32_t passes               = 1;
+	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t Waves() const {
 		return (threads_num[0] * threads_num[1] * threads_num[2] + wave_size - 1u) / wave_size;

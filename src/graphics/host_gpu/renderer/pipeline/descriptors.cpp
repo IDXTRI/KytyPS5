@@ -33,6 +33,8 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <unordered_set>
+#include <mutex>
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
@@ -1081,8 +1083,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
-	prepared.buffer_sources.clear();
-	prepared.buffers.clear();
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
@@ -1372,6 +1372,75 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
+	}
+	// The host evaluated these scalar reads (branch inputs, descriptor selections) from memory as
+	// it was before the draw or dispatch. Upstream (6409be28) exits when a bound shader may write
+	// them; Wolverine does this (CS 0x85a58319a7a75e48 reads a branch input from a buffer the same
+	// dispatch updates) and renders correctly with the pre-dispatch values, as the walk did before
+	// this check (KYTY_IGNORE_WRITTEN_OVERLAP=1). Each reader/writer pair is reported once.
+	const auto report_overlap = [](const char* what, uint64_t reader_hash, uint64_t writer_hash,
+	                               uint64_t address, uint64_t size, uint64_t written_address,
+	                               uint64_t written_size) {
+		static std::mutex                   reported_mutex;
+		static std::unordered_set<uint64_t> reported;
+		std::scoped_lock                    lock(reported_mutex);
+		if (reported.insert(reader_hash ^ (writer_hash << 1u) ^ reinterpret_cast<uintptr_t>(what))
+		        .second) {
+			LOGF("Warning: scalar resource reads overlap %s: reader 0x%016" PRIx64 " reads 0x%" PRIx64
+			     "+0x%" PRIx64 ", writer 0x%016" PRIx64 " writes 0x%" PRIx64 "+0x%" PRIx64 "
+",
+			     what, reader_hash, address, size, writer_hash, written_address, written_size);
+		}
+	};
+	for (const auto* reader: prepared_bindings) {
+		const auto& reads = reader->runtime->resources->specialization_reads;
+		if (reads.empty()) continue;
+		const auto reader_hash = reader->runtime->program->shader_hash;
+		for (const auto* writer: prepared_bindings) {
+			if (writer->runtime->program->has_address_writes) {
+				report_overlap("shader address writes (unprovable)", reader_hash,
+				               writer->runtime->program->shader_hash, 0, 0, 0, 0);
+			}
+		}
+		for (const auto [address, size]: reads) {
+			for (const auto id: m_bound_images) {
+				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+				if (image == nullptr ||
+				    (!image->binding.shader_write && !image->binding.is_target)) continue;
+				for (const auto written: {image->info.data, image->info.stencil,
+				                          image->info.metadata.range}) {
+					if (written.size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written.size)) {
+						report_overlap("an image or attachment write", reader_hash, 0, address, size,
+						               written.address, written.size);
+					}
+				}
+			}
+			for (const auto* writer: prepared_bindings) {
+				const auto& program = *writer->runtime->program;
+				const auto& extents = writer->runtime->resources->buffer_write_extents;
+				for (uint32_t i = 0; i < writer->buffer_sources.size(); ++i) {
+					const auto resource = program.bindings.descriptors.front().resources[i];
+					if (!program.info.buffers[resource].written) continue;
+					const auto& written = writer->buffer_sources[i];
+					// The bytes the dispatch can store to, when its stores are bounded: a heap-wide
+					// V# otherwise covers every descriptor read in the heap.
+					auto written_address = written.address;
+					auto written_size    = written.size;
+					if (resource < extents.size() && extents[resource].valid) {
+						written_address += extents[resource].begin;
+						written_size = extents[resource].end > extents[resource].begin
+						                   ? extents[resource].end - extents[resource].begin
+						                   : 0;
+					}
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written_address, written_size)) {
+						report_overlap("a shader buffer write", reader_hash, program.shader_hash,
+						               address, size, written_address, written_size);
+					}
+				}
+			}
+		}
 	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();

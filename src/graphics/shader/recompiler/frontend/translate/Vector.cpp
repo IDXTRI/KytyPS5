@@ -129,6 +129,22 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitInteger64CompareVia(inst, IR::ValueOpcode::ULessThan64, false, true, false);
 			return;
 
+		case O::V_CMP_LT_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMP_LE_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMP_LE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMPX_LE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual64, IR::Type::U64, false, true);
+			return;
+		case O::V_CMP_GE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual64, IR::Type::U64, false, false);
+			return;
+
 		case O::V_CMP_EQ_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, false, false);
 			return;
@@ -207,6 +223,18 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false, false); return;
 		case O::V_CMP_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, false);
+			return;
+		case O::V_CMP_EQ_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual64, false, false);
+			return;
+		case O::V_CMP_LE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, false, false);
+			return;
+		case O::V_CMPX_LE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, false, true);
+			return;
+		case O::V_CMPX_GE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual64, false, true);
 			return;
 		case O::V_CMPX_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, true);
@@ -310,7 +338,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_LE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, true, true);
 			return;
-		case O::V_CMP_NGE_F16: // not (a >= b): unordered less-than
+		case O::V_CMP_NGE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThan32, true, false);
 			return;
 		case O::V_CMP_NGT_F16:

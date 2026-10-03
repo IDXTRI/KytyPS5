@@ -617,7 +617,6 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
-		bool                                        skip_dispatch = false;
 		std::vector<MemoSlot>                        memo;
 	};
 
@@ -851,9 +850,6 @@ struct PipelineCache::ProgramCache {
 			}
 			entry = programs.find(lookup_key);
 		}
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
 		NotePredictability(stage, entry != programs.end() ? &entry->second : nullptr, user_data);
 		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
 		ShaderRecompiler::IR::SrtRuntime runtime {
@@ -970,11 +966,6 @@ struct PipelineCache::ProgramCache {
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
 		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch = true;
-			return {};
-		}
 		if (!translated.unsupported && !translated.call_target_user_data.empty() &&
 		    call_targets.try_emplace(params.hash, translated.call_target_user_data).second) {
 			for (const auto index: translated.call_target_user_data) {
@@ -1404,6 +1395,19 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	// Use one effective size for the cache key, LDS declaration, and access bounds.
+	const auto max_lds_dwords =
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+	if (input_info.lds_size_dwords > max_lds_dwords) {
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
+			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
+			                 "be incorrect.",
+			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
+		}
+	}
+	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }

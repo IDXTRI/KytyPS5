@@ -783,14 +783,6 @@ bool InlineSubroutineCalls(std::span<const uint32_t> code, const Decoder::Progra
 
 } // namespace
 
-// Research: KYTY_TRANSLATE_BVH=1 decodes through IMAGE_BVH_INTERSECT_RAY and translates it in
-// software (frontend/translate/Bvh.cpp) instead of skipping the dispatch. Opt-in: a wrong result
-// can leave a guest traversal loop spinning on the GPU.
-static bool TranslateBvh() {
-	static const bool enabled = std::getenv("KYTY_TRANSLATE_BVH") != nullptr;
-	return enabled;
-}
-
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	if (code.empty()) {
@@ -827,33 +819,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
-		Decoder::DecodeProgram(code, decoded, TranslateBvh());
+		Decoder::DecodeProgram(code, decoded);
 		if (InlineSubroutineCalls(code, decoded, options, joined_code, call_target_user_data)) {
-			Decoder::DecodeProgram(joined_code, decoded, TranslateBvh());
+			Decoder::DecodeProgram(joined_code, decoded);
 		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
-
-	if (decoded.has_bvh && !decoded.bvh_truncated) {
-		LOGF("%s BVH intersection translated in software: hash=0x%016" PRIx64 "\n",
-		     GetDumpLabel(options), options.shader_hash);
-	}
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.bvh_truncated) {
-		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			const auto& bvh = decoded.instructions.back();
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    options.shader_hash, bvh.pc, bvh.opcode_id));
-		}
-		return {.skip_dispatch = true};
-	}
 
 	std::string decoded_dump;
 	// KYTY_DECODED_DUMP_DIR=<dir> (environment): the decoded RDNA2 of every program that already has
@@ -956,14 +930,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
 		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
 		     GetDumpLabel(options), options.shader_hash, folded);
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
@@ -972,14 +946,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
-		IR::EliminateDeadCode(ir.blocks);
-	}
-	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
-		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
-		     GetDumpLabel(options), options.shader_hash, removed);
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	if (!LowerTessellationMemory(ir, options)) {
@@ -1042,7 +1011,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
-	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);

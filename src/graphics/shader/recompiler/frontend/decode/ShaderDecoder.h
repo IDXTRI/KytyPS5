@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -361,6 +365,10 @@ enum class Opcode {
 	V_CMP_NEQ_F32,
 	V_CMP_NLT_F32,
 	V_CMP_TRU_F32,
+	V_CMP_EQ_F64,
+	V_CMP_LE_F64,
+	V_CMPX_LE_F64,
+	V_CMPX_GE_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,
@@ -529,6 +537,7 @@ enum class Opcode {
 	FLAT_STORE_DWORDX3,
 	FLAT_STORE_DWORDX4,
 	DS_ADD_U32,
+	DS_ADD_U64,
 	DS_ADD_RTN_U32,
 	DS_SUB_U32,
 	DS_SUB_RTN_U32,
@@ -587,6 +596,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_LOD,
@@ -595,6 +605,7 @@ enum class Opcode {
 	IMAGE_STORE,
 	IMAGE_STORE_MIP,
 	IMAGE_ATOMIC_SWAP,
+	IMAGE_ATOMIC_CMPSWAP,
 	IMAGE_ATOMIC_ADD,
 	IMAGE_ATOMIC_SMIN,
 	IMAGE_ATOMIC_UMIN,
@@ -660,9 +671,7 @@ enum class OperandKind {
 	M0,
 	PopsExitingWaveId,
 	SharedBase,
-	SharedLimit,
 	PrivateBase,
-	PrivateLimit,
 	Null,
 	Vgpr,
 	// A special register the recompiler does not model;
@@ -777,10 +786,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
-	// Decoding stopped at a BVH instruction that is not translated (every one unless
-	// translate_bvh; the 64-bit form and malformed encodings always).
-	bool                     bvh_truncated = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
@@ -788,7 +793,7 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program, bool translate_bvh = false);
+void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 

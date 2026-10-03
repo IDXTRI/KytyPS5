@@ -167,6 +167,7 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicFMax32:
 		case ValueOpcode::SharedAtomicSwap32:
 		case ValueOpcode::SharedAtomicIAdd32:
+		case ValueOpcode::SharedAtomicIAdd64:
 		case ValueOpcode::SharedAtomicISub32:
 		case ValueOpcode::SharedAtomicInc32:
 		case ValueOpcode::SharedAtomicDec32:
@@ -186,6 +187,7 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 
 uint32_t SharedComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
+		case ValueOpcode::SharedAtomicIAdd64:
 		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::LoadSharedU32x2:
 		case ValueOpcode::WriteSharedU32x2: return 2u;
@@ -219,6 +221,7 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
+		case ValueOpcode::ImageAtomicCompareSwap32:
 		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicSMin32:

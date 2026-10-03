@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <thread>
 #include <unordered_map>
@@ -60,6 +61,8 @@ public:
 	void              Done();
 	// sceAgcSuspendPoint: a graphics-queue marker; blocks only while the previous one is pending.
 	void              SuspendPoint();
+	// Waits for guest command processing, including all compute queues (not GPU completion).
+	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -80,7 +83,6 @@ private:
 		std::span<const uint32_t> constant_commands;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;
-		bool                      reset_processor   = false;
 		bool                      started           = false;
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
@@ -89,7 +91,6 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
-	void              WaitForIdle();
 	// Re-checks queues blocked in WAIT_REG_MEM (a label was published off the GPU thread).
 	void              Wake();
 	void              ProcessCommands();
@@ -101,7 +102,6 @@ private:
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
-	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
 	std::mutex                                     m_shutdown_mutex;
 	Common::CondVar                                m_work_available;
@@ -116,7 +116,6 @@ private:
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
-	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;

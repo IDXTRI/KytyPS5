@@ -94,6 +94,7 @@ private:
 	int64_t                   m_last_gc_us            = 0;
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
+	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

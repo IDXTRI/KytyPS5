@@ -1309,18 +1309,26 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::LogicalAnd:
-			if (binary()) {
-				result = (a != 0u) && (b != 0u);
+		case ValueOpcode::LogicalAnd: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a == 0u) {
+				result = 0u;
 				return true;
 			}
-			return false;
-		case ValueOpcode::LogicalOr:
-			if (binary()) {
-				result = (a != 0u) || (b != 0u);
+			if (!Arg(inst, 1, b) || (b != 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
+		case ValueOpcode::LogicalOr: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a != 0u) {
+				result = 1u;
 				return true;
 			}
-			return false;
+			if (!Arg(inst, 1, b) || (b == 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
 		case ValueOpcode::LogicalXor:
 			if (binary()) {
 				result = (a != 0u) != (b != 0u);
@@ -1373,91 +1381,9 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
-std::span<const uint8_t> SrtWalker::FindActiveSources() {
-	if (m_program.control_flow.empty()) {
-		return {};
-	}
-	// 0 false, 1 true, 2 not evaluated (no condition, no strict reader, or unreadable).
-	const auto outcome_of = [&](uint32_t index) -> uint8_t {
-		const auto& block = m_program.control_flow[index];
-		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
-			return 2u;
-		}
-		uint32_t condition = 0;
-		bool     known     = false;
-		if (UseNativeTables()) {
-			uint64_t wide = 0;
-			known         = EvaluateNative(m_native->Conditions()[index], wide);
-			condition     = static_cast<uint32_t>(wide);
-		} else if (m_compiled != nullptr) {
-			known = EvaluateRoot(m_compiled->conditions[index], block.condition, condition);
-		} else {
-			known = Evaluate(block.condition, condition);
-		}
-		return known ? (condition != 0u ? 1u : 0u) : 2u;
-	};
-	// The walk is a function of the outcomes it sees: if the last walk's conditions give the same
-	// outcomes again, in order, its result stands (the conditions are memoized, so re-evaluating
-	// them reads nothing new).
-	const bool replay   = UseNativeTables();
-	bool       replayed = false;
-	if (replay && m_program.active_walk_valid) {
-		replayed = true;
-		for (const auto& [index, outcome]: m_program.active_walk) {
-			if (outcome_of(index) != outcome) {
-				replayed = false;
-				break;
-			}
-		}
-		// KYTY_SRT_NATIVE_VERIFY=1 walks anyway and compares below.
-		if (replayed && !NativeVerify()) {
-			return m_program.active_walk_result;
-		}
-	}
-	auto& active = m_program.active_sources;
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			active.at(source) = 0u;
-		}
-	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	auto& walk    = m_program.active_walk;
-	visited.assign(m_program.control_flow.size(), 0u);
-	pending.clear();
-	pending.push_back(0u);
-	walk.clear();
-	while (!pending.empty()) {
-		const auto index = pending.back();
-		pending.pop_back();
-		if (visited.at(index)) {
-			continue;
-		}
-		visited[index]    = 1u;
-		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) {
-			active[source] = 1u;
-		}
-		const auto outcome = outcome_of(index);
-		walk.emplace_back(index, outcome);
-		if (outcome != 2u) {
-			pending.push_back(block.successors[outcome != 0u ? 0u : 1u]);
-		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-		}
-	}
-	if (replayed && active != m_program.active_walk_result) {
-		EXIT("SRT active sources: a replayed walk differs from the full walk (shader %016" PRIx64
-		     ")\n", m_program.shader_hash);
-	}
-	if (replay) {
-		m_program.active_walk_result = active;
-		m_program.active_walk_valid  = true;
-	}
-	return active;
-}
-
+// Refreshes the flat buffer's reachable scalar reads and the active descriptor sources in one
+// walk of the resource control flow (upstream 6409be28), with our evaluators (native tables,
+// compiled plans) and the replay of the last walk when its conditions give the same outcomes.
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	// A failure skips the draw or dispatch; say which SRT read failed (capped).
 	static std::atomic<uint32_t> reported {0};
@@ -1483,8 +1409,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) {
 		return report("SRT plan incomplete", 0, 0, false);
 	}
-	flat.resize(m_program.srt_reads.size());
-	for (size_t index = 0; index < m_program.srt_reads.size(); index++) {
+	const auto refresh = [&](uint32_t index) {
+		if (index >= m_program.srt_reads.size()) {
+			return report("read index out of range", index, 0, false);
+		}
 		const auto& read  = m_program.srt_reads[index];
 		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
@@ -1501,7 +1429,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				return report("value unreadable", index, read.flat_offset, clean);
 			}
 			flat[read.flat_offset] = static_cast<uint32_t>(wide);
-			continue;
+			return true;
 		}
 		if (!(evaluator.m_compiled != nullptr
 		          ? evaluator.EvaluateRoot(evaluator.m_compiled->srt_reads[index], read.value,
@@ -1509,6 +1437,100 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		          : evaluator.Evaluate(read.value, flat[read.flat_offset]))) {
 			return report("value unreadable", index, read.flat_offset, clean);
 		}
+		return true;
+	};
+	auto& active = m_program.active_sources;
+	if (m_program.control_flow.empty()) {
+		active.clear();
+		flat.resize(m_program.srt_reads.size());
+		for (uint32_t index = 0; index < m_program.srt_reads.size(); ++index) {
+			if (!refresh(index)) return false;
+		}
+		return true;
+	}
+	flat.assign(m_program.srt_reads.size(), 0u);
+	// Branch conditions read memory the shader may write, so the clean evaluator decides them.
+	auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	// 0 false, 1 true, 2 not evaluated (no condition, no strict reader, or unreadable).
+	const auto outcome_of = [&](uint32_t index) -> uint8_t {
+		const auto& block = m_program.control_flow[index];
+		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
+			return 2u;
+		}
+		uint32_t condition = 0;
+		bool     known     = false;
+		if (predicate.UseNativeTables()) {
+			uint64_t wide = 0;
+			known         = predicate.EvaluateNative(predicate.m_native->Conditions()[index], wide);
+			condition     = static_cast<uint32_t>(wide);
+		} else if (predicate.m_compiled != nullptr) {
+			known = predicate.EvaluateRoot(predicate.m_compiled->conditions[index], block.condition,
+			                               condition);
+		} else {
+			known = predicate.Evaluate(block.condition, condition);
+		}
+		return known ? (condition != 0u ? 1u : 0u) : 2u;
+	};
+	// The walk is a function of the outcomes it sees: if the last walk's conditions give the same
+	// outcomes again, in order, it visits the same blocks (the conditions are memoized, so
+	// re-evaluating them reads nothing new); only their scalar reads are refreshed.
+	const bool replay   = predicate.UseNativeTables();
+	bool       replayed = false;
+	if (replay && m_program.active_walk_valid) {
+		replayed = true;
+		for (const auto& [index, outcome]: m_program.active_walk) {
+			if (outcome_of(index) != outcome) {
+				replayed = false;
+				break;
+			}
+		}
+		// KYTY_SRT_NATIVE_VERIFY=1 walks anyway and compares below.
+		if (replayed && !NativeVerify()) {
+			for (const auto& [index, outcome]: m_program.active_walk) {
+				for (const auto slot: m_program.control_flow[index].srt_reads) {
+					if (!refresh(slot)) return false;
+				}
+			}
+			active = m_program.active_walk_result;
+			return true;
+		}
+	}
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto source: block.sources) active.at(source) = 0u;
+	}
+	auto& visited = m_program.visited_blocks;
+	auto& pending = m_program.pending_blocks;
+	auto& walk    = m_program.active_walk;
+	visited.assign(m_program.control_flow.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	walk.clear();
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited.at(index)) continue;
+		visited[index] = 1u;
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto slot: block.srt_reads) {
+			if (!refresh(slot)) return false;
+		}
+		const auto outcome = outcome_of(index);
+		walk.emplace_back(index, outcome);
+		if (outcome != 2u) {
+			pending.push_back(block.successors[outcome != 0u ? 0u : 1u]);
+		} else {
+			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	if (replayed && active != m_program.active_walk_result) {
+		EXIT("SRT active sources: a replayed walk differs from the full walk (shader %016" PRIx64
+		     ")\n", m_program.shader_hash);
+	}
+	if (replay) {
+		m_program.active_walk_result = active;
+		m_program.active_walk_valid  = true;
 	}
 	return true;
 }

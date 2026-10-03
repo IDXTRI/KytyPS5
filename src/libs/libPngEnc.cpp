@@ -3,14 +3,17 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <mutex>
-#include <vector>
+#include <new>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
+#define STBIWDEF static inline
 #define STBI_WRITE_NO_STDIO
 #include "stb_image_write.h"
 
@@ -20,24 +23,24 @@ LIB_VERSION("PngEnc", 1, "PngEnc", 1, 1);
 
 namespace PngEnc {
 
-constexpr int32_t PNG_ENC_ERROR_INVALID_ADDR    = -2140602111; // 0x80690101
-constexpr int32_t PNG_ENC_ERROR_INVALID_SIZE    = -2140602110; // 0x80690102
-constexpr int32_t PNG_ENC_ERROR_INVALID_PARAM   = -2140602109; // 0x80690103
-constexpr int32_t PNG_ENC_ERROR_INVALID_HANDLE  = -2140602108; // 0x80690104
-constexpr int32_t PNG_ENC_ERROR_DATA_OVERFLOW   = -2140602096; // 0x80690110
-constexpr int32_t PNG_ENC_ERROR_FATAL           = -2140602080; // 0x80690120
+constexpr int32_t PNG_ENC_ERROR_INVALID_ADDR   = -2140602111; // 0x80690101
+constexpr int32_t PNG_ENC_ERROR_INVALID_SIZE   = -2140602110; // 0x80690102
+constexpr int32_t PNG_ENC_ERROR_INVALID_PARAM  = -2140602109; // 0x80690103
+constexpr int32_t PNG_ENC_ERROR_INVALID_HANDLE = -2140602108; // 0x80690104
+constexpr int32_t PNG_ENC_ERROR_DATA_OVERFLOW  = -2140602096; // 0x80690110
+constexpr int32_t PNG_ENC_ERROR_FATAL          = -2140602080; // 0x80690120
 
-constexpr uint32_t PNG_ENC_MAX_IMAGE_WIDTH        = 1000000;
-constexpr uint32_t PNG_ENC_MAX_FILTER_NUMBER      = 4;
-constexpr uint16_t PNG_ENC_COLOR_SPACE_RGB        = 3;
-constexpr uint16_t PNG_ENC_COLOR_SPACE_RGBA       = 19;
-constexpr uint16_t PNG_ENC_PIXEL_FORMAT_R8G8B8A8  = 0;
-constexpr uint16_t PNG_ENC_PIXEL_FORMAT_B8G8R8A8  = 1;
-constexpr uint16_t PNG_ENC_FILTER_TYPE_NONE       = 0;
-constexpr uint16_t PNG_ENC_FILTER_TYPE_SUB        = 1;
-constexpr uint16_t PNG_ENC_FILTER_TYPE_UP         = 2;
-constexpr uint16_t PNG_ENC_FILTER_TYPE_AVERAGE    = 4;
-constexpr uint16_t PNG_ENC_FILTER_TYPE_PAETH      = 8;
+constexpr uint32_t PNG_ENC_MAX_IMAGE_WIDTH       = 1000000;
+constexpr uint32_t PNG_ENC_MAX_IMAGE_HEIGHT      = 1000000;
+constexpr uint32_t PNG_ENC_MAX_FILTER_NUMBER     = 4;
+constexpr uint16_t PNG_ENC_COLOR_SPACE_RGB       = 3;
+constexpr uint16_t PNG_ENC_COLOR_SPACE_RGBA      = 19;
+constexpr uint16_t PNG_ENC_PIXEL_FORMAT_R8G8B8A8 = 0;
+constexpr uint16_t PNG_ENC_PIXEL_FORMAT_B8G8R8A8 = 1;
+constexpr uint16_t PNG_ENC_FILTER_TYPE_SUB       = 1;
+constexpr uint16_t PNG_ENC_FILTER_TYPE_UP        = 2;
+constexpr uint16_t PNG_ENC_FILTER_TYPE_AVERAGE   = 4;
+constexpr uint16_t PNG_ENC_FILTER_TYPE_PAETH     = 8;
 
 struct PngEncCreateParam {
 	uint32_t this_size;
@@ -73,6 +76,7 @@ static_assert(sizeof(PngEncEncodeParam) == 48);
 struct PngEncContext {
 	uint64_t magic;
 	uint32_t max_image_width;
+	uint32_t max_filter_number;
 };
 
 constexpr uint64_t PNG_ENC_CONTEXT_MAGIC = 0x4b595459504e4745ull; // KYTYPNGE
@@ -90,7 +94,8 @@ static std::mutex g_png_enc_mutex;
 static void PngEncWrite(void* context, void* data, int size) {
 	auto* writer = static_cast<PngEncWriter*>(context);
 
-	if (size < 0 || static_cast<uint64_t>(writer->size) + static_cast<uint32_t>(size) > writer->capacity) {
+	if (writer->overflow || size < 0 ||
+	    static_cast<uint64_t>(writer->size) + static_cast<uint32_t>(size) > writer->capacity) {
 		writer->overflow = true;
 		return;
 	}
@@ -99,17 +104,25 @@ static void PngEncWrite(void* context, void* data, int size) {
 	writer->size += static_cast<uint32_t>(size);
 }
 
-// Returns the stb filter to force (0 none, 1 sub, 2 up, 3 average, 4 paeth), or -1 to let stb
-// choose per row when the guest allows more than one filter.
 static int PngEncForcedFilter(uint16_t filter_type) {
-	switch (filter_type) {
-		case PNG_ENC_FILTER_TYPE_NONE: return 0;
-		case PNG_ENC_FILTER_TYPE_SUB: return 1;
-		case PNG_ENC_FILTER_TYPE_UP: return 2;
-		case PNG_ENC_FILTER_TYPE_AVERAGE: return 3;
-		case PNG_ENC_FILTER_TYPE_PAETH: return 4;
-		default: return -1;
+	if (filter_type == (PNG_ENC_FILTER_TYPE_SUB | PNG_ENC_FILTER_TYPE_UP |
+	                    PNG_ENC_FILTER_TYPE_AVERAGE | PNG_ENC_FILTER_TYPE_PAETH)) {
+		return -1;
 	}
+	// stb's adaptive mode cannot restrict itself to the guest's filter mask.
+	if ((filter_type & PNG_ENC_FILTER_TYPE_SUB) != 0) {
+		return 1;
+	}
+	if ((filter_type & PNG_ENC_FILTER_TYPE_UP) != 0) {
+		return 2;
+	}
+	if ((filter_type & PNG_ENC_FILTER_TYPE_AVERAGE) != 0) {
+		return 3;
+	}
+	if ((filter_type & PNG_ENC_FILTER_TYPE_PAETH) != 0) {
+		return 4;
+	}
+	return 0;
 }
 
 static int32_t ValidateCreateParam(const PngEncCreateParam* param) {
@@ -122,7 +135,8 @@ static int32_t ValidateCreateParam(const PngEncCreateParam* param) {
 	LOGF("\t max_image_width   = %" PRIu32 "\n", param->max_image_width);
 	LOGF("\t max_filter_number = %" PRIu32 "\n", param->max_filter_number);
 
-	if (param->attribute != 0 || param->max_filter_number > PNG_ENC_MAX_FILTER_NUMBER) {
+	if (param->this_size != sizeof(PngEncCreateParam) || param->attribute != 0 ||
+	    param->max_filter_number > PNG_ENC_MAX_FILTER_NUMBER) {
 		return PNG_ENC_ERROR_INVALID_PARAM;
 	}
 
@@ -162,10 +176,11 @@ static int32_t KYTY_SYSV_ABI PngEncCreate(const PngEncCreateParam* param, void* 
 		return PNG_ENC_ERROR_INVALID_SIZE;
 	}
 
-	auto* ctx            = static_cast<PngEncContext*>(memory_address);
-	ctx->magic           = PNG_ENC_CONTEXT_MAGIC;
-	ctx->max_image_width = param->max_image_width;
-	*handle              = ctx;
+	auto* ctx              = static_cast<PngEncContext*>(memory_address);
+	ctx->magic             = PNG_ENC_CONTEXT_MAGIC;
+	ctx->max_image_width   = param->max_image_width;
+	ctx->max_filter_number = param->max_filter_number;
+	*handle                = ctx;
 
 	return 0;
 }
@@ -200,7 +215,8 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 	LOGF("\t filter_type       = %" PRIu16 "\n", param->filter_type);
 	LOGF("\t compression_level = %" PRIu16 "\n", param->compression_level);
 
-	if (param->image_mem_addr == nullptr || param->png_mem_addr == nullptr) {
+	if (param->image_mem_addr == nullptr || param->png_mem_addr == nullptr ||
+	    (reinterpret_cast<uintptr_t>(param->image_mem_addr) & 3u) != 0) {
 		return PNG_ENC_ERROR_INVALID_ADDR;
 	}
 
@@ -209,37 +225,52 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 		return PNG_ENC_ERROR_INVALID_PARAM;
 	}
 
-	if (param->color_space != PNG_ENC_COLOR_SPACE_RGB && param->color_space != PNG_ENC_COLOR_SPACE_RGBA) {
+	if (param->color_space != PNG_ENC_COLOR_SPACE_RGB &&
+	    param->color_space != PNG_ENC_COLOR_SPACE_RGBA) {
 		return PNG_ENC_ERROR_INVALID_PARAM;
 	}
 
-	// The source is always 8 bits per channel; 16-bit output is not implemented
-	if (param->bit_depth != 8) {
-		LOGF("\t unsupported bit depth\n");
+	if (param->bit_depth != 8 || param->clut_number != 0 || param->compression_level > 9) {
 		return PNG_ENC_ERROR_INVALID_PARAM;
 	}
 
-	const uint32_t width     = param->image_width;
-	const uint32_t height    = param->image_height;
-	const uint32_t min_pitch = width * 4u;
-	const uint32_t pitch     = (param->image_pitch == 0 ? min_pitch : param->image_pitch);
+	constexpr uint16_t filter_mask = PNG_ENC_FILTER_TYPE_SUB | PNG_ENC_FILTER_TYPE_UP |
+	                                 PNG_ENC_FILTER_TYPE_AVERAGE | PNG_ENC_FILTER_TYPE_PAETH;
+	if ((param->filter_type & ~filter_mask) != 0 ||
+	    static_cast<uint32_t>(std::popcount(param->filter_type)) > ctx->max_filter_number) {
+		return PNG_ENC_ERROR_INVALID_PARAM;
+	}
 
-	if (width == 0 || height == 0 || width > ctx->max_image_width || height > 0x7fffffffu / min_pitch ||
-	    param->png_mem_size == 0 || pitch < min_pitch ||
-	    static_cast<uint64_t>(pitch) * (height - 1u) + min_pitch > param->image_mem_size) {
+	const uint32_t width  = param->image_width;
+	const uint32_t height = param->image_height;
+	if (width == 0 || height == 0 || width > ctx->max_image_width ||
+	    width > PNG_ENC_MAX_IMAGE_WIDTH || height > PNG_ENC_MAX_IMAGE_HEIGHT) {
 		return PNG_ENC_ERROR_INVALID_SIZE;
 	}
 
-	// Repack the rows into tightly packed RGB or RGBA for stb_image_write
 	const int      components = (param->color_space == PNG_ENC_COLOR_SPACE_RGBA ? 4 : 3);
-	const bool     bgr        = (param->pixel_format == PNG_ENC_PIXEL_FORMAT_B8G8R8A8);
 	const uint32_t row_size   = width * static_cast<uint32_t>(components);
+	const uint32_t min_pitch  = width * 4u;
+	const uint32_t pitch      = param->image_pitch;
 
-	std::vector<uint8_t> pixels(static_cast<size_t>(row_size) * height);
+	// Leave room for deflate expansion and stb's signed-int buffer-capacity doubling.
+	constexpr uint64_t max_filtered_size = std::numeric_limits<int>::max() / 2u;
+	if (static_cast<uint64_t>(row_size + 1u) * height > max_filtered_size ||
+	    param->png_mem_size == 0 || pitch < min_pitch || (pitch & 3u) != 0 ||
+	    static_cast<uint64_t>(pitch) * height > param->image_mem_size) {
+		return PNG_ENC_ERROR_INVALID_SIZE;
+	}
+
+	const bool                 bgr = (param->pixel_format == PNG_ENC_PIXEL_FORMAT_B8G8R8A8);
+	std::unique_ptr<uint8_t[]> pixels(new (std::nothrow)
+	                                      uint8_t[static_cast<size_t>(row_size) * height]);
+	if (pixels == nullptr) {
+		return PNG_ENC_ERROR_FATAL;
+	}
 
 	for (uint32_t y = 0; y < height; y++) {
 		const auto* src = param->image_mem_addr + static_cast<size_t>(y) * pitch;
-		auto*       dst = pixels.data() + static_cast<size_t>(y) * row_size;
+		auto*       dst = pixels.get() + static_cast<size_t>(y) * row_size;
 
 		for (uint32_t x = 0; x < width; x++) {
 			dst[0] = src[bgr ? 2 : 0];
@@ -260,12 +291,12 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 	{
 		std::scoped_lock lock(g_png_enc_mutex);
 
-		// stb accepts zlib levels 0-9 like the guest; values above 9 are clamped
-		stbi_write_png_compression_level = std::min<int>(param->compression_level, 9);
+		stbi_write_png_compression_level = param->compression_level;
 		stbi_write_force_png_filter      = PngEncForcedFilter(param->filter_type);
 
-		ok = stbi_write_png_to_func(PngEncWrite, &writer, static_cast<int>(width), static_cast<int>(height),
-		                            components, pixels.data(), static_cast<int>(row_size));
+		ok = stbi_write_png_to_func(PngEncWrite, &writer, static_cast<int>(width),
+		                            static_cast<int>(height), components, pixels.get(),
+		                            static_cast<int>(row_size));
 	}
 
 	if (output_info != nullptr) {

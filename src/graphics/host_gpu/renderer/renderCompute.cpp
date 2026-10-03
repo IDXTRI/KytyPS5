@@ -444,15 +444,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (resources.specialization_reads.empty() &&
+	    (TryConsumeComputeMetaClear(input_info, buffer) ||
+	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
-		ResetBindings();
-		return;
-	}
+
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();

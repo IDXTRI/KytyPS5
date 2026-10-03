@@ -1815,8 +1815,6 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
-// Opts the title in to 2560x1440 output modes. Kyty presents at the window's size whatever the
-// title allows, so there is nothing to change. Called every frame; not logged.
 KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
 	if (!DriverState().IsOpened(handle)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -1827,8 +1825,6 @@ KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
 KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) {
 	PRINT_NAME();
 
-	// The guest's call sites pass (handle, 0, 0) and ignore the result. The meaning of the other
-	// two arguments is unknown, so they are only logged.
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		LOGF("\t handle = %d\n"
@@ -1837,7 +1833,6 @@ KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t 
 		     handle, arg1, arg2);
 	}
 
-	// Kyty always presents at a fixed refresh rate.
 	return OK;
 }
 
@@ -1849,7 +1844,6 @@ KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
 		LOGF("\t handle = %d\n", handle);
 	}
 
-	// Kyty does not negotiate VRR, so the output stays at a fixed refresh rate.
 	return OK;
 }
 

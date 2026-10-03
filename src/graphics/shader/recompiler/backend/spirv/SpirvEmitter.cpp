@@ -127,6 +127,16 @@ void ValidateNativeProgram(const IR::Program& program) {
 			              program.memory_info[index].kind == IR::ResourceKind::IndirectBuffer;
 		       });
 	};
+	const auto local_flat_handle = [&](const IR::Inst& handle) {
+		return !handle.Uses().empty() &&
+		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
+			       if (IR::AddressOpcodeInfoOf(use.user->GetOpcode()).access == IR::AddressAccess::None)
+				       return false;
+			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].kind == IR::ResourceKind::FlatLocal;
+		       });
+	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();
@@ -143,7 +153,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 					if (planning_only_handle(inst)) {
 						break;
 					}
-					if (inst.NumArgs() != 2 || !program.info.uses_dma) {
+					if (inst.NumArgs() != 2 || (!program.info.uses_dma && !local_flat_handle(inst))) {
 						Fail(program, "typed address handle has invalid DMA metadata");
 					}
 					break;
@@ -278,11 +288,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory_index >= program.memory_info.size()) {
 					Fail(program, "address operation has invalid memory metadata");
 				}
-				if (program.memory_info[memory_index].kind == IR::ResourceKind::Scratch) {
+				const auto kind = program.memory_info[memory_index].kind;
+				if (kind == IR::ResourceKind::Scratch || kind == IR::ResourceKind::FlatLocal) {
 					if (program.scratch_dwords == 0) {
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
+					if (kind == IR::ResourceKind::FlatLocal && program.stage != ShaderType::Compute &&
+					    program.stage != ShaderType::Mesh) {
+						requirements.function_lds = true;
+					}
 				} else if (address_access == IR::AddressAccess::Write) {
 					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
 				}
@@ -320,7 +335,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
 				}
-				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+				if (shared_access == IR::SharedAccess::Atomic &&
+				    IR::SharedComponentCount(inst.GetOpcode()) == 2u) {
 					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
 						Fail(program, "64-bit shared atomics require compute LDS");
 					}
@@ -348,6 +364,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
