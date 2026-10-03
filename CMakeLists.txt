@@ -456,6 +456,15 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+# KYTY_FUNCTION_ARRAY_SHRINK: the SPIR-V pass that shrinks Function-storage arrays to their proven
+# index bound (graphics/host_gpu/spirvLocalArrays.h, from Jetsku/KytyPS5).
+add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvLocalArraysTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/spirvLocalArrays.cpp"
+)
+target_link_libraries(spirv_local_arrays_tests spirv-tools)
+target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
+
 add_executable(live_switches_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LiveSwitchesTests.cpp"
 )

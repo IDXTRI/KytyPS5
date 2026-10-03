@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -552,6 +553,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
+	// KYTY_FUNCTION_ARRAY_SHRINK bounds SubgroupLocalInvocationId by the largest subgroup.
+	SpirvLocalArrays::SetMaxSubgroupSize(
+	    std::max(properties11.subgroupSize, subgroup_size_control.maxSubgroupSize));
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
 	graphics.compute_subgroup_size_control_enabled =
 	    supported_features13.subgroupSizeControl == VK_TRUE &&
