@@ -11,11 +11,16 @@
 troubleshooting. You need your own dump of the game: no game files, keys or firmware are
 included.
 
-**Status:** test release (v2). The opening areas are playable at roughly 14-34 fps on a Ryzen 7
-7800X3D + RTX 4070 Ti, with some visual glitches (flickering ground detail and decals) and
-occasional GPU crashes. Ray-traced effects are skipped. New in v2: correct moon, trees, ground and
-Wolverine's suit (the game's own texture samplers), a white-plane glitch removed, a shader disk
-cache for smoother second launches, and October 2026 KytyPS5 fixes.
+**Status:** test build (v2). The opening areas are playable at roughly 10-34 fps on a Ryzen 7
+7800X3D + RTX 4070 Ti (cutscenes 1-4 fps), with some visual glitches (flickering ground detail and
+decals) and random GPU crashes. Ray-traced effects are skipped. New in v2: correct moon, trees,
+ground and Wolverine's suit (the game's own texture samplers), unused textures released so video
+memory no longer overflows in long sessions, white-plane/white-wedge/orange-flood glitches
+removed, a shader disk cache, F9 frame capture for bug reports, and October 2026 KytyPS5 fixes.
+
+**v2 is a test build and the last one on this code for now.** The next version waits for Senaxx's
+new KytyPS5 build (a reworked render path where shaders read their own descriptors); this work
+will move onto it.
 
 **What this fork adds** on top of KytyPS5 (release 2026-10-03, f53e5d2):
 

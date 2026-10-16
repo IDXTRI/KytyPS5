@@ -18,8 +18,26 @@ On top of `wolverine-v1`:
   fix, texture views/aliases, blending, shader instructions); the legacy FP32 MAD rounding change
   is reverted (it cost ~20 % fps). Senaxx ports: IR validation in debug only, ClampRange cache,
   NMin/NMax, lane-mask folding, NGG 9-bit primitive indices.
-- Skip list: Mac's six plus `4c582eb7319682a3,be2a9db103759bff` (a white plane in one town room).
-- Measured: menu 33-34 fps, Leap Attack prompt 14-15 fps, open areas 25-30 fps (RTX 4070 Ti).
+- **Bindless texture eviction on** (`KYTY_BINDLESS_EVICT=1`) with a **memory graveyard**
+  (`KYTY_MEMORY_GRAVEYARD_MB=2048`): freed device memory is held back before it is reused, a
+  safety net for a stale texture read not found yet (rare device lost). Without eviction VRAM
+  reached 14 GB on a 12 GB card and the game fell to 4 fps.
+- **AMPR/AMM**: a write into extended memory waits for its queued map; an unmap keeps what a later
+  submission mapped (fixed a render-thread write crash).
+- Bindless: keep the old view while a changed T# is pending; slots freed once; vertices built
+  from a placeholder texel are dropped.
+- **F9** writes the last N frames (`KYTY_GLITCH_CAPTURE=N`); burst frame dumps and raw image dumps
+  (`KYTY_FRAME_DUMP_BURST`, `KYTY_IMAGE_DUMP_ADDR`).
+- `KYTY_APP0_OVERRIDE_DIR`: a host file replaces the game file of the same name (engine settings
+  in `commandline.txt` without touching the dump).
+- A mesh draw over the host workgroup limits is skipped instead of exiting.
+- Skip list: Mac's six plus `4c582eb7319682a3,be2a9db103759bff` (white plane in a town room),
+  `d6ec1c4ba883d308` (white wedge on a rooftop) and `4d2a3a54c74938ad` (orange screen flood in
+  fights).
+- Measured: menu 33-34 fps, open areas 25-30, turning 14-20, fights 10-12, cutscenes 1-4
+  (RTX 4070 Ti). Open: ground-decal flicker (two bindless material pixel shaders), the floods'
+  real cause, the stale read behind the device losts.
+- **Paused** after this test build: the next version moves onto Senaxx's reworked KytyPS5 build.
 
 ## v1
 
