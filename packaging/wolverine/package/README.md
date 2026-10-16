@@ -1,4 +1,4 @@
-# Marvel's Wolverine on KytyPS5: Wolverine build v1 (test release)
+# Marvel's Wolverine on KytyPS5: Wolverine build v2 (test release)
 
 An experimental Windows build of the [KytyPS5](https://github.com/KytyPS5/KytyPS5) PS5 emulator,
 tuned for **Marvel's Wolverine** (PPSA03671, game version **01.001.005**).
@@ -8,6 +8,11 @@ plays through the opening areas, but expect low frame rates, visual glitches and
 crash. **Save often.**
 
 **No game files, keys or firmware are included.** You need your own dump of the game.
+
+> **Test build.** This is a snapshot of the work so far, published for testing. It is not a
+> finished release, and **no further v2 updates are planned for now**: the next version waits
+> for Senaxx's new KytyPS5 build (a reworked render path), which this work will move onto.
+
 
 ---
 
@@ -59,7 +64,7 @@ crash. **Save often.**
 5. When you close the game, the black window says whether it closed normally or shows the path
    of the log file.
 
-The .bat file already uses the recommended settings, detects AMD processors on its own, and
+The .bat file already uses the recommended settings, and
 writes nothing into the game folder.
 
 ## 3. Alternative: the launcher
@@ -68,8 +73,8 @@ writes nothing into the game folder.
    reads the recommended settings from `emulator\Kyty.ini` there.
 2. Open the settings (Global settings) and, under **Game folders**, add the folder that
    **contains** your game folder (for example `D:\Games`, not `D:\Games\PPSA03671-app0`).
-3. Check the settings against the table in section 4. On an **AMD processor, tick
-   "AMD CPU patch"** (the launcher cannot detect it). Press **Save**.
+3. Check the settings against the table in section 4. Leave **"AMD CPU patch"** off (see the
+   table). Press **Save**.
 4. Select Marvel's Wolverine in the list and press **Run**. A console window opens next to the
    game; leave it open.
 
@@ -86,8 +91,8 @@ give the same performance once each has its own shader cache.
 | Enable tessellation support | **On** | Required for some terrain and character surfaces. |
 | Enable readback | **On** | Required: the game reads back images it renders. |
 | Windows SysV red zone crash protection | **On** | Prevents a class of crashes. |
-| AMD CPU patch | **On for AMD processors**, off for Intel | Fixes an instruction AMD CPUs compute differently. |
-| Skip shaders | **Keep the preset list** (6 entries) | Skips expensive effects (one is ray tracing). Without it the game runs about 25-30 % slower. |
+| AMD CPU patch | **Off** | Despite its name it replaces the game's approximate `VRSQRTPS` with an exact value, one CPU exception per use (slow). The PS5's CPU is AMD, so AMD PCs already match the console. Try it only if animation or physics look wrong, most likely on Intel. |
+| Skip shaders | **Keep the preset list** (10 entries) | Skips expensive effects (one is ray tracing) and four shaders that draw visual errors (white planes and wedges, an orange screen flood in fights). Without it the game runs about 25-30 % slower. |
 | Screen resolution | 1280x720 (default) | Tested setting. Higher values are untested. |
 | Present mode | Mailbox | Tested setting. |
 | Vulkan validation, Shader validation, RenderDoc, Command buffer dump, Tracy | **Off** | Debugging tools: they make the game much slower. |
@@ -95,13 +100,15 @@ give the same performance once each has its own shader cache.
 
 ### Skipped shaders
 
-Six of the game's shaders are skipped: their draws are left out. They were picked by Mac (from
-the KytyPS5 Wolverine work) because they cost a lot of frame time or misbehave; one of them is a
-ray-tracing shader. Skipping them makes the game run about 25-30 % faster, and the effects they
-draw are missing (most notably ray-traced effects). Both start methods use this list:
+Eight of the game's shaders are skipped: their draws are left out. The first six were picked by
+Mac (from the KytyPS5 Wolverine work) because they cost a lot of frame time or misbehave; one of
+them is a ray-tracing shader. Skipping them makes the game run about 25-30 % faster, and the
+effects they draw are missing (most notably ray-traced effects). The last two (new in v2) draw a
+solid white plane over one room in the town buildings; nothing visible is missing without them.
+Both start methods use this list:
 
 ```
-bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015
+bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015,4c582eb7319682a3,be2a9db103759bff,d6ec1c4ba883d308,4d2a3a54c74938ad
 ```
 
 - **Launcher:** it is in Global settings, **Skip shaders**. If you cleared it, paste the line above
@@ -133,8 +140,9 @@ Measured on a Ryzen 7 7800X3D + RTX 4070 Ti at 1280x720, after the cache had fil
 
 | Situation | Frame rate |
 |---|---|
-| Main menu | ~30 fps |
+| Main menu | ~33-34 fps |
 | Standing still, open areas | 25-30 fps |
+| The "Leap Attack" prompt at the start of a new game (busy jungle) | ~14-15 fps |
 | Dense jungle with many plants | ~12-15 fps |
 | Running and turning | ~12-20 fps, with occasional stutter |
 | Fights | lower; varies a lot |
@@ -147,11 +155,13 @@ faster GPU helps less than you might expect.
 | Issue | Notes |
 |---|---|
 | **Crash when the window is resized or minimized** | Don't touch the window during play. |
-| **Rare GPU crash ("device lost")**, more likely in long sessions | Save often. Please report it with the log (section 11). |
-| **Light or shadow patches flickering on the ground**, decals (tyre tracks) appearing and disappearing | Being investigated (probably cached shadow maps). |
+| **GPU crash ("device lost")**, at random, more likely when video memory is full (heavy areas, long sessions) and when loading another save | Save often; to change saves, quit and restart the game. Cause known in part (a texture read after it was freed); please report it with the log (section 11). |
+| **Detail flickering**: ground/wall detail and decals (blood, tyre tracks) present on one frame and gone the next | Known since the first build. Narrowed to two ground-material shaders; not fixed yet. |
+| **Cutscenes run at 1-4 fps** | Known; the emulator waits on the GPU there. |
+| Fights run at about 10-12 fps | See section 5. |
+| Short purple or magenta colours on some surfaces | Seen now and then; they go back to normal. |
 | Textures missing for a moment after spawning or loading | They appear after a few seconds. |
 | Stutter when new things appear, especially on the first launch | The shader cache fills over time. |
-| The moon in the night sky is drawn tiled | Known, not fixed yet. |
 | Ray-traced effects are missing | Those shaders are skipped on purpose (see section 10). |
 | A character's face can render black in some cutscenes | Seen once; please report where. |
 | Low frame rate in dense foliage | See section 5. |
@@ -185,6 +195,27 @@ Only the opening areas of the game have been tested. Later parts may not work.
 
 ## 9. What this build changes compared with KytyPS5
 
+### New in v2
+
+- **The game's own texture samplers**: the moon is a single moon again, and ground and trees
+  keep their detail. Shaders that lost their draws with them (Wolverine's suit, tree trunks,
+  title-screen logs) draw again.
+- **White plane in a town room**, **white wedge on a rooftop** and **orange screen floods in fights** removed (four shaders skipped, see section 4).
+- **Unused textures are released** (`KYTY_BINDLESS_EVICT=1`): video memory no longer overflows into system memory in long sessions (before: 4 fps after a while). Freed memory is held back up to 2 GiB as a safety net.
+- **F9** saves the last 40 frames into `userdata\framedump`, to attach to a bug report.
+- **Engine settings without touching the game**: files in `userdata\overrides` replace the game's file of the same name (for example `commandline.txt`).
+- A garbage mesh draw is skipped instead of closing the emulator.
+- **Shader disk cache**: translated shaders are kept on disk, so the second launch stutters
+  much less.
+- **Video memory**: budget-aware texture pool and a safety net for deleted images
+  (`KYTY_VRAM_SAVER=2`).
+- **Fixes from KytyPS5 (October 2026)**: loading a save from the in-game menu no longer
+  crashes; texture views and 2D/3D aliases, blending on swizzled targets, more shader
+  instructions; mesh-shader triangle indices (edge flags); Senaxx's later Wolverine fixes.
+- Main menu ~33-34 fps (v1: ~30).
+
+### Since v1 and earlier
+
 This build is KytyPS5 (release 2026-10-03, f53e5d2) merged with the Marvel's Wolverine work from
 KytyPS5 PR #937 and further fixes:
 
@@ -209,6 +240,9 @@ that starts the emulator). Leave them alone unless you are testing.
 | Switch | Default | Effect |
 |---|---|---|
 | `KYTY_SKIP_BVH_DISPATCHES` | 1 | 0 runs the ray-tracing shaders. **Experimental: can crash the GPU.** |
+| `KYTY_BINDLESS_SAMPLERS` | 1 | 0 samples the game's textures with one generic sampler (v1 behaviour: tiled moon, stretched light streaks). |
+| `KYTY_PROGRAM_DISK_CACHE` | 1 | 0 stops keeping translated shaders on disk (more stutter on every launch). |
+| `KYTY_VRAM_SAVER` | 2 | 0 or 1: less aggressive video-memory saving. |
 | `KYTY_BINDLESS_REVALIDATE` | 1 | 0 stops re-checking textures the game replaces. |
 | `KYTY_LABELS_AFTER_GPU` | 1 | 0 uses KytyPS5's original GPU synchronization (not recommended). |
 | `KYTY_PIPELINE_CACHE_ANY_REVISION` | 1 | 0 discards the shader cache whenever the build changes. |
@@ -227,9 +261,9 @@ Please include:
 
 ## 12. Source code, licenses and credits
 
-- **Source code:** built from commit `fb54e221` of the Wolverine branch of KytyPS5. KytyPS5 is
-  licensed under the **GNU GPL 2.0** (see `LICENSE-GPL-2.0.txt`, and `LICENSE-Kyty-MIT.txt` for
-  the original Kyty code). The source of this build: https://github.com/IDXTRI/KytyPS5/tree/wolverine-v1 (tag `wolverine-v1`). Third-party
+- **Source code:** built from the Wolverine branch of KytyPS5. KytyPS5 is licensed under the
+  **GNU GPL 2.0** (see `LICENSE-GPL-2.0.txt`, and `LICENSE-Kyty-MIT.txt` for the original Kyty
+  code). The source of this build: https://github.com/IDXTRI/KytyPS5/tree/wolverine-v2 (tag `wolverine-v2`). Third-party
   licenses are in `emulator\licenses`.
 - **Credits:**
   - **KytyPS5** and all its contributors: the emulator.

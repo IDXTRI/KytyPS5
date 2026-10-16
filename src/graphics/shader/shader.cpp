@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -50,6 +52,8 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// KYTY_SHADER_TIMELINE: first registration time per code hash (under g_shader_map_mutex).
+static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_shader_registered;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -67,6 +71,27 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {data, hash};
+	if (ShaderTimelineEnabled() && g_shader_registered.try_emplace(hash, std::chrono::steady_clock::now()).second &&
+	    g_shader_registered.size() % 256u == 0u) {
+		std::printf("Shader timeline: %zu shader code hashes registered\n", g_shader_registered.size());
+	}
+}
+
+bool ShaderTimelineEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_TIMELINE");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+double ShaderRegisteredSecondsAgo(uint64_t hash) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       iter = g_shader_registered.find(hash);
+	if (iter == g_shader_registered.end()) {
+		return -1.0;
+	}
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - iter->second).count();
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -679,7 +704,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
-	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
+	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	key.push_back(info.target_uint_mask);
 	key.push_back(info.target_sint_mask);

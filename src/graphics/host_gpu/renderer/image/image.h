@@ -20,6 +20,7 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 class CommandRecorder;
+class TileManager;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -71,7 +72,7 @@ public:
 	void CopyImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
-	void CopyImageWithBuffer(Image& source, Buffer& buffer);
+	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
@@ -122,7 +123,16 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		content_seq    = NextContentSeq();
+	}
+	// Increases with every GPU write binding and every upload of any image: the image whose
+	// contents are newest among images over the same bytes (KYTY_RESHAPE_COPY).
+	static uint64_t NextContentSeq() noexcept {
+		static std::atomic<uint64_t> seq {0};
+		return seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -138,13 +148,21 @@ public:
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
+	// The bytes the texture cache counts for this image: fixed when it is registered
+	// (KYTY_GC_HOST_SIZES picks the guest or the host size), the guest size before that.
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
+		return accounted_bytes != 0 ? accounted_bytes : GuestAccountedSize();
+	}
+	[[nodiscard]] uint64_t GuestAccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
 	ImageInfo        info;
 	VulkanImage      backing;
+	// Device memory VMA gave the image (its allocation size), and what the cache accounts.
+	uint64_t         host_bytes      = 0;
+	uint64_t         accounted_bytes = 0;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
@@ -156,7 +174,17 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// KYTY_RESHAPE_COPY: a GPU-written image of another shape over the same bytes, whose result
+	// this new image starts from (TextureCache::InitializeImage).
+	ImageId          reshape_source {};
+	uint64_t         content_seq = 0; // see NextContentSeq
+	// The current stencil plane's mapping into the depth image, also retained by its association.
+	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// For KYTY_GLITCH_REPORT (textureCache.cpp): when the image was made and last uploaded.
+	uint64_t         created_frame      = 0;
+	uint64_t         last_upload_frame  = 0;
+	uint32_t         uploads            = 0;
 	size_t           lru_id             = 0;
 
 private:

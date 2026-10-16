@@ -875,13 +875,23 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
 	heap.settled[key]  = 1;
 	heap.descriptors[key] = {};
+	auto& stats = table.ImageResolveStats();
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+		stats.unreadable++;
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	if (!BindlessCompatible(descriptor, heap.binding)) {
+		if (descriptor.IsNull()) {
+			stats.null_desc++;
+		} else if (Prospero::SampledTextureNumericClass(descriptor.Format()) !=
+		           Prospero::TextureNumericClass::Float) {
+			stats.non_float++;
+		} else {
+			stats.shape++;
+		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -889,17 +899,28 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
+		stats.empty++;
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image != nullptr && !image->registered) {
+		// Dropped while it was bound (the slot vector erases it later): pinning it now would
+		// leave the slot holding its views after they are destroyed. Ask again next frame.
+		stats.deferred++;
+		heap.settled[key] = 0;
+		table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+		return false;
+	}
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
+		(slot == 0 ? stats.array_full : stats.empty)++;
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
+	stats.resolved++;
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
 	table.WriteSlot(heap.binding, slot, view, layout);
@@ -945,15 +966,42 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 				next = key; // look at it again next frame
 				break;
 			}
-			const auto old_image = heap.images[key];
-			if (table.ReleaseKey(heap, key)) {
-				if (auto* image = texture_cache.m_slot_images.try_get(old_image);
-				    image != nullptr && image->bindless_pinned) {
-					NoteBindlessStateChange(*image);
-					image->bindless_pinned = false;
+			const auto old_image      = heap.images[key];
+			const auto old_slot       = heap.slots[key];
+			const auto old_descriptor = heap.descriptors[key];
+			// Resolve the new T# before giving up the old slot. The guest rewrites an entry mostly
+			// to step its min LOD while a texture streams (engine notes 4.5); if the new view is
+			// not ready yet (image dropped or not registered, slot array full), the key used to be
+			// left pending or on placeholder 0 for frames, and a shader that reads a texel as
+			// geometry (VS 4d2a) flooded the screen. Now it keeps sampling the old view and the
+			// entry is compared again in the next window. KYTY_BINDLESS_KEEP_OLD=0 (live) disables.
+			static auto& keep_old = Common::LiveSwitches::Get("KYTY_BINDLESS_KEEP_OLD", 1);
+			const bool   keep     = old_slot != 0 && keep_old.load(std::memory_order_relaxed) != 0;
+			const bool   no_refs  = table.ReleaseKey(heap, key, !keep);
+			const bool   ok       = ResolveBindlessKey(heap, key);
+			auto*        image    = texture_cache.m_slot_images.try_get(old_image);
+			if (keep && !ok && image != nullptr && image->registered && heap.slots[key] == 0) {
+				heap.slots[key]       = old_slot;
+				heap.images[key]      = old_image;
+				heap.settled[key]     = 1;
+				heap.descriptors[key] = old_descriptor;
+				if (std::find(heap.resolved.begin(), heap.resolved.end(), old_image) ==
+				    heap.resolved.end()) {
+					heap.resolved.push_back(old_image);
 				}
+				table.AddImageReference(old_image, heap, key);
+				table.SetTranslation(heap, key, old_slot);
+				table.ImageResolveStats().kept_old++;
+				continue;
 			}
-			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+			if (keep) {
+				table.FreeSlot(heap.binding, old_slot);
+			}
+			if (no_refs && image != nullptr && image->bindless_pinned && old_image != heap.images[key]) {
+				NoteBindlessStateChange(*image);
+				image->bindless_pinned = false;
+			}
+			resolved += ok ? 1u : 0u;
 		}
 		heap.revalidate_cursor = next >= keys ? 0u : next;
 	}
@@ -994,7 +1042,9 @@ void RenderExecutor::ResolveBindlessRequests() {
 				continue;
 			}
 			if (resolved >= Budget) {
-				break; // still pending: the next frame flags it again
+				// Still pending (the blue debug placeholder): the next frame flags it again.
+				table.ImageResolveStats().deferred++;
+				continue;
 			}
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
 		}
@@ -1003,6 +1053,8 @@ void RenderExecutor::ResolveBindlessRequests() {
 	// place their age in the texture cache is refreshed.
 	m_context.GetTextureCache().TouchImages(m_bindless_used);
 	table.RecordFeedbackSnapshot(scheduler);
+	// Rate-limited to every 5 s; also prints the image key outcomes when samplers are off.
+	table.ReportSamplerStats();
 }
 
 // Bindless samplers: the S# records of each sampler heap a draw indexes are mirrored into the
@@ -1017,33 +1069,59 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 	}
 	auto& table = m_context.GetBindlessTable();
 	auto& cache = m_context.GetSamplerCache();
-	{
-		ShaderSamplerResource default_sampler;
-		std::ranges::copy(ShaderRecompiler::IR::FallbackSampler(), default_sampler.fields);
-		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
-	}
+	table.WriteDefaultSamplers(cache);
+	table.ReportSamplerStats();
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
 	constexpr uint64_t MaxRecords = 1024;
+	// KYTY_BINDLESS_SAMPLER_FIELDS=<mask> (live, research, default 0xff = the game's records as
+	// they are): field groups taken from the game's S# records, the rest from the default sampler
+	// (BindlessSamplerRecords::FieldGroup: 1 address modes, 2 filters, 4 LOD range, 8 LOD bias,
+	// 16 anisotropy, 32 border colour, 64 depth compare, 128 the rest). Wolverine's trees vanish
+	// with the game's samplers and are fine with the default one: bisect the groups.
+	// KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY=1 (environment, older) is the mask 1.
+	static auto& fields_switch = Common::LiveSwitches::Get(
+	    "KYTY_BINDLESS_SAMPLER_FIELDS", [] {
+		    const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY");
+		    return value != nullptr && value[0] == '1' ? int64_t {1} : int64_t {0xff};
+	    }());
+	// KYTY_BINDLESS_SAMPLER_RECHECK=1 (live, research): read every heap at each use instead of
+	// once per frame, to tell records the game rewrites during a frame from other causes.
+	static auto& recheck = Common::LiveSwitches::Get("KYTY_BINDLESS_SAMPLER_RECHECK", 0);
+	const auto   fields =
+	    static_cast<uint32_t>(fields_switch.load(std::memory_order_relaxed)) &
+	    BindlessSamplerRecords::FieldAll;
+	auto& stats = table.Stats();
+	static uint32_t mirrored_fields = BindlessSamplerRecords::FieldAll;
+	if (fields != mirrored_fields) {
+		table.DropSamplerHeapsExcept(fields);
+		mirrored_fields = fields;
+	}
 	for (const auto& use: snapshot.bindless_sampler_heaps) {
 		uint32_t region  = 0;
 		uint32_t entries = 0;
+		stats.uses++;
 		if (table.SamplersEnabled() && use.sampler < program.info.samplers.size()) {
 			const auto&    sampler = program.info.samplers[use.sampler];
 			const uint32_t flags =
 			    (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
 			    (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
-			    (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
+			    (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u) |
+			    (fields << BindlessTable::SamplerFieldsShift);
 			auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, flags);
-			if (heap->checked_frame != frame) {
+			if (heap->checked_frame != frame || recheck.load(std::memory_order_relaxed) != 0) {
 				heap->checked_frame = frame;
 				const uint64_t available =
 				    use.size > use.table_offset ? (use.size - use.table_offset) / 16u : 0u;
 				std::vector<std::array<uint32_t, 4>> records(std::min(available, MaxRecords));
 				const uint64_t address = use.base + use.table_offset;
 				const uint64_t bytes   = records.size() * sizeof(records[0]);
-				if (!records.empty() &&
-				    !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes) &&
-				    Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
+				if (records.empty()) {
+					stats.read_failed++;
+				} else if (m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes)) {
+					stats.gpu_dirty++;
+				} else if (!Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
+					stats.read_failed++;
+				} else {
 					(void)table.MirrorSamplerHeap(*heap, records, cache);
 				}
 			}
@@ -1093,6 +1171,9 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 				region -= magnitude;
 			}
 		}
+		if (region == 0u || entries == 0u) {
+			stats.default_draws++;
+		}
 		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
 	}
 }
@@ -1113,6 +1194,25 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		return;
 	}
 	ResolveBindlessRequests();
+	// Keys of images deleted while shaders still sampled them (BindlessTable::TakeReresolve):
+	// settled here, before this draw records, instead of after a frame of the placeholder.
+	table.TakeReresolve(m_bindless_reresolve);
+	if (!m_bindless_reresolve.empty()) {
+		constexpr uint32_t Budget = 64;
+		uint32_t           done   = 0;
+		for (const auto& [heap, key]: m_bindless_reresolve) {
+			if (key >= heap->settled.size() || heap->settled[key] != 0) {
+				continue;
+			}
+			if (done >= Budget) {
+				table.QueueReresolve(heap, key);
+				continue;
+			}
+			done += ResolveBindlessKey(*heap, key) ? 1u : 0u;
+		}
+		table.ImageResolveStats().reresolved += done;
+		m_bindless_reresolve.clear();
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.image >= program.info.images.size()) {
 			continue;
@@ -1284,6 +1384,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -1298,8 +1399,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
@@ -1438,6 +1537,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// them; Wolverine does this (CS 0x85a58319a7a75e48 reads a branch input from a buffer the same
 	// dispatch updates) and renders correctly with the pre-dispatch values, as the walk did before
 	// this check (KYTY_IGNORE_WRITTEN_OVERLAP=1). Each reader/writer pair is reported once.
+	// The written ranges are gathered once per commit, and a reader's reads are compared one by
+	// one only against a range that meets their span (Senaxx 63332b63: a per-read scan of every
+	// bound image and written buffer cost the jungle 1.6 fps).
 	const auto report_overlap = [](const char* what, uint64_t reader_hash, uint64_t writer_hash,
 	                               uint64_t address, uint64_t size, uint64_t written_address,
 	                               uint64_t written_size) {
@@ -1451,27 +1553,35 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			     what, reader_hash, address, size, writer_hash, written_address, written_size);
 		}
 	};
+	struct WrittenRange {
+		uint64_t address     = 0;
+		uint64_t size        = 0;
+		uint64_t writer_hash = 0; // 0: an image or attachment
+	};
+	std::vector<WrittenRange> written_ranges;
+	bool                      written_gathered = false;
+	bool                      address_writes   = false;
+	uint64_t                  address_writer   = 0;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		const auto reader_hash = reader->runtime->program->shader_hash;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-				report_overlap("shader address writes (unprovable)", reader_hash,
-				               writer->runtime->program->shader_hash, 0, 0, 0, 0);
+		if (!written_gathered) {
+			written_gathered = true;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->program->has_address_writes) {
+					address_writes = true;
+					address_writer = writer->runtime->program->shader_hash;
+				}
 			}
-		}
-		for (const auto [address, size]: reads) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						report_overlap("an image or attachment write", reader_hash, 0, address, size,
-						               written.address, written.size);
+					if (written.size != 0) {
+						written_ranges.push_back({.address = written.address, .size = written.size});
 					}
 				}
 			}
@@ -1492,12 +1602,37 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                   ? extents[resource].end - extents[resource].begin
 						                   : 0;
 					}
-					if (written_size != 0 &&
-					    ImageRangeOverlaps(address, size, written_address, written_size)) {
-						report_overlap("a shader buffer write", reader_hash, program.shader_hash,
-						               address, size, written_address, written_size);
+					if (written_size != 0) {
+						written_ranges.push_back({.address     = written_address,
+						                          .size        = written_size,
+						                          .writer_hash = program.shader_hash});
 					}
 				}
+			}
+		}
+		if (address_writes) {
+			report_overlap("shader address writes (unprovable)", reader_hash, address_writer, 0, 0, 0,
+			               0);
+		}
+		if (written_ranges.empty()) continue;
+		uint64_t span_begin = UINT64_MAX;
+		uint64_t span_end   = 0;
+		for (const auto [address, size]: reads) {
+			span_begin = std::min(span_begin, address);
+			span_end   = std::max(span_end, address + size);
+		}
+		if (span_end <= span_begin) continue;
+		for (const auto& written: written_ranges) {
+			if (!ImageRangeOverlaps(span_begin, span_end - span_begin, written.address, written.size)) {
+				continue;
+			}
+			for (const auto [address, size]: reads) {
+				if (!ImageRangeOverlaps(address, size, written.address, written.size)) continue;
+				report_overlap(written.writer_hash == 0 ? "an image or attachment write"
+				                                        : "a shader buffer write",
+				               reader_hash, written.writer_hash, address, size, written.address,
+				               written.size);
+				break;
 			}
 		}
 	}
@@ -1628,10 +1763,44 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				const bool note = m_context.GetGraphics().address_binding_report_enabled;
+				// KYTY_LIST_3D_SHADERS=1 (live, research): print each shader that binds a 3D image
+				// here, once per shader, extent, format and kind. Finds the volumetric passes
+				// without hiding compute shaders (hiding them live froze Wolverine, 2026-10-12;
+				// the slot-3 rooftop white wedge is drawn by no pixel shader).
+				static auto& list_3d   = Common::LiveSwitches::Get("KYTY_LIST_3D_SHADERS", 0);
+				const bool   report_3d = list_3d.load(std::memory_order_relaxed) != 0;
 				for (const auto resource: binding.resources) {
 					const auto& texture = descriptors.images.at(resource);
 					m_descriptor_images.push_back(
 					    MakeImageInfo(texture, m_image_occurrences.at(resource)++));
+					if (report_3d) {
+						if (const auto* image =
+						        m_context.GetTextureCache().m_slot_images.try_get(texture.image_id);
+						    image != nullptr && image->backing.extent.depth > 1) {
+							static std::mutex                   seen_mutex;
+							static std::unordered_set<uint64_t> seen;
+							const auto&                         e       = image->backing.extent;
+							const bool storage_kind =
+							    ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) ==
+							    ShaderRecompiler::IR::ImageResourceClass::Storage;
+							const uint64_t key = program.shader_hash ^
+							                     (static_cast<uint64_t>(e.width) << 1u) ^
+							                     (static_cast<uint64_t>(e.height) << 17u) ^
+							                     (static_cast<uint64_t>(e.depth) << 33u) ^
+							                     (static_cast<uint64_t>(image->backing.format) << 45u) ^
+							                     (storage_kind ? 1ull << 63u : 0ull);
+							std::scoped_lock lock(seen_mutex);
+							if (seen.insert(key).second) {
+								std::printf("3D image shader: stage %d 0x%016" PRIx64
+								            " %s %ux%ux%u format %d (guest 0x%016" PRIx64 ")\n",
+								            static_cast<int>(program.stage), program.shader_hash,
+								            storage_kind ? "storage" : "sampled", e.width, e.height,
+								            e.depth, static_cast<int>(image->backing.format),
+								            image->info.data.address);
+								std::fflush(stdout);
+							}
+						}
+					}
 					if (note) {
 						if (const auto* image =
 						        m_context.GetTextureCache().m_slot_images.try_get(texture.image_id);

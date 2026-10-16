@@ -54,6 +54,16 @@ public:
 
 	bool operator==(const Value& other) const;
 
+	// Serialization (KYTY_PROGRAM_DISK_CACHE): the stored type and the union's raw bits of a
+	// non-instruction value, and a value rebuilt from them.
+	[[nodiscard]] Type     RawType() const { return type; }
+	[[nodiscard]] uint64_t RawBits() const {
+		uint64_t bits = 0;
+		std::memcpy(&bits, &imm_u64, sizeof(bits));
+		return bits;
+	}
+	[[nodiscard]] static Value FromRaw(Type raw_type, uint64_t bits) { return Value(raw_type, bits); }
+
 private:
 	Type type = Type::Void;
 	union {

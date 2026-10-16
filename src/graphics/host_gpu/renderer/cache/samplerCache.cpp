@@ -5,7 +5,24 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics {
+
+// KYTY_SAMPLER_REDUCTION=1 (environment, default 0; ported from Jetsku/KytyPS5 ec1d46f5): honour
+// the S# FILTER_MODE (bits 29..30 of dword 0, RDNA2 ISA 8.2.7): 0 blends the filter footprint,
+// 1 and 2 return its minimum or maximum texel. The host sampler always blended, so a min/max
+// sampler (depth pyramids for occlusion and shadow culling, conservative downsampling) returned
+// the weighted average. Vulkan's reduction modes do the same; they exclude depth comparison.
+static bool SamplerReductionEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SAMPLER_REDUCTION");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
@@ -148,6 +165,27 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+	}
+
+	vk::SamplerReductionModeCreateInfo reduction {};
+	if (const auto filter_mode = r.FilterMode(); filter_mode == 1u || filter_mode == 2u) {
+		const bool applied = SamplerReductionEnabled() && m_graphics.sampler_filter_minmax_enabled &&
+		                     sampler_info.compareEnable == VK_FALSE;
+		if (applied) {
+			reduction.reductionMode = filter_mode == 1u ? vk::SamplerReductionMode::eMin
+			                                            : vk::SamplerReductionMode::eMax;
+			sampler_info.pNext = &reduction;
+		}
+		// Printed with the switch off too, so a normal log shows whether a title uses them.
+		static uint32_t printed = 0;
+		if (printed < 16) {
+			printed++;
+			std::printf("Sampler: S# filter mode %s (%s) dwords=%08x,%08x,%08x,%08x\n",
+			            filter_mode == 1u ? "min" : "max",
+			            applied ? "applied" : "blended; KYTY_SAMPLER_REDUCTION=1 applies it",
+			            r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
+			std::fflush(stdout);
+		}
 	}
 
 	vk::Sampler vk_sampler = nullptr;

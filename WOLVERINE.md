@@ -1,5 +1,28 @@
 # Marvel's Wolverine on KytyPS5: performance and stability work
 
+## v2 (branch `wolverine-v2`)
+
+On top of `wolverine-v1`:
+
+- **Game samplers by default** (`KYTY_BINDLESS_SAMPLERS=0` restores the generic linear/wrap
+  sampler). Draws were being skipped with them: the sampler heap's buffer, whose S# reads the
+  bindless sampler plan strands, could not be materialized. Such a buffer now binds empty
+  (`KYTY_DEAD_BUFFER_EMPTY=0` restores failing). Fixes the tiled moon, flat ground, and the
+  vanishing suit, tree trunks and title logs.
+- **Translated-shader disk cache** (`KYTY_PROGRAM_DISK_CACHE=1`), **VRAM saver presets**
+  (`KYTY_VRAM_SAVER=1|2`), stale bindless view guard, shader compile stats.
+- Skipped draws are reported in release logs (`ProgramCache: skipping ...`).
+- Diagnostics: live shader list and live skip (`KYTY_SHADER_LIST`, `KYTY_LIVE_SKIP`), glitch report
+  (`KYTY_GLITCH_REPORT`), image address watch, IR dumps by hash (`KYTY_IR_DUMP_HASHES`).
+- Upstream KytyPS5 main merged (2026-10-04) and 36 later commits cherry-picked (save-load crash
+  fix, texture views/aliases, blending, shader instructions); the legacy FP32 MAD rounding change
+  is reverted (it cost ~20 % fps). Senaxx ports: IR validation in debug only, ClampRange cache,
+  NMin/NMax, lane-mask folding, NGG 9-bit primitive indices.
+- Skip list: Mac's six plus `4c582eb7319682a3,be2a9db103759bff` (a white plane in one town room).
+- Measured: menu 33-34 fps, Leap Attack prompt 14-15 fps, open areas 25-30 fps (RTX 4070 Ti).
+
+## v1
+
 Branch `wolverine-v1` (release
 [wolverine-v1](https://github.com/IDXTRI/KytyPS5/releases/tag/wolverine-v1)): KytyPS5 release
 2026-10-03 (f53e5d2) merged with the community Wolverine work (PR #937: Mac/itsmemac, Senaxx, Ali
@@ -7,7 +30,9 @@ Almohaya) and the changes below. The earlier branch `wolverine-perf` was not mer
 
 Tested with PPSA03671 v01.001.005 on Windows 11, Ryzen 7 7800X3D, RTX 4070 Ti (12 GB),
 clang-cl Release build. Run with
-`--bindless --redzone --tessellation --readback-linear-images true --amd-cpu` (AMD CPUs only) and
+`--bindless --redzone --tessellation --readback-linear-images true` (the earlier `--amd-cpu` for
+AMD CPUs is no longer recommended: it emulates VRSQRTPS through a CPU exception per use and the
+PS5's CPU is AMD anyway) and
 Mac's skip list `--skip-shaders bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015`.
 No environment variables are needed: `KYTY_LABELS_AFTER_GPU` is on by default, and upstream's
 written-overlap check only warns (`KYTY_IGNORE_WRITTEN_OVERLAP` is gone). The release package

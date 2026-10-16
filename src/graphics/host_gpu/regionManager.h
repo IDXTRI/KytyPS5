@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/spinBackoff.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -30,9 +31,10 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (m_lock.test_and_set(std::memory_order_acquire)) {
+			// A thread that already owns it would wait forever.
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			Common::SpinAcquire(m_lock);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

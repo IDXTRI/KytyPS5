@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <span>
@@ -32,8 +33,11 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
-	// Called before a bindless-pinned image is unregistered.
-	std::function<void(ImageId)> on_bindless_unregister;
+	// Called before a bindless-pinned image is unregistered (in_use: deleted while still pinned,
+	// so shaders still sample it; false when the collector unpins an unused image).
+	std::function<void(ImageId, bool in_use)> on_bindless_unregister;
+	// Called before any image is unregistered, with its views (BindlessTable::DropStaleViews).
+	std::function<void(std::span<const CachedImageView>)> on_image_views_unregister;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -69,6 +73,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Any cached image shares bytes with [address, address + size).
 	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -77,11 +82,20 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// KYTY_IMAGE_DUMP_BURST / KYTY_IMAGE_DUMP_ADDR (textureCache.cpp): raw dumps of the images at
+	// one guest address on consecutive frames.
+	void ProcessImageDump();
 	// Marks the images as used now (bindless textures the shaders sampled).
 	void TouchImages(std::span<const ImageId> ids);
 	void RunGarbageCollector();
 	// Bytes of device memory the cached images account for.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
+	// Device memory of the registered images (VMA allocation sizes), their count, and the bytes
+	// of deleted images held by KYTY_IMAGE_RETIRE_FRAMES.
+	[[nodiscard]] uint64_t HostMemory() const noexcept { return m_total_host_memory; }
+	[[nodiscard]] GraphicContext& Graphics() const noexcept { return m_graphics; }
+	[[nodiscard]] size_t   ImageCount() const noexcept { return m_slot_images.size(); }
+	[[nodiscard]] uint64_t RetiringBytes() const noexcept { return m_retiring_bytes; }
 
 private:
 	// What the collector compares with its thresholds: own bytes, plus the buffer cache's with
@@ -193,8 +207,20 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// KYTY_IMAGE_RETIRE_FRAMES (DeleteImage): deleted images kept whole (views and memory) until
+	// the GPU is past the tick they were deleted at and this many frames were presented.
+	struct RetiringImage {
+		ImageId  id;
+		uint64_t tick;
+		uint64_t frame;
+		uint64_t bytes;
+	};
+	std::deque<RetiringImage>                         m_retiring_images;
+	uint64_t                                          m_retiring_bytes = 0;
+	void                                              RetireImages(bool all);
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_total_host_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
@@ -203,6 +229,7 @@ private:
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
+	uint64_t m_image_dump_frame = 0; // KYTY_IMAGE_DUMP_BURST
 	// KYTY_IMAGE_GC_STATS: what the collector visited and why it kept each candidate.
 	struct GcStats {
 		uint64_t runs          = 0;
@@ -228,6 +255,14 @@ private:
 
 	// The buffer cache's bytes during a KYTY_GC_COMBINED collection (see GcUsedMemory).
 	uint64_t m_other_cache_memory = 0;
+	// KYTY_GC_DRIVER_MARGIN_MB: bytes the collector freed in each of the last frames (indexed by
+	// LRU clock), not yet visible in the driver's usage (deferred frees), and the frame they
+	// belong to.
+	static constexpr size_t DriverFreedFrames = 4;
+	uint64_t m_gc_driver_freed[DriverFreedFrames] {};
+	uint64_t m_gc_driver_freed_clock[DriverFreedFrames] {};
+	[[nodiscard]] uint64_t DriverMarginHeadroom(uint64_t clock, uint64_t device_usage,
+	                                            uint64_t driver_budget) const;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

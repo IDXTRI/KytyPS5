@@ -3,8 +3,44 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+// KYTY_NO_FLOAT_CONTROLS="all" or "hash,hash,...": leave out SignedZeroInfNanPreserve for these
+// shaders. A diagnostic only: on the RTX 5090 (driver 616.92) NVIDIA's code for c7c9148c7b0fa86c is
+// the same with or without the mode (255 registers, 107,264 bytes).
+bool FloatControlsDisabled(uint64_t shader_hash) {
+	static const auto setting = [] {
+		struct Setting {
+			bool                  all = false;
+			std::vector<uint64_t> hashes;
+		} result;
+		const char* value = std::getenv("KYTY_NO_FLOAT_CONTROLS");
+		if (value == nullptr) {
+			return result;
+		}
+		const std::string_view list(value);
+		if (list == "all") {
+			result.all = true;
+			return result;
+		}
+		size_t start = 0;
+		while (start < list.size()) {
+			const auto end = std::min(list.find(',', start), list.size());
+			if (end > start) {
+				result.hashes.push_back(
+				    std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
+			}
+			start = end + 1;
+		}
+		return result;
+	}();
+	return setting.all || std::ranges::find(setting.hashes, shader_hash) != setting.hashes.end();
+}
 
 uint32_t TypeVoid(EmitterState& state) {
 	if (state.void_type == 0) {
@@ -298,6 +334,20 @@ void DefineBindlessImages(EmitterState& state) {
 		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationBinding,
 		                            IR::BindlessFeedback);
 		state.bindless_feedback_variable = feedback;
+		// A vertex shader that reads a texel as geometry (a size, an offset) gets 0 from the
+		// placeholder while its key is pending (first sight, 1-3 frames) and stretches its
+		// triangles across the screen (Wolverine VS 4d2a: orange floods). Remember a pending read
+		// and drop the vertex at the position export instead. KYTY_VS_PENDING_CULL=0 disables.
+		static const bool cull = [] {
+			const char* value = std::getenv("KYTY_VS_PENDING_CULL");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (cull && state.program.stage == ShaderType::Vertex) {
+			state.bindless_vertex_pending = state.builder.DefineGlobalVariable(
+			    TypePointer(state, spv::StorageClassPrivate, TypeBool(state)),
+			    spv::StorageClassPrivate, state.builder.Constant(spv::OpConstantNull, TypeBool(state)));
+			state.builder.AddName(state.bindless_vertex_pending, "bindless_vertex_pending");
+		}
 	}
 	if (state.program.info.watchdog_reports && state.bindless_feedback_variable == 0) {
 		const auto feedback = state.builder.DefineGlobalVariable(
@@ -773,7 +823,10 @@ void DefineModule(EmitterState& state) {
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(spv::CapabilityShader);
-	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	const bool float_controls = state.float_controls;
+	if (float_controls) {
+		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	}
 	if (UsesPhysicalAddresses(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -846,20 +899,20 @@ void DefineModule(EmitterState& state) {
 	                             spv::MemoryModelGLSL450);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-	                               32u);
+	if (float_controls) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               32u);
+	}
 	if (state.requirements.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);
-		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
+		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
-		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 		                               64u);
 		// FP64 denormal preservation is temporarily disabled.
 		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;

@@ -60,6 +60,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Vulkan 1.2 samplerFilterMinmax: S# FILTER_MODE min/max (SamplerCache, KYTY_SAMPLER_REDUCTION).
+	bool                               sampler_filter_minmax_enabled         = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;
@@ -142,6 +144,17 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Bytes of deleted images parked for reuse (KYTY_IMAGE_RECYCLE_MB), and releasing them.
+	[[nodiscard]] uint64_t ParkedImageBytes();
+	// Device memory freed by VMA but held back (KYTY_MEMORY_GRAVEYARD_S, vma.cpp), and how many
+	// allocations left it before their hold time because of the size cap.
+	[[nodiscard]] static uint64_t GraveyardBytes();
+	[[nodiscard]] static uint64_t GraveyardFreedEarly();
+	// Device usage and driver budget for the graveyard's cap (shrinks near the budget).
+	static void NoteDeviceMemory(uint64_t usage, uint64_t budget);
+	void                   ReleaseParkedImages() { TrimImagePool(0, false); }
+	// The size of the image's device memory allocation (0 without one).
+	[[nodiscard]] uint64_t ImageAllocationSize(const VulkanImage& image) const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -181,6 +194,9 @@ struct VulkanImageState {
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
 };
+
+// VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT with KYTY_VMA_MIN_MEMORY=1, else 0 (vma.cpp).
+[[nodiscard]] uint32_t VmaMinMemoryStrategy();
 
 struct VulkanImage {
 	VulkanImage() = default;

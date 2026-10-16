@@ -27,9 +27,163 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 
 namespace Libs::Graphics {
+
+// KYTY_MEMORY_GRAVEYARD_S=N (live, default 60; 0 = free at once) and KYTY_MEMORY_GRAVEYARD_MB=M
+// (live, default 768): device memory VMA gives back (an emptied block or a dedicated allocation)
+// is freed only N seconds later, at most M MiB held (the oldest go first past it). Wolverine reads
+// some released image memory 2-34 s later through a stale reference not yet found (T3; device
+// lost 2026-10-12 03:11: ReadInvalid in memory released 34 s earlier). Inside memory that still
+// exists such a read returns old data for a frame; unmapped, it loses the device. An allocation
+// that fails for lack of memory frees the whole graveyard and retries.
+namespace MemoryGraveyard {
+
+struct Entry {
+	VkDevice                              device;
+	VkDeviceMemory                        memory;
+	VkDeviceSize                          size;
+	const VkAllocationCallbacks*          callbacks;
+	std::chrono::steady_clock::time_point released;
+};
+
+std::mutex                                     g_mutex;
+std::deque<Entry>                              g_entries; // oldest first
+std::unordered_map<VkDeviceMemory, VkDeviceSize> g_sizes;
+uint64_t                                       g_bytes = 0;
+uint64_t                                       g_freed_early = 0; // past the cap, younger than N s
+PFN_vkAllocateMemory                           g_allocate = nullptr;
+PFN_vkFreeMemory                               g_free     = nullptr;
+// Device usage and driver budget, published by the texture cache's GC every frame (reading them
+// here would call back into VMA from inside its own vkAllocateMemory/vkFreeMemory calls).
+std::atomic<uint64_t> g_device_usage {0};
+std::atomic<uint64_t> g_driver_budget {0};
+std::atomic<uint64_t> g_bytes_at_note {0}; // g_bytes when g_device_usage was published
+
+// The cap in effect: within 512 MiB of the driver budget the graveyard shrinks by the overshoot,
+// so it never pushes the process past the budget (Wolverine 2026-10-12: a full 768 MiB graveyard
+// at the budget meant 1.2-1.5 GB paged to shared memory, 17 fps standing instead of 28).
+uint64_t EffectiveCap() {
+	static auto&       cap_mb  = Common::LiveSwitches::Get("KYTY_MEMORY_GRAVEYARD_MB", 768);
+	const auto         cap     = static_cast<uint64_t>(std::max<int64_t>(0, cap_mb.load(std::memory_order_relaxed))) << 20u;
+	constexpr uint64_t Reserve = 512ull << 20u;
+	const auto         usage   = g_device_usage.load(std::memory_order_relaxed);
+	const auto         budget  = g_driver_budget.load(std::memory_order_relaxed);
+	if (budget == 0 || usage + Reserve <= budget) {
+		return cap;
+	}
+	// KYTY_MEMORY_GRAVEYARD_FLOOR_MB (live, default 256): what the graveyard keeps even at the
+	// budget. Shrinking to 0 removed the protection exactly when the churn is highest: Wolverine
+	// device lost 2026-10-12 05:31 (sewer), memory released 13.9 s before a stale read while the
+	// device was over budget and the graveyard empty.
+	static auto& floor_mb  = Common::LiveSwitches::Get("KYTY_MEMORY_GRAVEYARD_FLOOR_MB", 256);
+	const auto   floor     = std::min<uint64_t>(
+        cap, static_cast<uint64_t>(std::max<int64_t>(0, floor_mb.load(std::memory_order_relaxed))) << 20u);
+	// Shrink from what the graveyard held when the usage was measured, not from the cap: with a
+	// 2 GiB cap it stayed at 1-1.5 GiB while the device was over budget (Wolverine 2026-10-13: 2.2 GB
+	// in shared memory, 10 fps in a fight).
+	const auto overshoot = usage + Reserve - budget;
+	const auto held      = std::min(cap, g_bytes_at_note.load(std::memory_order_relaxed));
+	return std::max(floor, overshoot >= held ? 0 : held - overshoot);
+}
+
+// Frees entries older than the hold time, or the oldest while over the cap (all = everything).
+// Called with g_mutex held.
+void Collect(bool all) {
+	static auto& hold_s = Common::LiveSwitches::Get("KYTY_MEMORY_GRAVEYARD_S", 60);
+	const auto   hold   = std::chrono::seconds(std::max<int64_t>(0, hold_s.load(std::memory_order_relaxed)));
+	const auto   cap    = EffectiveCap();
+	const auto   now    = std::chrono::steady_clock::now();
+	while (!g_entries.empty()) {
+		const auto& entry = g_entries.front();
+		const bool  old   = now - entry.released >= hold;
+		if (!all && !old && g_bytes <= cap) {
+			break;
+		}
+		if (!all && !old) {
+			g_freed_early++;
+		}
+		g_free(entry.device, entry.memory, entry.callbacks);
+		g_bytes -= entry.size;
+		g_entries.pop_front();
+	}
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Allocate(VkDevice device, const VkMemoryAllocateInfo* info,
+                                        const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+	auto result = g_allocate(device, info, callbacks, memory);
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+		std::scoped_lock lock(g_mutex);
+		if (!g_entries.empty()) {
+			Collect(true);
+			result = g_allocate(device, info, callbacks, memory);
+		}
+	}
+	if (result == VK_SUCCESS) {
+		std::scoped_lock lock(g_mutex);
+		g_sizes[*memory] = info->allocationSize;
+		Collect(false);
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL Free(VkDevice device, VkDeviceMemory memory,
+                                const VkAllocationCallbacks* callbacks) {
+	if (memory == VK_NULL_HANDLE) {
+		return;
+	}
+	std::scoped_lock lock(g_mutex);
+	VkDeviceSize size = 0;
+	if (const auto found = g_sizes.find(memory); found != g_sizes.end()) {
+		size = found->second;
+		g_sizes.erase(found);
+	}
+	static auto& hold_s = Common::LiveSwitches::Get("KYTY_MEMORY_GRAVEYARD_S", 60);
+	if (hold_s.load(std::memory_order_relaxed) <= 0) {
+		g_free(device, memory, callbacks);
+		Collect(false);
+		return;
+	}
+	g_entries.push_back({device, memory, size, callbacks, std::chrono::steady_clock::now()});
+	g_bytes += size;
+	Collect(false);
+}
+
+} // namespace MemoryGraveyard
+
+uint64_t GraphicContext::GraveyardBytes() {
+	std::scoped_lock lock(MemoryGraveyard::g_mutex);
+	MemoryGraveyard::Collect(false);
+	return MemoryGraveyard::g_bytes;
+}
+
+void GraphicContext::NoteDeviceMemory(uint64_t usage, uint64_t budget) {
+	std::scoped_lock lock(MemoryGraveyard::g_mutex);
+	MemoryGraveyard::g_device_usage.store(usage, std::memory_order_relaxed);
+	MemoryGraveyard::g_driver_budget.store(budget, std::memory_order_relaxed);
+	MemoryGraveyard::g_bytes_at_note.store(MemoryGraveyard::g_bytes, std::memory_order_relaxed);
+	if (MemoryGraveyard::g_free != nullptr) {
+		MemoryGraveyard::Collect(false);
+	}
+}
+
+uint64_t GraphicContext::GraveyardFreedEarly() {
+	std::scoped_lock lock(MemoryGraveyard::g_mutex);
+	return MemoryGraveyard::g_freed_early;
+}
+
+// KYTY_VMA_MIN_MEMORY=1 (live, research, default 0): device-local images and buffers placed with
+// VMA's best-fit strategy (the smallest free range that fits) instead of its default balance of
+// speed and packing; fewer holes in shared blocks, a little more CPU per allocation.
+uint32_t VmaMinMemoryStrategy() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_VMA_MIN_MEMORY", 0);
+	return enabled.load(std::memory_order_relaxed) != 0 ? VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT
+	                                                    : 0u;
+}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -39,6 +193,14 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	// Every device memory VMA allocates and frees goes through the graveyard (see above).
+	MemoryGraveyard::g_allocate = reinterpret_cast<PFN_vkAllocateMemory>(
+	    functions.vkGetDeviceProcAddr(static_cast<VkDevice>(device), "vkAllocateMemory"));
+	MemoryGraveyard::g_free = reinterpret_cast<PFN_vkFreeMemory>(
+	    functions.vkGetDeviceProcAddr(static_cast<VkDevice>(device), "vkFreeMemory"));
+	EXIT_IF(MemoryGraveyard::g_allocate == nullptr || MemoryGraveyard::g_free == nullptr);
+	functions.vkAllocateMemory = MemoryGraveyard::Allocate;
+	functions.vkFreeMemory     = MemoryGraveyard::Free;
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
@@ -55,10 +217,9 @@ bool GraphicContext::CreateAllocator() {
 	// texture and buffer churn, 256 MiB blocks held 5.7 GiB of allocations in 8.8 GiB of blocks
 	// while the device was over its budget (run 95: Windows paged 2-4 GB to system memory).
 	// 64 MiB: 0.45-0.7 GiB trapped (run 96), old spot 7 -> 15-16 fps.
-	uint64_t block_megabytes = 256; // 64 once the deleted-image read (PLAN P3) is fixed
-	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
-		block_megabytes = std::strtoull(value, nullptr, 10);
-	}
+	// (Read through the live switches so KYTY_VRAM_SAVER=2 can preset it; it applies at start.)
+	uint64_t block_megabytes = static_cast<uint64_t>(std::max<int64_t>(
+	    0, Common::LiveSwitches::Get("KYTY_VMA_BLOCK_MB", 256).load(std::memory_order_relaxed)));
 	if (block_megabytes >= 4 && block_megabytes <= 1024) {
 		info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(block_megabytes) << 20u;
 	}
@@ -78,6 +239,8 @@ void GraphicContext::DestroyAllocator() {
 	TrimImagePool(0, true);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+	std::scoped_lock lock(MemoryGraveyard::g_mutex);
+	MemoryGraveyard::Collect(true);
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -235,6 +398,20 @@ void GraphicContext::TrimImagePool(uint64_t cap_bytes, bool all) {
 	                   m_image_pool.begin() + static_cast<std::ptrdiff_t>(keep_from));
 }
 
+uint64_t GraphicContext::ImageAllocationSize(const VulkanImage& image) const {
+	if (allocator == nullptr || image.allocation == nullptr) {
+		return 0;
+	}
+	VmaAllocationInfo allocation {};
+	vmaGetAllocationInfo(allocator, image.allocation, &allocation);
+	return allocation.size;
+}
+
+uint64_t GraphicContext::ParkedImageBytes() {
+	std::scoped_lock lock(m_image_pool_mutex);
+	return m_image_pool_bytes;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -266,6 +443,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.flags |= VmaMinMemoryStrategy();
 	// KYTY_IMAGE_DEDICATED_KB (live, default 0 = off): images at least this large get their own
 	// device memory. Sharing VMA blocks, freed images left holes the driver still counts:
 	// Wolverine run 52 held 7.9 GiB of allocations in 9.9 GiB of blocks, and turning the camera

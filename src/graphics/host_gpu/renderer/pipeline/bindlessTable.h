@@ -5,10 +5,12 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessSamplerRecords.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <span>
 #include <deque>
 #include <memory>
 #include <span>
@@ -95,6 +97,8 @@ public:
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. Slots of dropped images are reused once the GPU is past them.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
+	// Queue a slot for reuse once the GPU is past the current tick (at most once).
+	void FreeSlot(uint32_t binding, uint32_t slot);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
@@ -116,7 +120,8 @@ public:
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. The slot keeps its view for the frames in flight and is reused once
 	// the GPU is past them. True when the image has no reference left (it need not stay pinned).
-	[[nodiscard]] bool ReleaseKey(Heap& heap, uint32_t key);
+	// free_slot = false: the caller keeps the slot (to fall back to it, or free it itself).
+	[[nodiscard]] bool ReleaseKey(Heap& heap, uint32_t key, bool free_slot = true);
 
 	// A guest sampler heap as one kind of use samples it: a region of the sampler array that
 	// mirrors its S# records, key for key. Uses differ in whether the depth-compare function is
@@ -125,6 +130,12 @@ public:
 	static constexpr uint32_t SamplerDepthCompare   = 1u;
 	static constexpr uint32_t SamplerPointFiltering = 2u;
 	static constexpr uint32_t SamplerIntegerBorder  = 4u;
+	static_assert(SamplerDepthCompare == ShaderRecompiler::IR::BindlessSamplerKeepDepthCompare &&
+	              SamplerPointFiltering == ShaderRecompiler::IR::BindlessSamplerPointFiltering &&
+	              SamplerIntegerBorder == ShaderRecompiler::IR::BindlessSamplerIntegerBorder);
+	// Bits 8..15 of a heap's flags: the KYTY_BINDLESS_SAMPLER_FIELDS mask it was mirrored with
+	// (BindlessSamplerRecords::FieldGroup), so a changed mask mirrors the heap anew.
+	static constexpr uint32_t SamplerFieldsShift = 8u;
 	struct SamplerHeap {
 		uint64_t                             base          = 0;
 		uint32_t                             table_offset  = 0;
@@ -136,18 +147,66 @@ public:
 	};
 	[[nodiscard]] SamplerHeap* FindOrCreateSamplerHeap(uint64_t base, uint32_t table_offset,
 	                                                   uint32_t flags);
+	// KYTY_BINDLESS_SAMPLER_FIELDS changed: heaps mirrored with another mask are dropped and
+	// their regions reused once the GPU is past them.
+	void DropSamplerHeapsExcept(uint32_t fields);
 	// Mirrors the heap's records into its region. New records are appended in place (their slots
 	// were never used); a changed record, or more records than the region holds, moves the heap
 	// to a new region, because slots the GPU may be reading are never rewritten. False when the
 	// sampler array is full; the heap then keeps its previous records.
 	bool MirrorSamplerHeap(SamplerHeap& heap, std::span<const std::array<uint32_t, 4>> records,
 	                       SamplerCache& cache);
-	// Slot 0 of the sampler array, used for keys outside their heap; written once.
-	void WriteDefaultSampler(vk::Sampler sampler);
+	// Slot 0 of the sampler array, used for keys outside their heap; written once. With
+	// KYTY_BINDLESS_SAMPLER_CLASS_DEFAULTS=1 slots 1..7 hold the default sampler of each kind.
+	void WriteDefaultSamplers(SamplerCache& cache);
+	// Research counters, reported every 5 s by ReportSamplerStats.
+	struct SamplerStats {
+		uint32_t mirrors       = 0; // heap reads that changed a mirror
+		uint32_t moves         = 0; // a changed record or growth moved a heap to a new region
+		uint32_t recycled      = 0; // regions reused (KYTY_BINDLESS_SAMPLER_RECYCLE)
+		uint32_t full          = 0; // mirrors refused: the sampler array is full
+		uint32_t gpu_dirty     = 0; // heap reads skipped: the GPU wrote the heap
+		uint32_t read_failed   = 0; // heap reads skipped: no backing
+		uint32_t default_draws = 0; // uses patched with no region (every key -> default)
+		uint32_t uses          = 0;
+	};
+	SamplerStats& Stats() noexcept { return m_sampler_stats; }
+	// What bindless image keys resolved to, reported every 5 s with the sampler stats (always,
+	// when non-zero): a key settled to the placeholder samples transparent black until its T#
+	// changes (Wolverine: black faces, objects without texture).
+	struct ImageStats {
+		uint32_t resolved    = 0;
+		uint32_t unreadable  = 0; // the T# could not be read from guest memory
+		uint32_t null_desc   = 0; // a null T#
+		uint32_t non_float   = 0; // integer formats have no bindless array
+		uint32_t shape       = 0; // a type the binding's array does not hold (1D, MSAA, mismatch)
+		uint32_t empty       = 0; // the texture cache had no image for it
+		uint32_t array_full  = 0; // no free slot in the binding's array
+		uint32_t deferred    = 0; // left pending this frame: the per-frame budget was spent
+		uint32_t reresolved  = 0; // of resolved: keys of in-use images settled before a draw
+		uint32_t kept_old    = 0; // changed T# not resolvable yet: the key kept its old view
+	};
+	ImageStats& ImageResolveStats() noexcept { return m_image_stats; }
+	void          ReportSamplerStats();
 	[[nodiscard]] bool SamplersEnabled() const noexcept { return m_samplers_per_array != 0; }
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
-	// make its keys pending again, so a draw that still needs it asks for it anew.
-	void OnImageUnregistered(ImageId id);
+	// make its keys pending again, so a draw that still needs it asks for it anew. in_use: the
+	// image was deleted while shaders still sampled it; its keys are queued for TakeReresolve.
+	void OnImageUnregistered(ImageId id, bool in_use = false);
+	// KYTY_BINDLESS_RERESOLVE (live, default 1): keys of in-use images that were just unregistered,
+	// for the draw path to settle again before it records. Otherwise the next draw samples the
+	// placeholder (zero) until the shader's feedback is read a frame later; a vertex shader that
+	// scales positions by a texel then stretches its triangles across the screen for that frame
+	// (Wolverine 2026-10-13: orange floods from VS 0x4d2a3a54c74938ad).
+	void TakeReresolve(std::vector<std::pair<Heap*, uint32_t>>& out) {
+		out.swap(m_reresolve);
+		m_reresolve.clear();
+	}
+	void QueueReresolve(Heap* heap, uint32_t key) { m_reresolve.emplace_back(heap, key); }
+	// Safety net for the stale-slot device losts (VRAM saver 2): the texture cache is dropping an
+	// image with these views. A slot still holding one of them goes back to the placeholder and
+	// its keys back to pending, whatever the references said. Returns how many slots it reset.
+	uint32_t DropStaleViews(std::span<const CachedImageView> views);
 	// Device-loss triage (addressBindingReport.h): the slots holding a view of the image.
 	static void ReportImageUsers(uint64_t image);
 
@@ -168,12 +227,15 @@ private:
 	CommandScheduler&       m_scheduler;
 	std::deque<Heap>        m_heaps;
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
+	std::vector<std::pair<Heap*, uint32_t>> m_reresolve;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors};
 	// Slots of unregistered images per array, with the tick after which no command buffer reads
 	// them.
 	std::array<std::deque<std::pair<uint64_t, uint32_t>>, ImageArrays> m_free_slots;
+	// Per slot: 1 while it waits on m_free_slots (FreeSlot keeps each slot there once).
+	std::array<std::vector<uint8_t>, ImageArrays> m_slot_free;
 	// What each slot's descriptor holds now (WriteSlot), for device-loss triage.
 	std::array<std::vector<vk::ImageView>, ImageArrays> m_slot_views;
 	// The image each slot's view belonged to when it was written: a view handle the driver
@@ -186,8 +248,12 @@ private:
 	vk::DescriptorSet       m_set    = nullptr;
 	uint32_t                m_images_per_array = 0;
 	uint32_t                m_samplers_per_array = 0;
-	uint32_t                m_next_sampler_slot  = 1; // slot 0 is the default sampler
+	// Slot 0 (and 1..7 with class defaults) is the default sampler.
+	BindlessSamplerRecords::RegionAllocator m_sampler_regions;
 	bool                    m_default_sampler_written = false;
+	SamplerStats            m_sampler_stats;
+	ImageStats              m_image_stats;
+	uint64_t                m_sampler_stats_time = 0;
 	std::deque<SamplerHeap> m_sampler_heaps;
 	std::unique_ptr<Buffer> m_translation;
 	std::unique_ptr<Buffer> m_feedback;

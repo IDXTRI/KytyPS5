@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -230,6 +231,34 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 }
 
 thread_local int g_indirect_failure_line = 0;
+
+// Whether buffer resource `buffer` is accessed, and only by planning-only accesses (which emit
+// no load or store). A buffer with no recorded access at all does not count.
+bool OnlyPlanningAccesses(const ResourcePlan& program, uint32_t buffer) {
+	bool planning = false;
+	for (const auto& memory: program.memory_info) {
+		if ((memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::ScalarBuffer &&
+		     memory.kind != ResourceKind::IndirectBuffer) ||
+		    memory.resource != buffer) {
+			continue;
+		}
+		if (!memory.planning_only) {
+			return false;
+		}
+		planning = true;
+	}
+	return planning;
+}
+
+// KYTY_DEAD_BUFFER_EMPTY=0 (environment) restores failing the draw when such a buffer's V#
+// cannot be evaluated.
+bool EmptyDeadBuffers() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEAD_BUFFER_EMPTY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 bool FailIndirect(int line) {
 	if (g_indirect_failure_line == 0) {
@@ -1569,8 +1598,52 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	specialization.buffers.clear();
 	specialization.buffers.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i],
-		              program.info.buffers[i].written)) {
+		bool evaluated = evaluate(program.info.buffers[i].source, snapshot.buffers[i],
+		                          program.info.buffers[i].written);
+		if (!evaluated && OnlyPlanningAccesses(program, i) && EmptyDeadBuffers()) {
+			// Every access through this buffer is planning-only: the S# reads a bindless
+			// sampler plan stranded (the shader indexes the host's sampler mirror instead), so
+			// the shader never reads it and its V# need not be known. Failing here skipped the
+			// whole draw (Wolverine with KYTY_BINDLESS_SAMPLERS=1: Wolverine's suit, tree
+			// trunks). Bind an empty descriptor, as for an inactive source.
+			snapshot.buffers[i]             = {};
+			snapshot.buffers[i].dword_count = 4u;
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 16) {
+				std::fprintf(stderr,
+				             "Materialization: shader 0x%016" PRIx64 " buffer %u is only read by "
+				             "planning-only accesses; bound empty\n",
+				             program.shader_hash, i);
+				std::fflush(stderr);
+			}
+			evaluated = true;
+		}
+		if (!evaluated) {
+			// Which buffer could not be evaluated, and what else its source feeds (Wolverine:
+			// pixel shaders whose draws vanish with KYTY_BINDLESS_SAMPLERS=1).
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 32) {
+				const auto source      = program.info.buffers[i].source;
+				bool       sampler_heap = false;
+				for (const auto& sampler: program.info.samplers) {
+					sampler_heap |= sampler.source == source &&
+					                source < program.descriptor_sources.size() &&
+					                program.descriptor_sources[source].bindless_sampler.has_value();
+				}
+				bool image_table = false;
+				for (const auto& candidate: program.descriptor_sources) {
+					image_table |= candidate.indirect_image.has_value() &&
+					               (candidate.indirect_image->table_source == source ||
+					                candidate.indirect_image->material_source == source);
+				}
+				std::fprintf(stderr,
+				             "Materialization: shader 0x%016" PRIx64 " buffer %u (source %u, "
+				             "written %d) not evaluable; bindless sampler heap %d, indirect image "
+				             "table/material %d\n",
+				             program.shader_hash, i, source, program.info.buffers[i].written ? 1 : 0,
+				             sampler_heap ? 1 : 0, image_table ? 1 : 0);
+				std::fflush(stderr);
+			}
 			return FailIndirect(__LINE__);
 		}
 		auto&                descriptor_value = snapshot.buffers[i];

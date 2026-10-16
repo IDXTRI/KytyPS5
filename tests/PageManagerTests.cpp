@@ -247,13 +247,21 @@ void TestSharedWatcherCounts() {
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
+  uint32_t write_watchers = 0;
+  uint32_t access_watchers = 0;
+  manager.Watchers(address, write_watchers, access_watchers);
+  Check(write_watchers == 0 && access_watchers == 0, "untracked page reports watchers");
   manager.UpdatePageWatchers<true>(address + 8, 32);
   manager.UpdatePageWatchers<true>(address + 128, 64);
+  manager.Watchers(address + 100, write_watchers, access_watchers);
+  Check(write_watchers == 2 && access_watchers == 0, "Watchers miscounts shared watchers");
   manager.UpdatePageWatchers<false>(address + 8, 32);
   Check(Protection(memory) == PAGE_READONLY,
         "first unwatch released a shared watcher");
   manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
+  manager.Watchers(address, write_watchers, access_watchers);
+  Check(write_watchers == 0, "Watchers keeps a released watcher");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 

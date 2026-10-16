@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <cstdio>
@@ -278,6 +279,47 @@ void TestFailedMaterializationRejectsStage() {
         "missing runtime user data did not reject the cached stage");
 }
 
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
+UnevaluableBufferPlan(bool planning_only) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Pixel;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+  auto &user_data = value_block.AppendNewInst(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  DescriptorSource source;
+  source.dwords = {Value(&user_data), Value(0u), Value(0u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  // The S# read a bindless sampler plan strands: it goes through the heap's buffer but emits
+  // no load.
+  program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer,
+                                 .resource = 0,
+                                 .planning_only = planning_only});
+  return ExtractResourcePlan(program);
+}
+
+void TestPlanningOnlyBufferIsBoundEmpty() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // No user data: the buffer's V# cannot be evaluated.
+  auto stranded = UnevaluableBufferPlan(true);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(stranded, {}, snapshot, specialization) &&
+            snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0u &&
+            snapshot.buffers[0].dwords[1] == 0u && snapshot.buffers[0].dwords[2] == 0u &&
+            snapshot.buffers[0].dwords[3] == 0u,
+        "a buffer only planning-only reads use did not bind empty");
+  auto used = UnevaluableBufferPlan(false);
+  ResourceSnapshot used_snapshot;
+  ResourceSpecialization used_specialization;
+  Check(!MaterializeResources(used, {}, used_snapshot, used_specialization),
+        "an unevaluable buffer the shader reads did not reject the stage");
+}
+
 void TestFiniteImageRefreshReusesScalarReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -403,12 +445,46 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+// KYTY_PROGRAM_DISK_CACHE phase 2: a plan written to disk and read back materializes the
+// same resources as the original.
+void TestPlanSurvivesDiskRoundTrip() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace Disk = Libs::Graphics::ProgramDiskCache;
+  const uint32_t dword = 0x0badf00d;
+  const auto check = [](ResourcePlan original, const SrtRuntime &runtime, const char *name) {
+    std::vector<uint8_t> bytes;
+    Check(Disk::SerializePlan(original, bytes), name);
+    ResourcePlan back;
+    Check(Disk::DeserializePlan(bytes, back), name);
+    ResourceSnapshot a, b;
+    ResourceSpecialization sa, sb;
+    const bool ma = MaterializeResources(original, runtime, a, sa);
+    const bool mb = MaterializeResources(back, runtime, b, sb);
+    Check(ma == mb && a.flattened_srt == b.flattened_srt && sa == sb &&
+              a.samplers.size() == b.samplers.size() &&
+              a.buffers.size() == b.buffers.size() && a.images.size() == b.images.size(),
+          name);
+    for (size_t i = 0; i < a.samplers.size(); i++) {
+      Check(a.samplers[i].dwords == b.samplers[i].dwords, name);
+    }
+  };
+  uint32_t specialization_reads = 0;
+  check(SrtPlan(reinterpret_cast<uint64_t>(&dword)),
+        {.userdata = &specialization_reads,
+         .read_specialization_memory = RejectSpecializationRead},
+        "SRT plan disk round trip");
+  check(MixedSamplerPlan(), {}, "mixed sampler plan disk round trip");
+  check(UnbasedFlatPlan(), {}, "unbased flat plan disk round trip");
+}
+
 int main() {
+  TestPlanSurvivesDiskRoundTrip();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
+  TestPlanningOnlyBufferIsBoundEmpty();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   std::puts("ResourceMaterializationTests: all cases passed");

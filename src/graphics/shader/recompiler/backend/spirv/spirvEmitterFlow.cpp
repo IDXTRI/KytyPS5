@@ -487,7 +487,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
 	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-	    exp.index != 0 && state.input_info.pixel->alpha_blend_source_remap) {
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 		return;
 	}
 	EmitIfCondition(state, exec, [&]() {
@@ -556,14 +556,36 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
+		    exp.index == 0 && !uint_output &&
+		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
 			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
 			if (blend_output != 0) {
-				const auto alpha = state.builder.AllocateId();
+				auto alpha = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
 				                          3u, 3u, 3u, 3u);
+				uint32_t alpha_factor = 0;
+				switch (state.input_info.pixel->alpha_blend_source) {
+					case ShaderAlphaBlendSource::SourceAlphaOne:
+						alpha_factor = ConstantF32Value(state, 1.0f);
+						break;
+					case ShaderAlphaBlendSource::SourceAlphaZero:
+						alpha_factor = ConstantF32Value(state, 0.0f);
+						break;
+					default: break;
+				}
+				if (alpha_factor != 0) {
+					const auto mapping = state.input_info.pixel->target_export_mapping[0];
+					for (uint32_t component = 0; component < 4; component++) {
+						if (mapping.Map(component) != 3u) continue;
+						const auto factors = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeInsert, vector_type, factors,
+						                          alpha_factor, alpha, component);
+						alpha = factors;
+						break;
+					}
+				}
 				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
 			}
 		}
@@ -589,6 +611,22 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
 			                          value);
 		} else if (exp.kind == IR::ExportTargetKind::Position) {
+			if (state.bindless_vertex_pending != 0) {
+				// A texel this vertex read was still pending: export the zero position, which the
+				// guard below (or a fully degenerate triangle) removes, instead of a vertex built
+				// from the placeholder's 0.
+				const auto pending = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeBool(state), pending,
+				                          state.bindless_vertex_pending);
+				const auto mask = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), mask,
+				                          pending, pending, pending, pending);
+				const auto zero    = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
+				const auto guarded = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeF32Vector(state, 4), guarded, mask, zero,
+				                          value);
+				value = guarded;
+			}
 			if (state.invalid_position_clip_distance != UINT32_MAX) {
 				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
 				const auto equal = state.builder.AllocateId();

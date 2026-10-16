@@ -864,6 +864,7 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 			topology = vk::PrimitiveTopology::eTriangleList;
 			break;
 		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kPolygon:
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
 		case Prospero::PrimitiveType::kTriStrip:
@@ -1091,6 +1092,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kPolygon:
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
@@ -1202,8 +1204,15 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
 		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
 		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+			// Garbage counts (a skipped culling dispatch left its draw arguments unwritten)
+			// would only lose the device: drop the draw instead of the whole run.
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("Draw: mesh draw exceeds host workgroup limits (%ux%u); skipped\n",
+				            mesh_groups, draw.instance_count);
+				std::fflush(stdout);
+			}
+			return;
 		}
 	}
 
@@ -1295,6 +1304,11 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
 		                          nullptr, 0, nullptr);
 	}
+	const auto serialize = SerializeGpuMode();
+	if (serialize == 1) {
+		buffer.EndRendering();
+		FullMemoryBarrier(vk_buffer);
+	}
 	uint64_t ps_hash = 0;
 	for (const auto* stage: stages) {
 		if (stage->runtime != nullptr && *stage->runtime &&
@@ -1369,6 +1383,23 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	if (serialize == 2) {
+		const auto other_writes = [](const ShaderStageRuntime& runtime) {
+			return runtime.program->has_address_writes ||
+			       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+				       return image.written &&
+				              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+			       });
+		};
+		bool writes = state.ps_active && other_writes(state.ps_input_info.stage);
+		for (const auto& stage: vertex_stages) {
+			writes = writes || other_writes(stage.stage);
+		}
+		if (writes) {
+			m_context.GetCommandScheduler().EndRendering();
+			FullMemoryBarrier(vk_buffer);
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

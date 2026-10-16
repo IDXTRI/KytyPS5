@@ -9,10 +9,14 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -57,7 +61,6 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
-	bool                       blend_alpha_source_remap                           = false;
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -67,7 +70,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 126);
+static_assert(sizeof(PipelineStaticParameters) == 125);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -240,6 +243,21 @@ private:
 	uint64_t                                                m_deferred_draws = 0;
 
 	void InitializeDriverCache();
+	bool WriteDriverCache(const char* what);
+	void JoinCheckpoint();
+	std::mutex                            m_checkpoint_mutex;
+	std::thread                           m_checkpoint_thread;
+	std::atomic<bool>                     m_checkpoint_done {true};
+	std::chrono::steady_clock::time_point m_last_checkpoint {};
+	size_t                                m_checkpoint_pipelines = 0;
+
+public:
+	// Writes the driver cache in the background now and then (KYTY_PIPELINE_CACHE_CHECKPOINT_S);
+	// GPU thread.
+	void MaybeCheckpoint();
+
+private:
+	void InitializeProgramDiskCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 };

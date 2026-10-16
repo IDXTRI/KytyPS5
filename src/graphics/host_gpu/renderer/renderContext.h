@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -53,6 +54,14 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// KYTY_FAULT_WATCHED_UNMAPPED: a fault on a page the trackers still watch although the range
+	// is no longer (or not yet) listed as GPU-mapped goes to the caches that watch it.
+	[[nodiscard]] bool HandleWatchedUnmappedFault(PageFaultAccess access,
+	                                              uint64_t        fault_vaddr) noexcept;
+	void               DispatchFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Fault triage: watcher counts of the faulting 4 KiB page and whether its range is mapped.
+	void               DescribeFaultPage(uint64_t fault_vaddr) const noexcept;
+	[[nodiscard]] uint32_t PageWatchers(uint64_t fault_vaddr) const noexcept;
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
@@ -63,6 +72,7 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	void               ReportVram();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -92,6 +102,7 @@ private:
 	bool                      m_fault_process_pending = false;
 	// Steady-clock time of the last collection (KYTY_GC_INTERVAL_US), GPU thread.
 	int64_t                   m_last_gc_us            = 0;
+	std::chrono::steady_clock::time_point m_vram_report_time {};
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
 	bool                      m_bda_logged = false;

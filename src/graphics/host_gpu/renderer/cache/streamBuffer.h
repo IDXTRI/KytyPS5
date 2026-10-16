@@ -87,6 +87,10 @@ public:
 	// Tick of the last recorded GPU write into the buffer (BufferCache direct readback).
 	uint64_t last_gpu_write_tick = 0;
 	bool   is_deleted   = false;
+	// KYTY_BUFFER_AUDIT: the shader whose binding created the buffer and the bytes it asked
+	// for (the rest came from joining overlapping buffers or the stream leap).
+	uint64_t origin_shader  = 0;
+	uint64_t origin_request = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 

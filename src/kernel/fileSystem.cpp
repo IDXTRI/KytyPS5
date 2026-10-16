@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -333,6 +334,37 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
+// KYTY_APP0_OVERRIDE_DIR=<host folder> (environment, read once): a regular file in that folder
+// replaces the game's file of the same relative path under /app0 (and /hostapp), e.g.
+// <folder>/commandline.txt for the engine's startup settings. The dump itself is never written.
+static const std::filesystem::path& App0OverrideDir() {
+	static const std::filesystem::path dir = [] {
+		const char* value = std::getenv("KYTY_APP0_OVERRIDE_DIR");
+		return value != nullptr && value[0] != '\0' ? Common::PathFromUtf8(value)
+		                                            : std::filesystem::path();
+	}();
+	return dir;
+}
+
+static std::filesystem::path App0Override(const std::string& point, const std::filesystem::path& rel_path) {
+	const auto& dir = App0OverrideDir();
+	if (dir.empty() || rel_path.empty() || (point != "/app0/" && point != "/hostapp/")) {
+		return {};
+	}
+	std::error_code ec;
+	auto            candidate = dir / rel_path;
+	if (!std::filesystem::is_regular_file(candidate, ec)) {
+		return {};
+	}
+	static std::atomic<int> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+		::printf("FileSystem: %s%s served from override %s\n", point.c_str(),
+		         Common::PathToGenericString(rel_path).c_str(),
+		         Common::PathToGenericString(candidate).c_str());
+	}
+	return candidate;
+}
+
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -349,6 +381,9 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		if (auto overridden = App0Override(p.point, native_rel_path); !overridden.empty()) {
+			return overridden;
+		}
 		if (Common::IsArchivePath(p.dir)) {
 			return p.dir / native_rel_path;
 		}

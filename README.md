@@ -11,9 +11,11 @@
 troubleshooting. You need your own dump of the game: no game files, keys or firmware are
 included.
 
-**Status:** test release. The opening areas are playable at roughly 12-30 fps on a Ryzen 7
-7800X3D + RTX 4070 Ti, with visual glitches (flickering shadows, a tiled moon) and occasional GPU
-crashes. Ray-traced effects are skipped.
+**Status:** test release (v2). The opening areas are playable at roughly 14-34 fps on a Ryzen 7
+7800X3D + RTX 4070 Ti, with some visual glitches (flickering ground detail and decals) and
+occasional GPU crashes. Ray-traced effects are skipped. New in v2: correct moon, trees, ground and
+Wolverine's suit (the game's own texture samplers), a white-plane glitch removed, a shader disk
+cache for smoother second launches, and October 2026 KytyPS5 fixes.
 
 **What this fork adds** on top of KytyPS5 (release 2026-10-03, f53e5d2):
 
@@ -21,7 +23,10 @@ crashes. Ray-traced effects are skipped.
 - lower VRAM use (about 10-11 GB instead of 12.7 GB), GPU fault handling and safer texture
   memory reuse;
 - streamed-texture updates, Wolverine fixes on the new KytyPS5 code, Xbox View button as the PS5
-  touchpad, and Wolverine's settings as defaults.
+  touchpad, and Wolverine's settings as defaults;
+- v2: the game's own texture samplers on by default, draws no longer dropped when a shader's
+  unused sampler table cannot be read, a translated-shader disk cache, VRAM saver presets, and
+  fixes ported from KytyPS5 main and Senaxx's branch.
 
 **Credits:** KytyPS5 and its contributors; **Mac (itsmemac), Senaxx and Ali Almohaya** for the
 Marvel's Wolverine work (PR #937) and Senaxx's later fixes; **Jetsku** for the SPIR-V
@@ -35,9 +40,9 @@ Not affiliated with Sony Interactive Entertainment, Insomniac Games or Marvel.
 
 # KytyPS5
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)

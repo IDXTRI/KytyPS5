@@ -645,6 +645,8 @@ struct ResourcePlan {
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
+	// active_sources before the walk (sources no block guards), built once per plan.
+	mutable std::vector<uint8_t>            active_initial;
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
@@ -698,6 +700,8 @@ std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Whether the translation path validates the IR (debug builds, or KYTY_VALIDATE_IR=1).
+bool  IrValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);

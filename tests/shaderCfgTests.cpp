@@ -3600,6 +3600,128 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
         "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
+void TestNewShaderRecompilerCapturedFractF64() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[] = {0x7e087d04u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.family == Family::VOP1 && decoded.opcode == Opcode::V_FRACT_F64 &&
+            decoded.opcode_id == 0x3e && decoded.word_count == 1 &&
+            decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 4 &&
+            decoded.src0.kind == OperandKind::Vgpr && decoded.src0.reg == 4,
+        "captured V_FRACT_F64 did not decode its in-place register pair");
+  for (const uint32_t opcode : {0x3eu, 0x2fu}) {
+    for (const uint32_t source : {249u, 250u}) {
+      const uint32_t invalid[] = {EncodeVop1(opcode, 4, source),
+          source == 249u ? 0x00060604u : EncodeVop1Dpp(4, 0xe4)};
+      DecodeInstruction(invalid, 0, decoded);
+      Check(decoded.opcode == Opcode::UNSUPPORTED,
+            "FP64 VOP1 accepted an unsupported SDWA or DPP encoding");
+    }
+  }
+}
+
+void TestNewShaderRecompilerF64AluEncodings() {
+  using namespace ShaderRecompiler::Decoder;
+  for (const bool maximum : {false, true}) {
+    const std::array<uint32_t, 2> captured = maximum
+        ? std::array<uint32_t, 2>{0xd5670006u, 0x00020480u}
+        : std::array<uint32_t, 2>{0xd5660006u, 0x00020cf2u};
+    Instruction decoded;
+    DecodeInstruction(captured, 0, decoded);
+    Check(decoded.family == Family::VOP3 &&
+              decoded.opcode == (maximum ? Opcode::V_MAX_F64 : Opcode::V_MIN_F64) &&
+              decoded.opcode_id == (maximum ? 0x167u : 0x166u) && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 6 &&
+              decoded.src0.kind == (maximum ? OperandKind::IntegerInlineConstant
+                                            : OperandKind::FloatInlineConstant) &&
+              decoded.src0.value == (maximum ? 0u : 0x3f800000u) &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == (maximum ? 2u : 6u) &&
+              !decoded.src0.absolute && !decoded.src0.negate &&
+              !decoded.src1.absolute && !decoded.src1.negate &&
+              !decoded.dst.clamp && decoded.dst.omod == 0,
+          "captured V_MIN/MAX_F64 lost its inline source, register pair, or modifiers");
+  }
+  for (const auto [opcode, expected] : {
+      std::pair{0x17u, Opcode::V_TRUNC_F64}, std::pair{0x18u, Opcode::V_CEIL_F64},
+      std::pair{0x1au, Opcode::V_FLOOR_F64}}) {
+    for (const bool vop3 : {false, true}) {
+      const std::array<uint32_t, 2> words = vop3
+          ? std::array<uint32_t, 2>{EncodeVop3Word0(0x180 + opcode, 1, 0, 1),
+                                   EncodeVop3Word1(8, 0, 0) | (1u << 29)}
+          : std::array<uint32_t, 2>{EncodeVop1(opcode, 1, 258), 0};
+      Instruction decoded;
+      DecodeInstruction(words, 0, decoded);
+      Check(decoded.opcode == expected && decoded.word_count == (vop3 ? 2u : 1u) &&
+                decoded.dst.reg == 1 && decoded.src0.reg == (vop3 ? 8u : 2u) &&
+                decoded.src0.absolute == vop3 && decoded.src0.negate == vop3,
+            "FP64 rounding lost its VOP1/VOP3 encoding, odd pair, or source modifiers");
+    }
+    for (const uint32_t source : {249u, 250u}) {
+      const uint32_t invalid[] = {EncodeVop1(opcode, 1, source),
+          source == 249u ? 0x00060604u : EncodeVop1Dpp(4, 0xe4)};
+      Instruction decoded;
+      DecodeInstruction(invalid, 0, decoded);
+      Check(decoded.opcode == Opcode::UNSUPPORTED,
+            "FP64 rounding accepted unsupported SDWA or DPP encoding");
+    }
+  }
+}
+
+void TestNewShaderRecompilerVop1SdwaBfrev() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[] = {0x7e0070f9u, 0x00040600u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::V_BFREV_B32 && decoded.word_count == 2 &&
+            decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 0 &&
+            decoded.dst.sdwa_sel == 6 && decoded.src0.kind == OperandKind::Vgpr &&
+            decoded.src0.reg == 0 && decoded.src0.sdwa_sel == 4 &&
+            !decoded.src0.sdwa_sext,
+        "captured V_BFREV_B32 SDWA source metadata is incorrect");
+  for (const uint32_t modifier : {0x00070600u, 0x00140600u, 0x00240600u,
+                                 0x00042600u, 0x00044600u, 0x00040400u,
+                                 0x00041e00u}) {
+    const uint32_t invalid[] = {captured[0], modifier};
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.word_count == 2 && decoded.opcode == Opcode::UNSUPPORTED,
+          "V_BFREV_B32 SDWA accepted unsupported selectors or modifiers");
+  }
+}
+
+void TestVop2SdwaMulI24Destination() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[][2] = {
+      {0x121818f9u, 0x04861488u}, {0x123434f9u, 0x0486146au}};
+  for (uint32_t index = 0; index < 2; ++index) {
+    Instruction decoded;
+    DecodeInstruction(captured[index], 0, decoded);
+    const uint32_t reg = index == 0 ? 12u : 26u;
+    Check(decoded.opcode == Opcode::V_MUL_I32_I24 && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == reg &&
+              decoded.dst.sdwa_sel == 4 && decoded.dst.sdwa_dst_unused == 2 &&
+              decoded.dst.explicit_sdwa_dst && !decoded.dst.clamp &&
+              decoded.dst.omod == 0 && decoded.src0.sdwa_sel == 6 &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == reg &&
+              decoded.src1.sdwa_sel == 4 && !decoded.src1.sdwa_sext,
+          "captured V_MUL_I32_I24 SDWA destination/source metadata is incorrect");
+    Check(index == 0 ? decoded.src0.kind == OperandKind::IntegerInlineConstant &&
+                           decoded.src0.value == 8
+                     : decoded.src0.kind == OperandKind::VccLo,
+          "captured V_MUL_I32_I24 SDWA scalar source is incorrect");
+  }
+  for (const uint32_t modifier : {
+           0x04861788u, 0x04861c88u, 0x04871488u, 0x07861488u,
+           0x04961488u, 0x04a61488u, 0x14861488u, 0x24861488u,
+           0x04863488u, 0x04865488u}) {
+    const uint32_t invalid[] = {captured[0][0], modifier};
+    Instruction decoded;
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.word_count == 2,
+          "V_MUL_I32_I24 SDWA accepted reserved selectors or float modifiers");
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -4692,8 +4814,8 @@ void TestNewShaderDecoderArchitecture() {
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   const uint32_t opcodes[] = {
-      0xa2u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
-      0xf5u}; // eq_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
+      0xa2u, 0xa5u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
+      0xf5u}; // eq_i64, ne_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
   for (const auto opcode : opcodes) {
     const uint32_t shader[] = {
         EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
@@ -4711,6 +4833,13 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
     Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
           "64-bit VOPC DPP rejection reason was not explicit");
   }
+  const uint32_t sdwa[] = {EncodeVopc(0xa5u, 249u, 0u), 0x06060000u};
+  ShaderRecompiler::Decoder::Instruction compare;
+  ShaderRecompiler::Decoder::DecodeInstruction(sdwa, 0u, compare);
+  Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED &&
+            compare.word_count == 2u &&
+            compare.unsupported_reason.find("VOPC SDWA modifier is not supported") != std::string::npos,
+        "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
@@ -4767,6 +4896,46 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   Check((result.decoded_dump.find("V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo") != std::string::npos),
         "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestVopcCmpxClassF16Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+  for (const uint32_t modifier : {0x86360000u, 0x86350002u}) {
+    const uint32_t captured[] = {0x7d3f70f9u, modifier};
+    Instruction decoded;
+    DecodeInstruction(captured, 0, decoded);
+    Check(decoded.opcode == Opcode::V_CMPX_CLASS_F16 && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::ExecLo &&
+              decoded.src0.kind == OperandKind::Vgpr &&
+              decoded.src0.reg == (modifier == 0x86360000u ? 0u : 2u) &&
+              decoded.src0.sdwa_sel == (modifier == 0x86360000u ? 6u : 5u) &&
+              decoded.src0.absolute && decoded.src0.negate &&
+              decoded.src1.kind == OperandKind::IntegerInlineConstant &&
+              decoded.src1.value == 56 && decoded.src1.sdwa_sel == 6,
+          "captured V_CMPX_CLASS_F16 SDWA fields are incorrect");
+    const uint32_t shader[] = {captured[0], captured[1], EncodeSopp(0x01)};
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  const uint32_t compact[] = {EncodeVopc(0x9f, 256, 1)};
+  const uint32_t vop3[] = {EncodeVop3Word0(0x9f, 126),
+                           EncodeVop3Word1(256, 257, 0)};
+  for (auto words : {std::span<const uint32_t>(compact),
+                     std::span<const uint32_t>(vop3)}) {
+    Instruction decoded;
+    DecodeInstruction(words, 0, decoded);
+    Check(decoded.opcode == Opcode::V_CMPX_CLASS_F16 &&
+              decoded.dst.kind == OperandKind::ExecLo && decoded.src0.reg == 0 &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == 1,
+          "compact/VOP3 V_CMPX_CLASS_F16 did not decode to an EXEC compare");
+  }
+  for (const uint32_t modifier : {0x86370000u, 0x87360000u}) {
+    const uint32_t invalid[] = {0x7d3f70f9u, modifier};
+    Instruction decoded;
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.word_count == 2,
+          "V_CMPX_CLASS_F16 accepted reserved SDWA selector 7");
+  }
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16() {
@@ -8890,6 +9059,46 @@ void TestNativeScalarReadDescriptorPlanning() {
   }
 }
 
+void TestScalarSelectedVccBufferAddress() {
+  using namespace ShaderRecompiler::IR;
+  // 68ca7b6fd9c44cfa selects an ordinary 64-bit address through VCC before
+  // copying its words into a writable buffer descriptor.
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 4, 128), EncodeSop2(0x0b, 106, 0, 2),
+      EncodeVop1(0x01, 1, 106), EncodeVop1(0x02, 8, 257),
+      EncodeSMovB32(9, 107), EncodeSMovB32(10, 132),
+      EncodeSMovB32(11, 255), 3u << 28u,
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 2, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 5> userdata{0x12345670u, 0x12u, 0xb27c0000u, 0x30u, 0u};
+  for (const uint32_t wave_size : {32u, 64u}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    auto input = *options.input_info.compute;
+    input.threads_num[0] = input.wave_size = options.wave_size = wave_size;
+    options.input_info.compute = &input;
+    options.user_data = userdata;
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto plan = ExtractResourcePlan(translated.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const uint32_t condition : {0u, 1u}) {
+      userdata[4] = condition;
+      Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+            "scalar-selected VCC address did not materialize");
+      const auto offset = condition ? 0u : 2u;
+      Check(snapshot.buffers.size() == 1 && snapshot.flattened_srt.empty() &&
+                snapshot.specialization_reads.empty() &&
+                snapshot.buffers[0].dwords[0] == userdata[offset] &&
+                snapshot.buffers[0].dwords[1] == userdata[offset + 1],
+            "VCC selection replaced raw address words with a lane ballot");
+    }
+    const auto compiled = ShaderRecompiler::CompileProgram(
+        std::move(translated), options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 void TestNativeGuardedSamplerSource() {
   constexpr uint32_t nested = 12, sample = 18, join = 20, end = 22;
   const uint32_t shader[] = {
@@ -10012,6 +10221,48 @@ void TestWaveRowReduction() {
         "a DPP row scan with V_PERMLANEX16 read at lanes 31 and 63 did not become two reductions");
   Check(native_reductions(0x117, false) == 0 && native_reductions(0x117, true) == 0,
         "a scan with the wrong last shift was taken for a lane reduction");
+
+  // The same scan as a pixel shader's work-list loop writes it (PS 0x00e3d8e3fcdfd5a7): EXEC saved,
+  // WQM, the lanes with work through S_AND_SAVEEXEC, every lane through S_ORN2_SAVEEXEC of that
+  // mask, the scan over the lanes with work, EXEC restored. With the mask reads folded (FoldLaneMasks), EXEC of the scan is x || !x; the scan
+  // must still become native reductions, or the emulated one hangs the GPU (DEBUGGING.md,
+  // 2026-10-01).
+  {
+    const std::vector<uint32_t> shader = {
+        EncodeVop3Word0(0x365, 3), EncodeVop3Word1(193, 128, 0),    // v_mbcnt_lo_u32_b32 v3, -1, 0
+        EncodeSMovB32(80, 126),                                     // s_mov_b32 s80, exec_lo
+        EncodeSop1(0x09, 126, 126),                                 // s_wqm_b32 exec_lo, exec_lo
+        EncodeVopc(0xd1, 130, 3),                                   // v_cmpx_lt_u32 exec_lo, 2, v3
+        EncodeVopc(0xc1, 132, 3),                                   // v_cmp_lt_u32 vcc_lo, 4, v3
+        EncodeSop1(0x3c, 69, 106),                                  // s_and_saveexec_b32 s69, vcc_lo
+        EncodeSMovB32(126, 69),                                     // s_mov_b32 exec_lo, s69
+        EncodeSop2(0x0e, 0, 69, 80),                                // s_and_b32 s0, s69, s80
+        EncodeSop1(0x40, 106, 69),                                  // s_orn2_saveexec_b32 vcc_lo, s69
+        EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 3, 0), // v_cndmask_b32 v1, 0, v3, s0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x111),       // v_max_u32 v1, v1 row_shr:1, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x118),
+        EncodeSMovB32(126, 106),                                    // s_mov_b32 exec_lo, vcc_lo
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + 15, 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + 31, 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                                  // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                                     // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2),              // exp mrt0
+        0xbf810000u,
+    };
+    auto options      = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = 32;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t     found  = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    Check(found == 2, "a work-list scan after S_ORN2_SAVEEXEC did not become two row reductions");
+  }
 }
 
 // V_ADD_F64 and the f64 compares of two engine shaders (V_CMP_LE_F64, V_CMPX_LE_F64,
@@ -12916,6 +13167,35 @@ void TestBlendMappingClassification() {
   blend.color_srcblend = static_cast<uint8_t>(Factor::kDstAlpha);
   Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
         "destination alpha incorrectly used the physical alpha channel");
+
+  blend.separate_alpha_blend = true;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kSrcAlpha);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.color_destblend = blend.alpha_destblend =
+      static_cast<uint8_t>(Factor::kOneMinusSrcAlpha);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaOne,
+        "separate alpha accumulation did not preserve its unit source factor");
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaZero,
+        "separate alpha attenuation did not preserve its zero source factor");
+  blend.alpha_srcblend = blend.color_srcblend;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlpha,
+        "equal separate alpha equations did not reuse the broadcast alpha mode");
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kOne);
+  const auto exact = blend;
+  for (uint32_t changed = 0; changed < 6; changed++) {
+    blend = exact;
+    switch (changed) {
+      case 0: blend.color_srcblend = static_cast<uint8_t>(Factor::kZero); break;
+      case 1: blend.color_destblend = static_cast<uint8_t>(Factor::kOne); break;
+      case 2: blend.alpha_srcblend = static_cast<uint8_t>(Factor::kDstAlpha); break;
+      case 3: blend.alpha_destblend = static_cast<uint8_t>(Factor::kOne); break;
+      case 4: blend.color_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
+      case 5: blend.alpha_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
+    }
+    Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+          "separate alpha lowering accepted a different blend equation");
+  }
 }
 
 void TestLogicalAlphaBlendExport() {
@@ -12925,58 +13205,85 @@ void TestLogicalAlphaBlendExport() {
   const auto ordinary_key = MakeStageStaticKey(pixel);
   pixel.dual_source_blending = true;
   const auto guest_key = MakeStageStaticKey(pixel);
-  pixel.alpha_blend_source_remap = true;
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
   const auto remapped_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+  const auto separate_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+  const auto zero_key = MakeStageStaticKey(pixel);
   Check(ordinary_key != guest_key && guest_key != remapped_key &&
-            ordinary_key != remapped_key,
-        "ordinary, guest dual-source, and logical-alpha shaders share a cache key");
+            ordinary_key != remapped_key && separate_key != ordinary_key &&
+            separate_key != guest_key && separate_key != remapped_key &&
+            zero_key != ordinary_key && zero_key != guest_key &&
+            zero_key != remapped_key && zero_key != separate_key,
+        "ordinary, guest dual-source, and logical-alpha modes share a cache key");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &pixel;
-  for (const bool compressed : {false, true}) {
-    const uint32_t shader[] = {
-        // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
-        EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
-        EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
-        EncodeVop1(0x01, 2, 255), 0x40400000u,
-        EncodeVop1(0x01, 3, 255), 0x3e800000u,
-        EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
-        EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
-        EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
-        EncodeSopp(0x01),
-    };
-    const auto result = RecompileForTest(shader, options);
-    CheckSpirvBinaryValidates(result.spirv);
-    const auto source = DisassembleSpirvBinary(result.spirv);
-    Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
-              source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
-              CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
-              source.find("out_mrt_2") == std::string::npos,
-          "inactive MRT exports overwrote the logical-alpha output");
-    Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
-          "ignoring inactive MRT stores discarded their valid-mask export");
-    uint32_t alpha_input = 0;
-    uint32_t color_input = 0;
-    for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
-      if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
-        continue;
+  for (const auto mode : {ShaderAlphaBlendSource::SourceAlpha,
+                          ShaderAlphaBlendSource::SourceAlphaOne}) {
+    pixel.alpha_blend_source = mode;
+    for (const bool compressed : {false, true}) {
+      const uint32_t shader[] = {
+          // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
+          EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
+          EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
+          EncodeVop1(0x01, 2, 255), 0x40400000u,
+          EncodeVop1(0x01, 3, 255), 0x3e800000u,
+          EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
+          EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
+          EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
+          EncodeSopp(0x01),
+      };
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto source = DisassembleSpirvBinary(result.spirv);
+      Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+                source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+                CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+                source.find("out_mrt_2") == std::string::npos,
+            "inactive MRT exports overwrote the logical-alpha output");
+      Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
+            "ignoring inactive MRT stores discarded their valid-mask export");
+      uint32_t alpha_input = 0;
+      uint32_t alpha_broadcast = 0;
+      uint32_t color_input = 0;
+      uint32_t one = 0;
+      bool unit_alpha_factor = false;
+      for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
+        const auto opcode = result.spirv[i] & 0xffffu;
+        if (opcode == 43u && (result.spirv[i] >> 16u) == 4u &&
+            result.spirv[i + 3] == 0x3f800000u) {
+          one = result.spirv[i + 2];
+        }
+        if (opcode == 82u && (result.spirv[i] >> 16u) == 6u &&
+            result.spirv[i + 3] == one && result.spirv[i + 4] == alpha_broadcast &&
+            result.spirv[i + 5] == 0u) {
+          unit_alpha_factor = true;
+        }
+        if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
+          continue;
+        }
+        const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
+        if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
+          alpha_input = result.spirv[i + 3];
+          alpha_broadcast = result.spirv[i + 2];
+        } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
+          color_input = result.spirv[i + 3];
+        }
       }
-      const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
-      if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
-        alpha_input = result.spirv[i + 3];
-      } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
-        color_input = result.spirv[i + 3];
-      }
+      Check(alpha_input != 0 && alpha_input == color_input,
+            "blend source did not broadcast logical alpha before the physical export swizzle");
+      Check(unit_alpha_factor == (mode == ShaderAlphaBlendSource::SourceAlphaOne),
+            "secondary ABGR output must be (1, Sa, Sa, Sa) only for separate alpha accumulation");
     }
-    Check(alpha_input != 0 && alpha_input == color_input,
-          "blend source did not broadcast logical alpha before the physical export swizzle");
   }
 
   const uint32_t guest_shader[] = {
       EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
       EncodeExp0(1, 0xf), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
   };
-  pixel.alpha_blend_source_remap = false;
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::None;
   pixel.target_output_mode[1] = pixel.target_output_mode[0];
   pixel.target_export_mapping = {};
   const auto guest = RecompileForTest(guest_shader, options);
@@ -14700,7 +15007,11 @@ int main() {
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerCapturedFractF64();
+  TestNewShaderRecompilerF64AluEncodings();
+  TestNewShaderRecompilerVop1SdwaBfrev();
   TestNewShaderRecompilerVop1SdwaNotDestination();
+  TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
@@ -14712,6 +15023,7 @@ int main() {
   TestDeadImageAccessKeepsNoImageIndex();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
+  TestVopcCmpxClassF16Decoder();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
@@ -14756,6 +15068,7 @@ int main() {
   TestSharedExitPreservesNativeDescriptorSources();
   TestNestedSelectionPreservesDescriptorSources();
   TestNativeScalarReadDescriptorPlanning();
+  TestScalarSelectedVccBufferAddress();
   TestNativeGuardedSamplerSource();
   TestNativeDescriptorProvenanceRejectsGpuSelection();
   TestCfgSiblingSharedExit();

@@ -79,6 +79,16 @@ int main() {
   Check(late.load() == 9,
         "a switch registered after the file was read missed its value");
 
+  // KYTY_VRAM_SAVER presets.
+  using Common::LiveSwitches::PresetValue;
+  Check(PresetValue("KYTY_VMA_BLOCK_MB", 256, 0) == 256, "level 0 changed a default");
+  Check(PresetValue("KYTY_VMA_BLOCK_MB", 256, 1) == 256, "level 1 took a level-2 preset");
+  Check(PresetValue("KYTY_VMA_BLOCK_MB", 256, 2) == 64, "level 2 missed its preset");
+  Check(PresetValue("KYTY_GC_HOST_SIZES", 0, 1) == 1, "level 1 missed its preset");
+  Check(PresetValue("KYTY_GC_HOST_SIZES", 0, 2) == 1, "level 2 lost a level-1 preset");
+  Check(PresetValue("KYTY_GC_DRIVER_MARGIN_MB", 0, 1) == 768, "level 1 missed the driver margin");
+  Check(PresetValue("KYTY_TEST_UNSET", 42, 2) == 42, "a switch outside the preset changed");
+
   std::error_code error;
   std::filesystem::remove(path, error);
   std::printf("LiveSwitchesTests: OK\n");

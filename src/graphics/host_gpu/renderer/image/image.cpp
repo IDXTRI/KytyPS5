@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
@@ -251,6 +252,9 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	uploads++;
+	content_seq       = NextContentSeq();
+	last_upload_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -351,7 +355,9 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
+	const uint32_t base_depth = source.backing.image_type == backing.image_type
+	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
+	                            : backing.image_type == vk::ImageType::e3D
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
 	const auto     source_aspect =
@@ -465,7 +471,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 	return static_cast<uint32_t>(std::min<uint64_t>(rows, capacity / row_size));
 }
 
-void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
+void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -483,6 +489,8 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
 	EXIT_IF(levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
 	        source_block != destination_block);
+	const auto source_transform = source.info.GetColorTransform();
+	const auto target_transform = info.GetColorTransform();
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
@@ -544,9 +552,19 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
-				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-				command.pipelineBarrier2(dependency);
+				if (source_transform != target_transform) {
+					const TileManager::Result bytes {buffer.Handle(), 0, copy_size};
+					if (source_transform != ColorTransform::None) {
+						tiler.TransformColor(bytes, bytes, source_transform, false);
+					}
+					if (target_transform != ColorTransform::None) {
+						tiler.TransformColor(bytes, bytes, target_transform, true);
+					}
+				} else {
+					barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+					command.pipelineBarrier2(dependency);
+				}
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
@@ -682,9 +700,12 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
+    : info(image_info),
+      stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
+      m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
+	created_frame = graphics.presented_frames.load(std::memory_order_relaxed);
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
 	if (info.pixel_format == vk::Format::eUndefined) {
@@ -720,6 +741,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	host_bytes = graphics.ImageAllocationSize(backing);
 	if (graphics.address_binding_report_enabled) {
 		AddressBindingDescribeObject(
 		    reinterpret_cast<uint64_t>(static_cast<VkImage>(backing.image)),

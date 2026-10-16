@@ -182,6 +182,8 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -207,8 +209,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
+	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -338,6 +340,11 @@ void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 // The guest hash the shader binary declares (a content hash when it declares none).
 uint64_t ShaderDeclaredHash(uint64_t shader_addr);
+// KYTY_SHADER_TIMELINE=1 (default 0): the time each shader code hash was first registered
+// (sceAgcCreateShader), to measure how long before its first use the game creates it.
+bool   ShaderTimelineEnabled();
+// Seconds since the code hash was first registered, or a negative value if it never was.
+double ShaderRegisteredSecondsAgo(uint64_t hash);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

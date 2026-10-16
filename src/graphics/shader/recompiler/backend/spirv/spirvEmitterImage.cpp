@@ -838,10 +838,38 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		                          index);
 		state.builder.AddFunction(spv::OpStore, pointer, flag);
 	}
+	static const uint64_t trace_hash = [] {
+		const char* value = std::getenv("KYTY_TRACE_BINDLESS");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	if (trace_hash != 0 && state.program.shader_hash == trace_hash &&
+	    state.bindless_feedback_variable != 0) {
+		const auto store = [&](uint32_t word, uint32_t value) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+			                          ConstantU32(state, IR::BindlessTraceBase + word));
+			state.builder.AddFunction(spv::OpStore, pointer, value);
+		};
+		store(0, key);
+		store(1, raw);
+		store(2, base);
+		store(3, count);
+	}
 	const auto slot    = state.builder.AllocateId();
 	// Pending keys sample slot 2 (the blue placeholder) while their texture is loaded.
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, pending, ConstantU32(state, 2u),
 	                          raw);
+	if (state.bindless_vertex_pending != 0) {
+		// Slots 0-2 are the placeholders (not resident, key outside its heap, pending), all of
+		// which read 0: a vertex built from them is dropped at the position export.
+		const auto placeholder = Binary(state, spv::OpULessThan, TypeBool(state), slot,
+		                                ConstantU32(state, 3u));
+		const auto before      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), before, state.bindless_vertex_pending);
+		const auto after = Binary(state, spv::OpLogicalOr, TypeBool(state), before, placeholder);
+		state.builder.AddFunction(spv::OpStore, state.bindless_vertex_pending, after);
+	}
 	state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
 	return slot;
 }
@@ -988,8 +1016,14 @@ static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerReso
 	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
 	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
 	const auto slot     = state.builder.AllocateId();
+	// KYTY_BINDLESS_SAMPLER_CLASS_DEFAULTS=1: the default sampler of this use's kind.
+	const uint32_t default_slot =
+	    IR::BindlessSamplerClassDefaults()
+	        ? IR::BindlessSamplerKind(sampler.depth_compare, sampler.force_point_filtering,
+	                                  sampler.integer_border)
+	        : 0u;
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, in_range, entry,
-	                          ConstantU32(state, 0u));
+	                          ConstantU32(state, default_slot));
 	state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
 	return slot;
 }

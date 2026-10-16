@@ -14,18 +14,20 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
-#include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -809,14 +811,95 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// Otherwise the page may carry a transient watch protection no tracker owns any more while
 		// the guest mapping allows the access (Wolverine run 101: the Render Thread's memcpy into
 		// texture memory the GPU side no longer lists as mapped). Restore it and retry.
-		if (access != GpuAccess::Execute &&
-		    (IsAccessibleNow(info->access_violation_vaddr, access == GpuAccess::Write) ||
-		     Libs::LibKernel::Memory::RepairOrphanedProtection(info->access_violation_vaddr,
-		                                                        access == GpuAccess::Write))) {
+		// Research switches for the unhandled-fault reports (Wolverine run 96, a Discord user's v1
+		// log: the Render Thread's AVX memcpy writing a page start in extended memory, repair
+		// declined). All default off = the behaviour above.
+		// KYTY_FAULT_WATCHED_UNMAPPED=1 (live): a page the trackers still watch while its range is
+		// not listed as GPU-mapped (an unmap or a map in progress on the GPU thread) is handed to
+		// the caches that watch it instead of being treated as nobody's.
+		// KYTY_FAULT_REPAIR_HOST_PAGE=1 (live): the orphan repair lifts only the 4 KiB host page
+		// of the fault, not the whole 16 KiB guest page with its still-watched neighbours.
+		// KYTY_FAULT_SETTLE_MS=N (live): before giving up, re-run the checks for up to N ms; a
+		// fault raised while another thread maps, unmaps or re-protects the page resolves once
+		// that operation has finished.
+		static auto& watched_unmapped = Common::LiveSwitches::Get("KYTY_FAULT_WATCHED_UNMAPPED", 0);
+		static auto& repair_host_page = Common::LiveSwitches::Get("KYTY_FAULT_REPAIR_HOST_PAGE", 0);
+		static auto& settle_ms        = Common::LiveSwitches::Get("KYTY_FAULT_SETTLE_MS", 0);
+		const auto   vaddr            = info->access_violation_vaddr;
+		const bool   write            = access == GpuAccess::Write;
+		const auto   recoverable      = [&]() {
+			if (access == GpuAccess::Execute) {
+				return false;
+			}
+			if (watched_unmapped.load(std::memory_order_relaxed) != 0 &&
+			    Libs::LibKernel::Memory::HandleWatchedUnmappedGpuFault(access, vaddr)) {
+				return true;
+			}
+			return IsAccessibleNow(vaddr, write) ||
+			       Libs::LibKernel::Memory::RepairOrphanedProtection(
+			           vaddr, write, repair_host_page.load(std::memory_order_relaxed) != 0);
+		};
+		bool recovered = recoverable();
+		// KYTY_FAULT_AMM_WAIT_MS=N (live, default 5000; 0 = off): a write into extended memory
+		// that a queued AMM submission will map waits for that map, up to N ms. On the hardware
+		// the map runs within microseconds; here its ring can sit behind a wait on the emulated
+		// GPU. Wolverine crash (a), run 2026-10-12 03:47: the Render Thread copied into memory
+		// right past a mapped range, never mapped in the session (extended history).
+		static auto& amm_wait_ms = Common::LiveSwitches::Get("KYTY_FAULT_AMM_WAIT_MS", 5000);
+		if (!recovered && access != GpuAccess::Execute &&
+		    vaddr >= Libs::LibKernel::Memory::kExtendedMemoryBase &&
+		    Libs::LibKernel::Memory::PendingAmmMapCovers(vaddr)) {
+			const auto start    = std::chrono::steady_clock::now();
+			const auto deadline = start + std::chrono::milliseconds(std::max<int64_t>(
+			                                  0, amm_wait_ms.load(std::memory_order_relaxed)));
+			while (!recovered && std::chrono::steady_clock::now() < deadline &&
+			       Libs::LibKernel::Memory::PendingAmmMapCovers(vaddr)) {
+				std::this_thread::sleep_for(std::chrono::microseconds(200));
+				recovered = recoverable();
+			}
+			recovered = recovered || recoverable();
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("Host fault at 0x%016" PRIx64 ": waited %lld us for a queued AMM map: %s\n",
+				            vaddr,
+				            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+				                                       std::chrono::steady_clock::now() - start)
+				                                       .count()),
+				            recovered ? "recovered" : "still unmapped");
+				std::fflush(stdout);
+			}
+		}
+		if (!recovered && access != GpuAccess::Execute) {
+			const auto limit = settle_ms.load(std::memory_order_relaxed);
+			if (limit > 0) {
+				const auto start    = std::chrono::steady_clock::now();
+				const auto deadline = start + std::chrono::milliseconds(limit);
+				while (!recovered && std::chrono::steady_clock::now() < deadline) {
+					std::this_thread::sleep_for(std::chrono::microseconds(200));
+					// Writes only through HandleGpuFault: a read it resolves may need its load
+					// served from the backing store (TakeServeFromBacking, handled above).
+					recovered =
+					    (write && Libs::LibKernel::Memory::HandleGpuFault(access, vaddr)) ||
+					    recoverable();
+				}
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("Host fault at 0x%016" PRIx64 " (%s): %s after %lld us of settling\n",
+					            vaddr, write ? "write" : "read",
+					            recovered ? "recovered" : "still unhandled",
+					            static_cast<long long>(
+					                std::chrono::duration_cast<std::chrono::microseconds>(
+					                    std::chrono::steady_clock::now() - start)
+					                    .count()));
+					std::fflush(stdout);
+				}
+			}
+		}
+		if (recovered) {
 			thread_local uint64_t retried_address = 0;
 			thread_local uint32_t retries         = 0;
-			retries         = retried_address == info->access_violation_vaddr ? retries + 1 : 0;
-			retried_address = info->access_violation_vaddr;
+			retries         = retried_address == vaddr ? retries + 1 : 0;
+			retried_address = vaddr;
 			if (retries < 64) {
 				return true;
 			}
@@ -830,6 +913,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
+		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			Libs::LibKernel::Memory::DescribeFaultAddress(
+			    info->access_violation_vaddr,
+			    info->access_violation_type == Common::HostException::AccessViolationType::Write);
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
@@ -1409,7 +1497,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
-	PreloadAdjacentPrograms();
+	// The runtime automatically loads libc; other PRXs are requested by the application.
+	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
+	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1418,7 +1508,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
-	StartAllModules();
+	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
+		StartModule(libc, 0, nullptr, nullptr);
+	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1671,84 +1763,6 @@ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	}
 }
 
-static std::string GetProgramModuleName(const Program* program) {
-	EXIT_IF(program == nullptr);
-
-	if (program->dynamic_info != nullptr && program->dynamic_info->so_name != nullptr &&
-	    program->dynamic_info->so_name[0] != '\0') {
-		return std::string(program->dynamic_info->so_name);
-	}
-
-	return Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name));
-}
-
-static bool ModuleStartDependenciesSatisfied(const Program*               program,
-                                             const std::vector<Program*>& programs,
-                                             const std::vector<Program*>& started) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->dynamic_info == nullptr);
-
-	for (const auto* needed: program->dynamic_info->needed) {
-		if (needed == nullptr || needed[0] == '\0') {
-			continue;
-		}
-
-		const auto needed_name = std::string(needed);
-
-		for (auto* dependency: programs) {
-			if (dependency == nullptr || dependency == program || dependency->elf == nullptr ||
-			    !dependency->elf->IsShared()) {
-				continue;
-			}
-
-			const auto dependency_name = GetProgramModuleName(dependency);
-			if (Common::EqualNoCase(dependency_name, needed_name) ||
-			    Common::EqualNoCase(Common::FilenameWithoutDirectory(
-			                            Common::PathToGenericString(dependency->file_name)),
-			                        needed_name)) {
-				if (std::find(started.begin(), started.end(), dependency) == started.end()) {
-					return false;
-				}
-				break;
-			}
-		}
-	}
-
-	return true;
-}
-
-void RuntimeLinker::StartAllModules() {
-	Common::LockGuard lock(m_mutex);
-
-	std::vector<Program*> started;
-
-	for (;;) {
-		bool progressed = false;
-
-		for (auto* p: m_programs) {
-			if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-			    std::find(started.begin(), started.end(), p) == started.end() &&
-			    ModuleStartDependenciesSatisfied(p, m_programs, started)) {
-				StartModule(p, 0, nullptr, nullptr);
-				started.push_back(p);
-				progressed = true;
-			}
-		}
-
-		if (!progressed) {
-			break;
-		}
-	}
-
-	for (auto* p: m_programs) {
-		if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-		    std::find(started.begin(), started.end(), p) == started.end()) {
-			StartModule(p, 0, nullptr, nullptr);
-			started.push_back(p);
-		}
-	}
-}
-
 void RuntimeLinker::StopAllModules() {
 	Common::LockGuard lock(m_mutex);
 
@@ -1756,75 +1770,6 @@ void RuntimeLinker::StopAllModules() {
 		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
 			StopModule(p, 0, nullptr, nullptr);
 		}
-	}
-}
-
-static bool IsAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower.ends_with(".prx") || lower.ends_with(".sprx");
-}
-
-static bool SkipAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower == "eboot.bin" || lower == "libkernel.prx" || lower == "libkernel_sys.prx";
-}
-
-void RuntimeLinker::PreloadAdjacentPrograms() {
-	if (m_programs.empty()) {
-		return;
-	}
-
-	std::vector<std::filesystem::path> module_paths;
-
-	auto is_loaded = [this](const std::filesystem::path& path) {
-		auto fixed_path = Common::FixFilenameSlash(Common::PathToGenericString(path));
-		for (auto* program: m_programs) {
-			if (Common::EqualNoCase(
-			        Common::FixFilenameSlash(Common::PathToGenericString(program->file_name)),
-			        fixed_path)) {
-				return true;
-			}
-		}
-		return false;
-	};
-
-	auto add_path = [&module_paths, &is_loaded](const std::filesystem::path& path) {
-		if (is_loaded(path)) {
-			return;
-		}
-		for (const auto& p: module_paths) {
-			if (Common::EqualNoCase(Common::PathToGenericString(p),
-			                        Common::PathToGenericString(path))) {
-				return;
-			}
-		}
-		module_paths.push_back(path);
-	};
-
-	auto add_dir = [&add_path](const std::filesystem::path& dir) {
-		if (!Common::File::IsDirectoryExisting(dir)) {
-			return;
-		}
-		for (const auto& entry: Common::File::GetDirEntries(dir)) {
-			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
-			    !SkipAdjacentModuleFile(entry.name)) {
-				add_path(dir / entry.name);
-			}
-		}
-	};
-
-	auto root = m_programs.at(0)->file_name.parent_path();
-	if (root.empty()) {
-		return;
-	}
-
-	add_dir(root);
-	add_dir(root / "sce_module");
-	add_dir(root / "sce_modules");
-
-	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
-		program->fail_if_global_not_resolved = false;
 	}
 }
 
@@ -1957,38 +1902,39 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-	const bool emulate_rsqrt = Config::AmdCpuEnabled();
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
-	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (use_red_zone_protection) {
-		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += RED_ZONE_TRAMPOLINE_SIZE;
-	}
+#if !defined(__APPLE__)
+	const bool emulate_amd = Config::AmdCpuEnabled();
+#else
+	const bool emulate_amd = false;
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+#else
+	const bool protect_memory_faults = false;
+#endif
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+
+	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	if (patch_guest_instructions) {
+		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
+		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (use_red_zone_protection) {
-		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
-		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
-		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
-		                           program->base_size_aligned,
-		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
-		                           program->red_zone_trampoline_size);
+	if (patch_guest_instructions) {
+		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
+		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
+		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
-#endif
 	if (!is_shared) {
-		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		program->tls.handler_vaddr += program->red_zone_trampoline_size;
-#endif
+		program->tls.handler_vaddr =
+		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
@@ -2008,10 +1954,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uint64_t                                   eh_frame_header_addr = 0;
 	uint64_t                                   eh_frame_header_size = 0;
-#endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
@@ -2070,52 +2014,68 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection && phdr[i].p_type == PT_GNU_EH_FRAME) {
+		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
 			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
 			eh_frame_header_size = phdr[i].p_memsz;
 		}
-#endif
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::vector<uintptr_t> function_starts;
-	if (use_red_zone_protection) {
-		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                 &function_starts)) {
-			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
-			     Common::PathToString(program->file_name).c_str());
+	if (patch_guest_instructions) {
+		std::vector<uintptr_t> function_starts;
+		const bool             have_function_starts =
+		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
+		                                &function_starts) &&
+		    !function_starts.empty();
+		const auto module_name = Common::PathToString(program->file_name.filename());
+		if (!have_function_starts) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
+			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                module_name));
 		}
-	}
-#endif
-	for (const auto& [segment_addr, segment_size]: executable_segments) {
-		uint64_t reciprocal_sqrt_count = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection) {
-			const auto result =
-			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
-			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
-			     result.red_zone_function_count, result.memory_instruction_count,
-			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
-			     result.stack_dependent_memory_instruction_count,
-			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
-			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+		GuestInstructionPatchResult totals {};
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_amd);
+			totals.reciprocal_sqrt += result.reciprocal_sqrt;
+			totals.extrq += result.extrq;
+			totals.insertq += result.insertq;
+			totals.rdpid += result.rdpid;
+			totals.clwb += result.clwb;
+			if (protect_memory_faults) {
+				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+				     module_name.c_str(),
+				     result.function_count, result.red_zone_function_count,
+				     result.memory_instruction_count, result.patched_memory_instruction_count,
+				     result.short_memory_instruction_count,
+				     result.stack_dependent_memory_instruction_count,
+				     result.control_flow_memory_instruction_count,
+				     result.unrelocatable_memory_instruction_count);
+			}
 		}
-#else
-		if (emulate_rsqrt) {
-			reciprocal_sqrt_count =
-			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
-			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
-		}
-#endif
-		if (reciprocal_sqrt_count != 0) {
-			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+		if (emulate_amd && have_function_starts) {
+			InstructionPatchCounts combined {};
+			std::string            details;
+			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
+			                                  {"EXTRQ", totals.extrq},
+			                                  {"INSERTQ", totals.insertq},
+			                                  {"RDPID", totals.rdpid},
+			                                  {"CLWB", totals.clwb}}) {
+				combined += counts;
+				if (!details.empty()) details += "; ";
+				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
+				                       counts.trapped, counts.Skipped());
+			}
+			const auto  found   = combined.found;
+			const auto  skipped = combined.Skipped();
+			const char* status  = found == 0         ? "no matching instructions"
+			                      : skipped == found ? "not patched"
+			                      : skipped != 0     ? "partially patched"
+			                                         : "patched";
+			Log::WriteToConsoleAndLog(
+			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
 
@@ -2144,11 +2104,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (program->red_zone_trampoline_size != 0) {
-			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
+		if (program->instruction_trampoline_size != 0) {
+			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
 		}
-#endif
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}
@@ -2230,12 +2188,6 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->debug != 0);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->textrel != 0);
-
-	std::vector<uint64_t> needed;
-	GetDynValues(elf, &needed, DT_NEEDED);
-	for (auto need: needed) {
-		program->dynamic_info->needed.push_back(program->dynamic_info->str_table + need);
-	}
 
 	uint64_t so_name = 0;
 	GetDynValue(elf, &so_name, DT_SONAME);

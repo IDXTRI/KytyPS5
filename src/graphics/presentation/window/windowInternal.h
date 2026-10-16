@@ -17,6 +17,9 @@ namespace Libs::Graphics {
 class Presenter;
 class RenderContext;
 
+// F9: write the frames kept by KYTY_GLITCH_CAPTURE (swapchain.cpp) after the next presentation.
+void RequestGlitchCapture();
+
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
 	std::vector<vk::SurfaceFormatKHR> formats;
@@ -42,7 +45,7 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
-	void                                                    Resize(uint32_t width, uint32_t height);
+	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);

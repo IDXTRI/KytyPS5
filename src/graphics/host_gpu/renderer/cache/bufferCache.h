@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <chrono>
+#include <deque>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -124,6 +125,8 @@ public:
 	void                            RunGarbageCollector();
 	// Bytes of the cached buffers.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
+	[[nodiscard]] size_t   BufferCount() const noexcept { return m_buffers.size(); }
+	[[nodiscard]] uint64_t RetiringBytes() const noexcept { return m_retiring_bytes; }
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -243,6 +246,17 @@ private:
 	std::chrono::steady_clock::time_point              m_bda_verify_last {};
 	Buffer                                             m_gds_buffer;
 	Buffer                                             m_bda_pagetable_buffer;
+	// KYTY_BUFFER_RETIRE_FRAMES (EraseBuffer).
+	struct RetiringBuffer {
+		BufferId id;
+		uint64_t tick;
+		uint64_t frame;
+		uint64_t bytes;
+	};
+	std::deque<RetiringBuffer> m_retiring_buffers;
+	uint64_t                   m_retiring_bytes = 0;
+	void                       EraseBuffer(BufferId id, bool gpu_done = false);
+	void                       RetireBuffers();
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;

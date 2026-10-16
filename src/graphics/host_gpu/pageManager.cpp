@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/profiler.h"
+#include "common/spinBackoff.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -61,11 +62,7 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
 class SpinGuard final {
 public:
-	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
-		}
-	}
+	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) { Common::SpinAcquire(m_lock); }
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
 	KYTY_CLASS_NO_COPY(SpinGuard);
 
@@ -299,6 +296,18 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {
 	}
 	const auto index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	return region->pages[index].access_watchers != 0;
+}
+
+void PageManager::Watchers(uint64_t vaddr, uint32_t& write, uint32_t& access) const noexcept {
+	write  = 0;
+	access = 0;
+	const auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return;
+	}
+	const auto& page = region->pages[static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE)];
+	write            = page.write_watchers;
+	access           = page.access_watchers;
 }
 
 template <bool track, bool is_read>

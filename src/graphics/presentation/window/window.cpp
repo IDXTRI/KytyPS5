@@ -207,6 +207,11 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 					RenderDocRequestCapture();
 				}
 				break;
+			case SDLK_F9:
+				if (!key.repeat) {
+					RequestGlitchCapture();
+				}
+				break;
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
@@ -372,11 +377,13 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
-void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+void WindowContext::Resize(int new_width, int new_height) {
+	if (new_width <= 0 || new_height <= 0) {
+		return;
+	}
 	Common::LockGuard lock(mutex);
-	graphic_ctx.screen_width  = new_width;
-	graphic_ctx.screen_height = new_height;
+	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
+	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {

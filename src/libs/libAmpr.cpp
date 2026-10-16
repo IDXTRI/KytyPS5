@@ -21,8 +21,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -907,6 +910,7 @@ struct CommandBufferState {
 	uint64_t buffer           = 0;
 	uint64_t size             = 0;
 	uint64_t write_offset     = 0;
+	uint64_t submit_seq       = 0; // AMM submission order (AmmOrder), set when submitted
 	bool     header_validated = false;
 	bool     buffer_validated = false;
 	struct ReadFileCommand {
@@ -1607,12 +1611,83 @@ struct PendingSubmission {
 	uint64_t           result = 0;
 };
 
+class SubmissionEngine;
+std::mutex                     g_engines_mutex;
+std::vector<SubmissionEngine*> g_engine_list;
+// The engine whose submission this thread executes (for the wait it is blocked in).
+thread_local SubmissionEngine* g_current_engine = nullptr;
+
 // One in-order engine each for the asset reader and the memory mapper, as on the hardware:
 // a wait in one engine only holds that engine, and the guest keeps submitting to the other.
 class SubmissionEngine {
 public:
 	SubmissionEngine(const char* name, bool amm_engine): m_name(name), m_amm_engine(amm_engine) {
+		{
+			std::scoped_lock lock(g_engines_mutex);
+			g_engine_list.push_back(this);
+		}
 		std::thread([this] { Run(); }).detach();
+	}
+
+	// The wait the running submission is blocked in (0 = none).
+	std::atomic<uint64_t> wait_address {0};
+	std::atomic<uint64_t> wait_ref {0};
+
+	// True if a queued or running submission maps a range that covers vaddr.
+	bool PendingMapCovers(uint64_t vaddr) {
+		std::scoped_lock lock(m_mutex);
+		const auto covers = [vaddr](const CommandBufferState& state) {
+			for (const auto& command: state.amm_map_commands) {
+				if (command.kind != AmmCommandKind::Unmap && vaddr >= command.va &&
+				    vaddr - command.va < command.size) {
+					return true;
+				}
+			}
+			return false;
+		};
+		if (m_current != nullptr && covers(m_current->state)) {
+			return true;
+		}
+		return std::any_of(m_queue.begin(), m_queue.end(),
+		                   [&](const PendingSubmission& s) { return covers(s.state); });
+	}
+
+	void Describe(uint64_t vaddr) {
+		std::scoped_lock lock(m_mutex);
+		if (m_current == nullptr && m_queue.empty()) {
+			return;
+		}
+		std::printf("  %s: %s, %zu queued", m_name, m_current != nullptr ? "running" : "idle",
+		            m_queue.size());
+		if (const auto address = wait_address.load(); address != 0) {
+			uint64_t observed = 0;
+			(void)AprShared::ReadGuest(address, &observed);
+			std::printf(", waiting on 0x%016" PRIx64 " for 0x%" PRIx64 " (now 0x%" PRIx64 ")", address,
+			            wait_ref.load(), observed);
+		}
+		std::printf("\n");
+		constexpr uint64_t Near  = 16ull << 20u;
+		const auto         print = [&](const CommandBufferState& state, const char* what) {
+			uint32_t shown = 0;
+			for (const auto& command: state.amm_map_commands) {
+				if (command.va < vaddr + Near && command.va + command.size + Near > vaddr && shown < 8) {
+					shown++;
+					std::printf("    %s seq %" PRIu64 ": %s 0x%016" PRIx64 "+0x%" PRIx64 "%s\n", what,
+					            state.submit_seq,
+					            command.kind == AmmCommandKind::Unmap ? "unmap" : "map", command.va,
+					            command.size,
+					            vaddr >= command.va && vaddr - command.va < command.size
+					                ? "  <- covers the fault"
+					                : "");
+				}
+			}
+		};
+		if (m_current != nullptr) {
+			print(m_current->state, "running");
+		}
+		for (const auto& submission: m_queue) {
+			print(submission.state, "queued");
+		}
 	}
 
 	void Enqueue(PendingSubmission&& submission) {
@@ -1632,11 +1707,13 @@ public:
 				return false;
 			}
 			m_running = true;
+			m_current = &submission;
 		}
 		Execute(submission);
 		{
 			std::scoped_lock lock(m_mutex);
 			m_running = false;
+			m_current = nullptr;
 		}
 		m_wake.notify_one();
 		return true;
@@ -1652,11 +1729,13 @@ private:
 				submission = std::move(m_queue.front());
 				m_queue.pop_front();
 				m_running = true;
+				m_current = &submission;
 			}
 			Execute(submission);
 			{
 				std::scoped_lock lock(m_mutex);
 				m_running = false;
+				m_current = nullptr;
 			}
 		}
 	}
@@ -1664,8 +1743,11 @@ private:
 	void Execute(const PendingSubmission& submission) {
 		int32_t  execution_result = OK;
 		uint32_t error_offset     = 0;
+		auto*    previous_engine  = g_current_engine;
+		g_current_engine          = this;
 		const auto submit_result = ExecuteCommandBufferState(submission.state, m_amm_engine,
 		                                                     &execution_result, &error_offset);
+		g_current_engine = previous_engine;
 		if (submit_result != OK && execution_result == OK) {
 			execution_result = submit_result;
 		}
@@ -1685,6 +1767,7 @@ private:
 	const char*                   m_name;
 	bool                          m_amm_engine = false;
 	bool                          m_running    = false;
+	const PendingSubmission*      m_current    = nullptr; // the running submission (under m_mutex)
 	std::mutex                    m_mutex;
 	std::condition_variable       m_wake;
 	std::deque<PendingSubmission> m_queue;
@@ -1704,17 +1787,121 @@ SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 		static std::deque<std::string> names;
 		names.push_back((amm_engine ? "amm" : "apr") + std::string(" p") + std::to_string(priority));
 		engine = new SubmissionEngine(names.back().c_str(), amm_engine);
+		static std::once_flag hooks;
+		std::call_once(hooks, [] {
+			LibKernel::Memory::SetPendingAmmHooks(
+			    [](uint64_t vaddr) {
+				    std::scoped_lock lock(g_engines_mutex);
+				    return std::any_of(g_engine_list.begin(), g_engine_list.end(),
+				                       [vaddr](SubmissionEngine* e) { return e->PendingMapCovers(vaddr); });
+			    },
+			    [](uint64_t vaddr) {
+				    std::printf("pending AMPR/AMM submissions (maps within 16 MiB of the fault):\n");
+				    std::scoped_lock lock(g_engines_mutex);
+				    for (auto* e: g_engine_list) {
+					    e->Describe(vaddr);
+				    }
+			    });
+		});
 	}
 	return *engine;
 }
 
 } // namespace
 
+// AMM submission order across the priority rings. The rings run independently (a wait holds
+// only its own ring), so an unmap queued behind a wait can run after a map submitted later on
+// another ring. On the hardware the wait clears in microseconds and the unmap comes first; here
+// it waits for the emulated GPU (100+ ms), and the late unmap destroyed the new mapping at the
+// same address. Wolverine crash (a), run 2026-10-12 03:40: MainThread mapped 0x801fc9bc000+0x24000
+// inline, the AMM engine unmapped it 100 ms later (an older submission), and the Render Thread's
+// copy into it faulted. So each AMM-mapped range remembers the submission that mapped it, and an
+// unmap leaves out the parts a later submission mapped: the result submission order gives.
+namespace AmmOrder {
+
+std::atomic<uint64_t> g_next_seq {0};
+std::mutex            g_mutex;
+// Mapped ranges: start -> (end, submission sequence of the map).
+std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_ranges;
+
+uint64_t NextSeq() {
+	return g_next_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+// Removes [start, end) from the tracked ranges, splitting the ones it cuts. g_mutex held.
+void EraseLocked(uint64_t start, uint64_t end) {
+	auto it = g_ranges.lower_bound(start);
+	if (it != g_ranges.begin() && std::prev(it)->second.first > start) {
+		--it;
+	}
+	while (it != g_ranges.end() && it->first < end) {
+		const auto [r_start, value] = *it;
+		const auto [r_end, r_seq]   = value;
+		it                          = g_ranges.erase(it);
+		if (r_start < start) {
+			g_ranges.emplace(r_start, std::make_pair(start, r_seq));
+		}
+		if (r_end > end) {
+			it = g_ranges.emplace(end, std::make_pair(r_end, r_seq)).first;
+			++it;
+		}
+	}
+}
+
+void Mapped(uint64_t va, uint64_t size, uint64_t seq) {
+	if (seq == 0 || size == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_mutex);
+	EraseLocked(va, va + size);
+	g_ranges.emplace(va, std::make_pair(va + size, seq));
+}
+
+// The parts of [va, va + size) an unmap from submission seq may remove: all of it except what a
+// later submission mapped. Those parts stop being tracked.
+std::vector<std::pair<uint64_t, uint64_t>> UnmapPieces(uint64_t va, uint64_t size, uint64_t seq,
+                                                       uint64_t* kept_bytes) {
+	std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	*kept_bytes = 0;
+	std::scoped_lock lock(g_mutex);
+	const auto       end    = va + size;
+	uint64_t         cursor = va;
+	auto             it     = g_ranges.lower_bound(va);
+	if (it != g_ranges.begin() && std::prev(it)->second.first > va) {
+		--it;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> newer;
+	for (; it != g_ranges.end() && it->first < end; ++it) {
+		if (seq != 0 && it->second.second > seq) {
+			newer.emplace_back(std::max(it->first, va), std::min(it->second.first, end));
+		}
+	}
+	for (const auto& [n_start, n_end]: newer) {
+		if (n_start > cursor) {
+			pieces.emplace_back(cursor, n_start - cursor);
+		}
+		*kept_bytes += n_end - n_start;
+		cursor = n_end;
+	}
+	if (cursor < end) {
+		pieces.emplace_back(cursor, end - cursor);
+	}
+	for (const auto& [p_start, p_size]: pieces) {
+		EraseLocked(p_start, p_start + p_size);
+	}
+	return pieces;
+}
+
+} // namespace AmmOrder
+
 static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
                                 uint32_t submission_id, uint64_t result_address) {
 	PendingSubmission submission;
 	if (!TryGetCommandBufferState(command_buffer, &submission.state)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (amm_engine) {
+		submission.state.submit_seq = AmmOrder::NextSeq();
 	}
 	submission.id     = submission_id;
 	submission.result = result_address;
@@ -1832,8 +2019,10 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 			case CommandKind::KernelEvent: {
 				const auto& command = state.kernel_event_commands[entry.index];
 				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
-				auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
-				    eq, command.id, reinterpret_cast<void*>(command.data));
+				// Upstream deb45a8b: APR completion events use the AMPR filter.
+				auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
+				    eq, static_cast<uintptr_t>(command.id), LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
+				    reinterpret_cast<void*>(command.data));
 				if (result != OK) {
 					LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
 					     ", result=0x%08" PRIx32 "\n",
@@ -1858,6 +2047,10 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				constexpr double   WaitReportSeconds = 10.0;
 				Common::Timer      wait_timer;
 				wait_timer.Start();
+				if (g_current_engine != nullptr) {
+					g_current_engine->wait_ref.store(command.ref_value);
+					g_current_engine->wait_address.store(command.address);
+				}
 				execution_lock.unlock();
 				uint64_t observed    = 0;
 				double   next_report = WaitReportSeconds;
@@ -1878,6 +2071,9 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 					}
 				}
 				execution_lock.lock();
+				if (g_current_engine != nullptr) {
+					g_current_engine->wait_address.store(0);
+				}
 				if (!satisfied(observed)) {
 					LOGF("\tAMPR wait-on-address cannot read its address: address=0x%016" PRIx64
 					     " compare=%u ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
@@ -1899,18 +2095,46 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				const auto& command = state.amm_map_commands[entry.index];
 				int         result  = OK;
 				if (command.kind == AmmCommandKind::Unmap) {
-					result = LibKernel::Memory::KernelMunmap(command.va, command.size);
+					uint64_t   kept   = 0;
+					const auto pieces = AmmOrder::UnmapPieces(command.va, command.size,
+					                                          state.submit_seq, &kept);
+					for (const auto& [piece_va, piece_size]: pieces) {
+						if (result == OK) {
+							result = LibKernel::Memory::KernelMunmap(piece_va, piece_size);
+						}
+					}
+					if (kept != 0) {
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+							std::printf("AMM: unmap of 0x%016" PRIx64 "+0x%" PRIx64
+							            " keeps 0x%" PRIx64 " bytes a later submission mapped\n",
+							            command.va, command.size, kept);
+							std::fflush(stdout);
+						}
+					}
 				} else {
 					result = ExecuteAmmMapCommand(command);
+					if (result == OK) {
+						AmmOrder::Mapped(command.va, command.size, state.submit_seq);
+					}
 				}
 
 				if (result != OK) {
-					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64
-					     " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
-					     " prot=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
-					     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
-					     command.size, command.type, static_cast<uint32_t>(command.prot),
-					     static_cast<uint32_t>(result));
+					// Printed, not LOGF (silent in our builds): a failed map ends the buffer, so
+					// its later maps are skipped too, and the game writes into the unmapped range
+					// later (suspect for the Render Thread's unmapped extended-memory write).
+					static std::atomic<uint32_t> reported {0};
+					if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+						std::printf("AMM submit command failed: kind=%u va=0x%016" PRIx64
+						            " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
+						            " prot=0x%08" PRIx32 " result=0x%08" PRIx32
+						            " (command %zu of %zu; the rest of the buffer is skipped)\n",
+						            static_cast<uint32_t>(command.kind), command.va,
+						            command.dmem_offset, command.size, command.type,
+						            static_cast<uint32_t>(command.prot), static_cast<uint32_t>(result),
+						            entry.index + 1, state.amm_map_commands.size());
+						std::fflush(stdout);
+					}
 					*execution_result = result;
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return OK;

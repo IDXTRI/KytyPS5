@@ -10,6 +10,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -17,12 +18,22 @@
 #include <unordered_map>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
 
 // KYTY_FAULT_STATS=1 (live, default 0): every 5 s, the tracked-page faults by kind, the distinct
-// pages and the pages that faulted most, to tell a few hot pages from many cold ones.
+// pages and the pages that faulted most, to tell a few hot pages from many cold ones; then the
+// faulting code sites with the time spent handling them. A site is an offset in the emulator
+// executable (symbolize with the build's PDB), or "guest" for game code. A read site in the
+// emulator stalls its thread until the GPU finishes (BufferCache::ReadMemory).
 class FaultStats {
 public:
 	static bool Enabled() {
@@ -30,11 +41,53 @@ public:
 		return enabled.load(std::memory_order_relaxed) != 0;
 	}
 
-	void Add(bool write, uint64_t vaddr) {
+	// The instruction that faulted, as an offset in the emulator executable; 0 for other code.
+	static uint64_t FaultSite() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		static const auto module_base = [](const char* name) {
+			return reinterpret_cast<uint64_t>(GetModuleHandleA(name));
+		};
+		static const uint64_t self  = module_base(nullptr);
+		static const uint64_t ntdll = module_base("ntdll.dll");
+		const auto            owner = [](void* pc) {
+            MEMORY_BASIC_INFORMATION info {};
+            return VirtualQuery(pc, &info, sizeof(info)) != 0
+			                      ? reinterpret_cast<uint64_t>(info.AllocationBase)
+			                      : 0;
+		};
+		void*      frames[48] {};
+		const auto count = CaptureStackBackTrace(0, 48, frames, nullptr);
+		// This handler's frames, the exception dispatch in ntdll, then the faulting code.
+		bool seen_self = false;
+		for (USHORT i = 0; i < count; i++) {
+			const auto base = owner(frames[i]);
+			if (base == self) {
+				seen_self = true;
+				continue;
+			}
+			if (!seen_self || base != ntdll) {
+				continue;
+			}
+			while (i + 1 < count && owner(frames[i + 1]) == ntdll) {
+				i++;
+			}
+			if (i + 1 < count && owner(frames[i + 1]) == self) {
+				return reinterpret_cast<uint64_t>(frames[i + 1]) - self;
+			}
+			return 0;
+		}
+#endif
+		return 0;
+	}
+
+	void Add(bool write, uint64_t vaddr, uint64_t site, uint64_t handle_us) {
 		std::lock_guard lock(m_mutex);
 		auto&           page = m_pages[vaddr >> 12u];
 		(write ? page.writes : page.reads)++;
 		(write ? m_writes : m_reads)++;
+		auto& code = m_sites[site * 2u + (write ? 1u : 0u)];
+		code.count++;
+		code.us += handle_us;
 		const auto now = std::chrono::steady_clock::now();
 		if (now - m_report < std::chrono::seconds(5)) {
 			return;
@@ -53,6 +106,25 @@ public:
 			         top[i].second.writes, top[i].second.reads);
 		}
 		::printf("\n");
+		std::vector<std::pair<uint64_t, Site>> sites(m_sites.begin(), m_sites.end());
+		const auto site_count = std::min<size_t>(sites.size(), 8);
+		std::partial_sort(sites.begin(), sites.begin() + static_cast<ptrdiff_t>(site_count),
+		                  sites.end(),
+		                  [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+		::printf("Fault sites (5 s):");
+		for (size_t i = 0; i < site_count; i++) {
+			const auto site = sites[i].first / 2u;
+			const char kind = (sites[i].first & 1u) != 0 ? 'w' : 'r';
+			if (site == 0) {
+				::printf(" guest/%c n%" PRIu64 " %.1f ms;", kind, sites[i].second.count,
+				         static_cast<double>(sites[i].second.us) / 1000.0);
+			} else {
+				::printf(" +0x%" PRIx64 "/%c n%" PRIu64 " %.1f ms;", site, kind,
+				         sites[i].second.count, static_cast<double>(sites[i].second.us) / 1000.0);
+			}
+		}
+		::printf("\n");
+		m_sites.clear();
 		m_pages.clear();
 		m_writes = 0;
 		m_reads  = 0;
@@ -64,8 +136,13 @@ private:
 		uint64_t writes = 0;
 		uint64_t reads  = 0;
 	};
+	struct Site {
+		uint64_t count = 0;
+		uint64_t us    = 0;
+	};
 	std::mutex                            m_mutex;
 	std::unordered_map<uint64_t, Counts>  m_pages;
+	std::unordered_map<uint64_t, Site>    m_sites; // key: site * 2 + write
 	uint64_t                              m_writes = 0;
 	uint64_t                              m_reads  = 0;
 	std::chrono::steady_clock::time_point m_report = std::chrono::steady_clock::now();
@@ -83,8 +160,11 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_bindless_table(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
-		m_bindless_table.OnImageUnregistered(id);
+	m_texture_cache.on_bindless_unregister = [this](ImageId id, bool in_use) {
+		m_bindless_table.OnImageUnregistered(id, in_use);
+	};
+	m_texture_cache.on_image_views_unregister = [this](std::span<const CachedImageView> views) {
+		static_cast<void>(m_bindless_table.DropStaleViews(views));
 	};
 	// Idle until KYTY_RECORD_THREAD turns on for a command buffer (commandScheduler.cpp).
 	m_command_scheduler.EnableRecordingThread();
@@ -133,16 +213,76 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	if (FaultStats::Enabled()) {
-		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr);
-	}
+	DispatchFault(access, fault_vaddr);
+	return true;
+}
+
+// The caches' part of a fault: a write makes the page CPU-dirty in both caches (which untrack
+// and unprotect it), a read downloads GPU-written bytes.
+void RenderContext::DispatchFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	constexpr uint64_t fault_size = 1;
+	const bool         stats      = FaultStats::Enabled();
+	const auto         site       = stats ? FaultStats::FaultSite() : 0;
+	const auto         start      = stats ? std::chrono::steady_clock::now()
+	                                      : std::chrono::steady_clock::time_point {};
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
-	return true;
+	if (stats) {
+		const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                    std::chrono::steady_clock::now() - start)
+		                    .count();
+		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr, site,
+		                  static_cast<uint64_t>(us));
+	}
+}
+
+bool RenderContext::HandleWatchedUnmappedFault(PageFaultAccess access,
+                                               uint64_t        fault_vaddr) noexcept {
+	constexpr uint64_t fault_size = 1;
+	// Writes only: a read would go through BufferCache::ReadMemory, which creates a buffer over
+	// a range that is not (or no longer) GPU-mapped.
+	if (access != PageFaultAccess::Write || !GuestRange {fault_vaddr, fault_size}.Valid() ||
+	    IsMapped(fault_vaddr, fault_size) || PageWatchers(fault_vaddr) == 0u) {
+		return false;
+	}
+	static std::atomic<uint32_t> reported = 0;
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("GPU fault: write of watched page 0x%016" PRIx64
+		            " outside the GPU-mapped ranges, sent to the caches\n",
+		            static_cast<uint64_t>(fault_vaddr & ~uint64_t {0xfff}));
+		std::fflush(stdout);
+	}
+	DispatchFault(access, fault_vaddr);
+	// Recovered only if a cache let go of the page; stale watcher counts no cache owns go on to
+	// the orphan repair.
+	return PageWatchers(fault_vaddr) == 0u;
+}
+
+uint32_t RenderContext::PageWatchers(uint64_t fault_vaddr) const noexcept {
+	uint32_t write  = 0;
+	uint32_t access = 0;
+	m_page_manager.Watchers(fault_vaddr, write, access);
+	return write + access;
+}
+
+void RenderContext::DescribeFaultPage(uint64_t fault_vaddr) const noexcept {
+	uint32_t write  = 0;
+	uint32_t access = 0;
+	m_page_manager.Watchers(fault_vaddr, write, access);
+	const bool mapped = GuestRange {fault_vaddr, 1}.Valid() && IsMapped(fault_vaddr, 1);
+	std::printf("tracker page 0x%016" PRIx64 ": write watchers=%u access watchers=%u, %s\n",
+	            static_cast<uint64_t>(fault_vaddr & ~uint64_t {0xfff}), write, access,
+	            mapped ? "GPU-mapped" : "not in the GPU-mapped ranges");
+	const uint64_t guest_page = fault_vaddr & ~uint64_t {0x3fff};
+	for (uint64_t page = guest_page; page < guest_page + 0x4000u; page += 0x1000u) {
+		m_page_manager.Watchers(page, write, access);
+		std::printf("  4 KiB page 0x%016" PRIx64 ": write=%u access=%u\n", page, write, access);
+	}
+	std::fflush(stdout);
 }
 
 bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
@@ -180,7 +320,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+		// access a range with no cached data, so they must finish before it is unmapped.
+		if (m_command_scheduler.Active() &&
+		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -237,13 +382,63 @@ Common::LockGuard RenderContext::LockMutexProfiled() {
 	return Common::LockGuard(m_mutex);
 }
 
+// KYTY_VRAM_REPORT=N (live, seconds, default 30; 0 = off): one line splitting the device memory
+// by owner, to direct memory work at the largest consumer:
+//   device = what the driver counts for the process, of its budget;
+//   blocks/allocations = VMA's device-local memory blocks and what is allocated inside them (the
+//     difference is free space trapped in partly used blocks);
+//   images = texture cache (VMA sizes; guest-accounted in brackets), buffers = buffer cache,
+//   pool = parked deleted images, retiring = images and buffers held by the retire switches.
+void RenderContext::ReportVram() {
+	static auto& interval = Common::LiveSwitches::Get("KYTY_VRAM_REPORT", 30);
+	const auto   seconds  = interval.load(std::memory_order_relaxed);
+	if (seconds <= 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_vram_report_time != std::chrono::steady_clock::time_point {} &&
+	    now - m_vram_report_time < std::chrono::seconds(seconds)) {
+		return;
+	}
+	const bool first   = m_vram_report_time == std::chrono::steady_clock::time_point {};
+	m_vram_report_time = now;
+	if (first) {
+		return;
+	}
+	auto&          graphics    = m_texture_cache.Graphics();
+	uint64_t       allocations = 0;
+	uint64_t       blocks      = 0;
+	graphics.GetDeviceAllocationStats(allocations, blocks);
+	constexpr double MiB = 1024.0 * 1024.0;
+	std::printf("VRAM: device %.0f of %.0f MiB | blocks %.0f, allocations %.0f (trapped %.0f) | "
+	            "images %zu %.0f [%.0f guest] | buffers %zu %.0f | pool %.0f | retiring %.0f MiB | "
+	            "graveyard %.0f MiB (freed early %" PRIu64 ")\n",
+	            static_cast<double>(graphics.GetDeviceMemoryUsage()) / MiB,
+	            static_cast<double>(graphics.GetDriverMemoryBudget()) / MiB,
+	            static_cast<double>(blocks) / MiB, static_cast<double>(allocations) / MiB,
+	            static_cast<double>(blocks - std::min(blocks, allocations)) / MiB,
+	            m_texture_cache.ImageCount(), static_cast<double>(m_texture_cache.HostMemory()) / MiB,
+	            static_cast<double>(m_texture_cache.UsedMemory()) / MiB,
+	            m_buffer_cache.BufferCount(), static_cast<double>(m_buffer_cache.UsedMemory()) / MiB,
+	            static_cast<double>(graphics.ParkedImageBytes()) / MiB,
+	            static_cast<double>(m_texture_cache.RetiringBytes() +
+	                                m_buffer_cache.RetiringBytes()) /
+	                MiB,
+	            static_cast<double>(GraphicContext::GraveyardBytes()) / MiB,
+	            GraphicContext::GraveyardFreedEarly());
+	std::fflush(stdout);
+}
+
 void RenderContext::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
+	ReportVram();
+	m_pipeline_cache.MaybeCheckpoint();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	m_texture_cache.ProcessImageDump();
 	// KYTY_GC_INTERVAL_US (live, default 4000; 0 = every call): collect at most once per interval.
 	// This runs after every completed guest submission (~1300/s at the Wolverine spot) while both
 	// collectors age in frames and budget per frame. Run 31 A/B 0/4000: collectors 16.1 -> 4.0

@@ -118,11 +118,23 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// KYTY_BUFFER_POOLED_KB=N (live, research, default 0): device-address buffers up to N KiB
+	// share VMA blocks instead of each getting its own device memory. Every guest-memory buffer
+	// has a device address, so each was a separate vkAllocateMemory: rounded up to the driver's
+	// allocation granularity (64 KiB on Windows for 16 KiB buffers) and one more allocation for
+	// the OS to manage per submission. Trade-off: a stale read of a freed small buffer then hits
+	// a neighbour's memory instead of faulting.
+	static auto& pooled_kb = Common::LiveSwitches::Get("KYTY_BUFFER_POOLED_KB", 0);
+	const auto   pooled_limit =
+	    static_cast<uint64_t>(std::max<int64_t>(0, pooled_kb.load(std::memory_order_relaxed))) << 10u;
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !(usage == MemoryUsage::DeviceLocal && buffer_info.size <= pooled_limit)
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage) |
+	    (usage == MemoryUsage::DeviceLocal ? VmaMinMemoryStrategy() : 0);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}

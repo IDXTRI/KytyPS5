@@ -211,10 +211,23 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 // Fault safety net: a CPU access the guest mapping allows hit a page whose host protection no
 // tracker owns any more (orphaned watch state). Restores the guest protection on its 16 KiB page;
 // true when the access may be retried.
-bool RepairOrphanedProtection(uint64_t vaddr, bool write);
+// host_page_only (KYTY_FAULT_REPAIR_HOST_PAGE=1): restore only the 4 KiB host page of the fault;
+// its 16 KiB guest page can hold other 4 KiB pages the trackers still watch, and lifting their
+// protection silently stops tracking CPU writes there.
+bool RepairOrphanedProtection(uint64_t vaddr, bool write, bool host_page_only = false);
+// For an unhandled host fault: the guest mapping and the host page state at vaddr (printed).
+void DescribeFaultAddress(uint64_t vaddr, bool write);
+// AMM submissions still queued or running (libAmpr registers these): whether one holds a map that
+// covers vaddr, and a printout of them for the fault report.
+void SetPendingAmmHooks(bool (*covers)(uint64_t vaddr), void (*describe)(uint64_t vaddr));
+[[nodiscard]] bool PendingAmmMapCovers(uint64_t vaddr);
+// KYTY_FAULT_WATCHED_UNMAPPED (fault handler): Graphics::RenderContext::HandleWatchedUnmappedFault.
+[[nodiscard]] bool HandleWatchedUnmappedGpuFault(Graphics::PageFaultAccess access,
+                                                 uint64_t                  fault_vaddr) noexcept;
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);

@@ -12,13 +12,28 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "common/liveSwitches.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 
+// A private copy for the frame dump (libPngEnc.cpp has its own, without file output).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -32,7 +47,8 @@ struct Presenter::Frame {
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
 
-	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
+	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format,
+	               CommandScheduler* renderer = nullptr);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
@@ -146,7 +162,8 @@ private:
 	vk::Format                                     m_format = vk::Format::eUndefined;
 };
 
-void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format,
+                                 CommandScheduler* renderer) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
@@ -169,9 +186,42 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 
 	if (dst.image != nullptr) {
-		graphics.device.destroyImageView(view, nullptr);
+		// KYTY_FRAME_DEFER_DELETE (environment, default 1; 0 = destroy at once as before): the
+		// old image is destroyed after the renderer's current tick. The renderer copies guest
+		// frames into it (CopyFrom, Clear with a producer) and Acquire waits only for the
+		// present tick, so a frame changing size (window resize, resolution change) could lose
+		// its image while that copy was in flight; DeleteImage also parks it in the image pool,
+		// which may hand it out or release it at once (KYTY_IMAGE_POOL_BUDGET).
+		static const bool defer = [] {
+			const char* value = std::getenv("KYTY_FRAME_DEFER_DELETE");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (defer && renderer != nullptr && renderer->Active()) {
+			auto old        = std::make_shared<VulkanImage>();
+			old->format     = dst.format;
+			old->image_type = dst.image_type;
+			old->extent     = dst.extent;
+			old->layers     = dst.layers;
+			old->mip_levels = dst.mip_levels;
+			old->samples    = dst.samples;
+			old->usage      = dst.usage;
+			old->flags      = dst.flags;
+			old->image      = dst.image;
+			old->allocation = dst.allocation;
+			old->tiling     = dst.tiling;
+			old->sharing    = dst.sharing;
+			old->recyclable = dst.recyclable;
+			dst.image       = nullptr;
+			dst.allocation  = nullptr;
+			renderer->DeferOperation([&graphics, old, old_view = view] {
+				graphics.device.destroyImageView(old_view, nullptr);
+				graphics.DeleteImage(*old);
+			});
+		} else {
+			graphics.device.destroyImageView(view, nullptr);
+			graphics.DeleteImage(dst);
+		}
 		view = nullptr;
-		graphics.DeleteImage(dst);
 	}
 
 	vk::ImageCreateInfo create {};
@@ -252,6 +302,435 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
 }
 
+// KYTY_FRAME_DUMP=<folder> writes the presented frame to <folder>/frame_<seconds>.bmp every
+// KYTY_FRAME_DUMP_EVERY seconds (default 15), counted from the presenter's creation. The frame is
+// read back from the GPU, so this works for runs nobody watches: with the monitor off, the window
+// covered or the session locked, where window captures come back black. (Senaxx 012d6e10.)
+// Wolverine fork: KYTY_FRAME_DUMP_BURST=N (live) writes the next N CONSECUTIVE presented frames
+// as burst_<frame>.bmp (into KYTY_FRAME_DUMP, or ./framedump), to compare frames of a flicker
+// (detail present on one frame, gone the next) side by side. Each dump waits for its submission.
+class FrameDump final {
+public:
+	static std::unique_ptr<FrameDump> FromEnvironment(GraphicContext& graphics) {
+		const char* folder   = std::getenv("KYTY_FRAME_DUMP");
+		const bool  interval_mode = folder != nullptr && *folder != '\0';
+		const char* every    = std::getenv("KYTY_FRAME_DUMP_EVERY");
+		const int   parsed   = every != nullptr ? std::atoi(every) : 0;
+		const int   interval = interval_mode ? (parsed > 0 ? parsed : 15) : 0;
+		const std::string target = interval_mode ? std::string(folder) : std::string("framedump");
+		if (interval_mode) {
+			std::error_code error;
+			std::filesystem::create_directories(target, error);
+			std::printf("Frame dump: every %d s into %s\n", interval, target.c_str());
+		}
+		return std::make_unique<FrameDump>(graphics, target, interval);
+	}
+
+	FrameDump(GraphicContext& graphics, std::string folder, int interval)
+	    : m_graphics(graphics), m_folder(std::move(folder)), m_interval(interval),
+	      m_start(std::chrono::steady_clock::now()) {}
+	~FrameDump() {
+		// Every dump waits for its submission, so nothing here is still in use by the GPU.
+		if (m_image.image != nullptr) {
+			m_graphics.DeleteImage(m_image);
+		}
+		if (m_buffer != VK_NULL_HANDLE) {
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
+		}
+		if (m_ring != nullptr) {
+			m_retired_rings.push_back(std::move(m_ring));
+		}
+		for (auto& ring: m_retired_rings) {
+			DestroyRing(*ring);
+		}
+	}
+	KYTY_CLASS_NO_COPY(FrameDump);
+
+	// True when this presentation should be dumped; then Record and, after the submission
+	// finished, Write follow.
+	bool Due() {
+		static auto& burst = Common::LiveSwitches::Get("KYTY_FRAME_DUMP_BURST", 0);
+		if (const auto left = burst.load(std::memory_order_relaxed); left > 0) {
+			burst.store(left - 1, std::memory_order_relaxed);
+			if (!m_burst_folder_ready) {
+				std::error_code error;
+				std::filesystem::create_directories(m_folder, error);
+				m_burst_folder_ready = true;
+			}
+			m_in_burst = true;
+			return true;
+		}
+		m_in_burst = false;
+		if (m_interval <= 0) {
+			return false;
+		}
+		const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		                         std::chrono::steady_clock::now() - m_start)
+		                         .count();
+		if (elapsed < static_cast<int64_t>(m_next) * m_interval) {
+			return false;
+		}
+		m_seconds = static_cast<uint32_t>(elapsed);
+		m_next    = static_cast<uint32_t>(elapsed / m_interval) + 1u;
+		return true;
+	}
+
+	// The source is in TRANSFER_SRC_OPTIMAL (RecordPresentCommands leaves it there). A blit
+	// converts any presentable format to RGBA8.
+	void Record(vk::CommandBuffer command, Presenter::Frame& source) {
+		const vk::Extent2D extent {source.image.extent.width, source.image.extent.height};
+		Configure(extent);
+		vk::ImageMemoryBarrier to_transfer {};
+		to_transfer.sType               = vk::StructureType::eImageMemoryBarrier;
+		to_transfer.srcAccessMask       = vk::AccessFlagBits::eTransferRead;
+		to_transfer.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_transfer.oldLayout           = vk::ImageLayout::eUndefined;
+		to_transfer.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.image               = m_image.image;
+		to_transfer.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_transfer);
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(extent.width),
+                                             static_cast<int>(extent.height), 1};
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[1]  = region.srcOffsets[1];
+		command.blitImage(source.image.image, vk::ImageLayout::eTransferSrcOptimal, m_image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eNearest);
+		auto to_source          = to_transfer;
+		to_source.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_source.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		to_source.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		to_source.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_source);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = region.srcSubresource;
+		copy.imageExtent      = vk::Extent3D {extent.width, extent.height, 1};
+		command.copyImageToBuffer(m_image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          vk::Buffer(m_buffer), 1, &copy);
+		vk::BufferMemoryBarrier to_host {};
+		to_host.sType               = vk::StructureType::eBufferMemoryBarrier;
+		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.buffer              = vk::Buffer(m_buffer);
+		to_host.size                = VK_WHOLE_SIZE;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0, nullptr,
+		                        1, &to_host, 0, nullptr);
+	}
+
+	void Write(uint64_t presented) {
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaInvalidateAllocation(
+		                         m_graphics.allocator, m_buffer_allocation, 0, VK_WHOLE_SIZE)),
+		                     "invalidate frame dump buffer");
+		char name[48];
+		if (m_in_burst) {
+			std::snprintf(name, sizeof(name), "burst_%08" PRIu64 ".bmp", presented);
+		} else {
+			std::snprintf(name, sizeof(name), "frame_%04u.bmp", m_seconds);
+		}
+		const auto path = (std::filesystem::path(m_folder) / name).string();
+		// RGB only: the frame's alpha is whatever the game left there.
+		const auto*          rgba = static_cast<const uint8_t*>(m_mapped);
+		std::vector<uint8_t> rgb(static_cast<size_t>(m_extent.width) * m_extent.height * 3u);
+		for (size_t pixel = 0; pixel < rgb.size() / 3u; pixel++) {
+			rgb[pixel * 3u + 0u] = rgba[pixel * 4u + 0u];
+			rgb[pixel * 3u + 1u] = rgba[pixel * 4u + 1u];
+			rgb[pixel * 3u + 2u] = rgba[pixel * 4u + 2u];
+		}
+		const bool ok = stbi_write_bmp(path.c_str(), static_cast<int>(m_extent.width),
+		                               static_cast<int>(m_extent.height), 3, rgb.data()) != 0;
+		std::printf("Frame dump: %s %s (%ux%u, presented frame %" PRIu64 ")\n",
+		            ok ? "wrote" : "failed to write", path.c_str(), m_extent.width, m_extent.height,
+		            presented);
+		std::fflush(stdout);
+	}
+
+	// Wolverine fork: KYTY_GLITCH_CAPTURE=N (environment, default 0 = off) keeps the last N
+	// presented frames at half resolution in host memory, and F9 writes them to
+	// <folder>/glitch_<time>/f<frame>.bmp. Glitches that last a frame or two are over before
+	// anyone can take a screenshot (Wolverine 2026-10-13: white wedges, blocky glass, characters
+	// turning black). Costs one small blit and copy per frame, ~2 MiB of memory per kept frame.
+	[[nodiscard]] bool RingEnabled() const noexcept { return RingSlots() != 0; }
+
+	void RecordRing(vk::CommandBuffer command, Presenter::Frame& source, uint64_t presented) {
+		const vk::Extent2D extent {source.image.extent.width, source.image.extent.height};
+		const vk::Extent2D half {std::max(extent.width / 2u, 1u), std::max(extent.height / 2u, 1u)};
+		ConfigureRing(half);
+		const auto slot = m_ring->next;
+		m_ring->next     = (m_ring->next + 1u) % RingSlots();
+		vk::ImageMemoryBarrier to_transfer {};
+		to_transfer.sType               = vk::StructureType::eImageMemoryBarrier;
+		to_transfer.srcAccessMask       = vk::AccessFlagBits::eTransferRead;
+		to_transfer.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_transfer.oldLayout           = vk::ImageLayout::eUndefined;
+		to_transfer.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.image               = m_ring->image.image;
+		to_transfer.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_transfer);
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(extent.width),
+                                             static_cast<int>(extent.height), 1};
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[1] =
+		    vk::Offset3D {static_cast<int>(half.width), static_cast<int>(half.height), 1};
+		command.blitImage(source.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  m_ring->image.image, vk::ImageLayout::eTransferDstOptimal, 1, &region,
+		                  vk::Filter::eLinear);
+		auto to_source          = to_transfer;
+		to_source.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_source.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		to_source.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		to_source.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_source);
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset     = static_cast<vk::DeviceSize>(slot) * RingSlotBytes();
+		copy.imageSubresource = region.dstSubresource;
+		copy.imageExtent      = vk::Extent3D {half.width, half.height, 1};
+		command.copyImageToBuffer(m_ring->image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          vk::Buffer(m_ring->buffer), 1, &copy);
+		vk::BufferMemoryBarrier to_host {};
+		to_host.sType               = vk::StructureType::eBufferMemoryBarrier;
+		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.buffer              = vk::Buffer(m_ring->buffer);
+		to_host.offset              = copy.bufferOffset;
+		to_host.size                = RingSlotBytes();
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0, nullptr,
+		                        1, &to_host, 0, nullptr);
+		m_ring->frames[slot] = presented;
+	}
+
+	// Call after the latest submission that recorded into the ring finished. Copies the frames
+	// out and writes them on a background thread, so the game only stalls for the copy.
+	void WriteRing() {
+		if (m_ring == nullptr) {
+			return;
+		}
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaInvalidateAllocation(
+		                         m_graphics.allocator, m_ring->allocation, 0, VK_WHOLE_SIZE)),
+		                     "invalidate glitch capture buffer");
+		struct Saved {
+			uint64_t             frame = 0;
+			std::vector<uint8_t> rgb;
+		};
+		std::vector<Saved> saved;
+		const auto         slots  = RingSlots();
+		const auto         pixels = static_cast<size_t>(m_ring->extent.width) * m_ring->extent.height;
+		for (uint32_t i = 0; i < slots; i++) {
+			const auto slot = (m_ring->next + i) % slots; // oldest first
+			if (m_ring->frames[slot] == 0) {
+				continue;
+			}
+			const auto* rgba = static_cast<const uint8_t*>(m_ring->mapped) + slot * RingSlotBytes();
+			auto&       out  = saved.emplace_back();
+			out.frame        = m_ring->frames[slot];
+			out.rgb.resize(pixels * 3u);
+			for (size_t pixel = 0; pixel < pixels; pixel++) {
+				out.rgb[pixel * 3u + 0u] = rgba[pixel * 4u + 0u];
+				out.rgb[pixel * 3u + 1u] = rgba[pixel * 4u + 1u];
+				out.rgb[pixel * 3u + 2u] = rgba[pixel * 4u + 2u];
+			}
+		}
+		if (saved.empty()) {
+			return;
+		}
+		const auto now   = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+		std::tm    local {};
+		localtime_s(&local, &now);
+		char stamp[32];
+		std::strftime(stamp, sizeof(stamp), "glitch_%Y%m%d_%H%M%S", &local);
+		const auto folder = std::filesystem::path(m_folder) / stamp;
+		std::printf("Glitch capture: %zu frames (presented %" PRIu64 "..%" PRIu64 ", %ux%u) into %s\n",
+		            saved.size(), saved.front().frame, saved.back().frame, m_ring->extent.width,
+		            m_ring->extent.height, folder.string().c_str());
+		std::fflush(stdout);
+		std::thread([folder, extent = m_ring->extent, saved = std::move(saved)] {
+			std::error_code error;
+			std::filesystem::create_directories(folder, error);
+			uint32_t failed = 0;
+			for (const auto& frame: saved) {
+				char name[32];
+				std::snprintf(name, sizeof(name), "f%08" PRIu64 ".bmp", frame.frame);
+				const auto path = (folder / name).string();
+				if (stbi_write_bmp(path.c_str(), static_cast<int>(extent.width),
+				                   static_cast<int>(extent.height), 3, frame.rgb.data()) == 0) {
+					failed++;
+				}
+			}
+			std::printf("Glitch capture: wrote %zu frames into %s%s\n", saved.size() - failed,
+			            folder.string().c_str(), failed != 0 ? " (some failed)" : "");
+			std::fflush(stdout);
+		}).detach();
+	}
+
+private:
+	struct Ring {
+		vk::Extent2D          extent {};
+		VulkanImage           image;
+		VkBuffer              buffer     = VK_NULL_HANDLE;
+		VmaAllocation         allocation = nullptr;
+		void*                 mapped     = nullptr;
+		uint32_t              next       = 0;
+		std::vector<uint64_t> frames; // presented frame per slot, 0 = empty
+	};
+
+	static uint32_t RingSlots() {
+		static const uint32_t slots = [] {
+			const char* value  = std::getenv("KYTY_GLITCH_CAPTURE");
+			const int   parsed = value != nullptr ? std::atoi(value) : 0;
+			const auto  count  = static_cast<uint32_t>(std::clamp(parsed, 0, 240));
+			if (count != 0) {
+				std::printf("Glitch capture: F9 writes the last %u frames\n", count);
+			}
+			return count;
+		}();
+		return slots;
+	}
+
+	[[nodiscard]] vk::DeviceSize RingSlotBytes() const noexcept {
+		return static_cast<vk::DeviceSize>(m_ring->extent.width) * m_ring->extent.height * 4u;
+	}
+
+	void DestroyRing(Ring& ring) {
+		if (ring.image.image != nullptr) {
+			m_graphics.DeleteImage(ring.image);
+		}
+		if (ring.buffer != VK_NULL_HANDLE) {
+			vmaDestroyBuffer(m_graphics.allocator, ring.buffer, ring.allocation);
+			ring.buffer = VK_NULL_HANDLE;
+		}
+	}
+
+	void ConfigureRing(vk::Extent2D extent) {
+		if (m_ring != nullptr && m_ring->extent == extent) {
+			return;
+		}
+		// Earlier frames may still be copying into the old ring: keep it until shutdown (the
+		// presented size rarely changes).
+		if (m_ring != nullptr) {
+			m_retired_rings.push_back(std::move(m_ring));
+		}
+		m_ring         = std::make_unique<Ring>();
+		m_ring->extent = extent;
+		m_ring->frames.assign(RingSlots(), 0);
+		vk::ImageCreateInfo create {};
+		create.sType         = vk::StructureType::eImageCreateInfo;
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR8G8B8A8Unorm;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, m_ring->image)) {
+			EXIT("failed to allocate the glitch capture image, extent=%ux%u\n", extent.width,
+			     extent.height);
+		}
+		vk::BufferCreateInfo buffer {};
+		buffer.size  = RingSlotBytes() * RingSlots();
+		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags =
+		    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo info {};
+		const auto        raw = static_cast<VkBufferCreateInfo>(buffer);
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(m_graphics.allocator, &raw,
+		                                                             &allocate, &m_ring->buffer,
+		                                                             &m_ring->allocation, &info)),
+		                     "allocate glitch capture buffer");
+		m_ring->mapped = info.pMappedData;
+	}
+
+	void Configure(vk::Extent2D extent) {
+		if (m_image.image != nullptr && m_extent == extent) {
+			return;
+		}
+		if (m_image.image != nullptr) {
+			m_graphics.DeleteImage(m_image);
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
+			m_buffer = VK_NULL_HANDLE;
+		}
+		m_extent = extent;
+		vk::ImageCreateInfo create {};
+		create.sType         = vk::StructureType::eImageCreateInfo;
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR8G8B8A8Unorm;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, m_image)) {
+			EXIT("failed to allocate the frame dump image, extent=%ux%u\n", extent.width,
+			     extent.height);
+		}
+		vk::BufferCreateInfo buffer {};
+		buffer.size  = static_cast<vk::DeviceSize>(extent.width) * extent.height * 4u;
+		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags =
+		    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo info {};
+		const auto        raw = static_cast<VkBufferCreateInfo>(buffer);
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(m_graphics.allocator, &raw,
+		                                                             &allocate, &m_buffer,
+		                                                             &m_buffer_allocation, &info)),
+		                     "allocate frame dump buffer");
+		m_mapped = info.pMappedData;
+	}
+
+	GraphicContext&                       m_graphics;
+	std::string                           m_folder;
+	int                                   m_interval = 15;
+	std::chrono::steady_clock::time_point m_start;
+	uint32_t                              m_next    = 1;
+	bool                                  m_in_burst           = false;
+	bool                                  m_burst_folder_ready = false;
+	uint32_t                              m_seconds = 0;
+	vk::Extent2D                          m_extent {};
+	VulkanImage                           m_image;
+	VkBuffer                              m_buffer            = VK_NULL_HANDLE;
+	VmaAllocation                         m_buffer_allocation = nullptr;
+	void*                                 m_mapped            = nullptr;
+	std::unique_ptr<Ring>                 m_ring;
+	std::vector<std::unique_ptr<Ring>>    m_retired_rings;
+};
+
+namespace {
+std::atomic_bool g_glitch_capture_requested {false};
+} // namespace
+
+void RequestGlitchCapture() {
+	g_glitch_capture_requested.store(true, std::memory_order_relaxed);
+}
+
 class Swapchain final {
 public:
 	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
@@ -305,6 +784,7 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		frame_dump = FrameDump::FromEnvironment(owner.graphic_ctx);
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -344,6 +824,8 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// Declared last: destroyed first, while the device is still alive.
+	std::unique_ptr<FrameDump> frame_dump;
 };
 
 void Swapchain::Create() {
@@ -884,7 +1366,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
-	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
+	                 {image.backing.extent.width, image.backing.extent.height}, frame_format,
+	                 &m_impl->renderer.GetCommandScheduler());
 	frame->CopyFrom(buffer, image);
 	return *frame;
 }
@@ -895,7 +1378,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
+	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format,
+	                 &m_impl->renderer.GetCommandScheduler());
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
 	if (producer != nullptr) {
@@ -979,6 +1463,9 @@ void Presenter::Impl::Present() {
 			RecoverSwapchain(status);
 			continue;
 		}
+		bool     dumped    = false;
+		bool     captured  = false;
+		uint64_t dump_tick = 0;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
@@ -986,12 +1473,31 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			if (frame_dump != nullptr && layers[0].frame != nullptr && frame_dump->Due()) {
+				frame_dump->Record(command.Handle(), *layers[0].frame);
+				dumped = true;
+			}
+			if (frame_dump != nullptr && layers[0].frame != nullptr && frame_dump->RingEnabled()) {
+				frame_dump->RecordRing(
+				    command.Handle(), *layers[0].frame,
+				    window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
+				captured = g_glitch_capture_requested.exchange(false, std::memory_order_relaxed);
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;
 				}
 			}
+			dump_tick = tick;
+		}
+		if (dumped) {
+			present_scheduler.Wait(dump_tick);
+			frame_dump->Write(window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
+		}
+		if (captured) {
+			present_scheduler.Wait(dump_tick);
+			frame_dump->WriteRing();
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

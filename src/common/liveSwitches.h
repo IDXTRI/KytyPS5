@@ -14,6 +14,10 @@ namespace Common::LiveSwitches {
 //   static auto& spin = Common::LiveSwitches::Get("KYTY_EXAMPLE", 0);
 std::atomic<int64_t>& Get(const char* name, int64_t default_value);
 
+// KYTY_VRAM_SAVER=level (environment) presets: the default a switch gets at that level (level 0
+// or a switch outside the preset: default_value). Get applies it with the environment's level.
+int64_t PresetValue(const char* name, int64_t default_value, int level);
+
 } // namespace Common::LiveSwitches
 
 #endif /* KYTY_COMMON_LIVESWITCHES_H_ */

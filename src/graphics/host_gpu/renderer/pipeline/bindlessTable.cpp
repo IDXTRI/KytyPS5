@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -19,6 +20,7 @@
 #include <fmt/format.h>
 #include <string>
 #include <cstdlib>
+#include <chrono>
 #include <map>
 #include <tuple>
 
@@ -44,6 +46,13 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	// A device without update-after-bind samplers still gets a one-entry array, holding the
 	// default sampler, so every bindless pipeline sees the same layout.
 	m_samplers_per_array = std::min(MaxSamplers, graphics.bindless_max_samplers);
+	// The per-kind default slots need room for them and at least one heap region besides.
+	const bool kind_slots = ShaderRecompiler::IR::BindlessSamplerClassDefaultsRequested() &&
+	                        m_samplers_per_array >= ShaderRecompiler::IR::BindlessSamplerKinds + 64u;
+	ShaderRecompiler::IR::BindlessSamplerKindSlotsAvailable().store(kind_slots,
+	                                                                std::memory_order_release);
+	m_sampler_regions.Reset(kind_slots ? ShaderRecompiler::IR::BindlessSamplerKinds : 1u,
+	                        m_samplers_per_array);
 	const std::array<vk::DescriptorSetLayoutBinding, 7> bindings {{
 	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
 	     nullptr},
@@ -130,6 +139,17 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	     m_images_per_array, TranslationEntries, m_samplers_per_array);
 }
 
+void BindlessTable::DropSamplerHeapsExcept(uint32_t fields) {
+	std::erase_if(m_sampler_heaps, [&](const SamplerHeap& heap) {
+		if (((heap.flags >> SamplerFieldsShift) & BindlessSamplerRecords::FieldAll) == fields) {
+			return false;
+		}
+		// Command buffers recorded so far may still read its slots.
+		m_sampler_regions.Release(heap.region, heap.capacity, m_scheduler.CurrentTick());
+		return true;
+	});
+}
+
 BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base,
                                                                    uint32_t table_offset,
                                                                    uint32_t flags) {
@@ -145,20 +165,77 @@ BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base
 	return &heap;
 }
 
-void BindlessTable::WriteDefaultSampler(vk::Sampler sampler) {
+void BindlessTable::WriteDefaultSamplers(SamplerCache& cache) {
 	if (m_default_sampler_written || m_set == nullptr) {
 		return;
 	}
-	vk::DescriptorImageInfo info {sampler, nullptr, vk::ImageLayout::eUndefined};
-	vk::WriteDescriptorSet  write {};
+	const uint32_t kinds = ShaderRecompiler::IR::BindlessSamplerClassDefaults()
+	                           ? std::min(ShaderRecompiler::IR::BindlessSamplerKinds,
+	                                      std::max(m_samplers_per_array, 1u))
+	                           : 1u;
+	std::vector<vk::DescriptorImageInfo> infos;
+	for (uint32_t kind = 0; kind < kinds; kind++) {
+		ShaderSamplerResource descriptor;
+		std::ranges::copy(ShaderRecompiler::IR::FallbackSampler(), descriptor.fields);
+		if ((kind & SamplerPointFiltering) != 0u) {
+			descriptor.SetPointFiltering();
+		}
+		if ((kind & SamplerDepthCompare) != 0u) {
+			// A depth-compare use needs a compare function; with none Vulkan leaves the result
+			// implementation-defined. ALWAYS (7) reads as lit: no false shadow where the key
+			// fell outside its heap.
+			descriptor.fields[0] = (descriptor.fields[0] & ~(0x7u << 12u)) | (7u << 12u);
+		}
+		infos.push_back({cache.GetSampler(descriptor, (kind & SamplerIntegerBorder) != 0u), nullptr,
+		                 vk::ImageLayout::eUndefined});
+	}
+	vk::WriteDescriptorSet write {};
 	write.dstSet          = m_set;
 	write.dstBinding      = Samplers;
 	write.dstArrayElement = 0;
-	write.descriptorCount = 1;
+	write.descriptorCount = static_cast<uint32_t>(infos.size());
 	write.descriptorType  = vk::DescriptorType::eSampler;
-	write.pImageInfo      = &info;
+	write.pImageInfo      = infos.data();
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
 	m_default_sampler_written = true;
+}
+
+void BindlessTable::ReportSamplerStats() {
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (m_sampler_stats_time == 0) {
+		m_sampler_stats_time = now;
+		return;
+	}
+	if (now - m_sampler_stats_time < 5000u) {
+		return;
+	}
+	m_sampler_stats_time = now;
+	if (const auto& i = m_image_stats; i.resolved + i.unreadable + i.null_desc + i.non_float +
+	                                       i.shape + i.empty + i.array_full + i.deferred !=
+	                                   0u) {
+		std::printf("Bindless images (5 s): resolved %u (re-resolved before a draw %u, kept old view "
+		            "%u), deferred %u; black placeholder: unreadable %u, null %u, non-float %u, shape %u, "
+		            "empty %u, array full %u; slots 2D %u 2DArray %u Cube %u 3D %u of %u\n",
+		            i.resolved, i.reresolved, i.kept_old, i.deferred, i.unreadable, i.null_desc,
+		            i.non_float, i.shape,
+		            i.empty, i.array_full, m_next_slot[0], m_next_slot[1], m_next_slot[2],
+		            m_next_slot[3], m_images_per_array);
+		std::fflush(stdout);
+	}
+	m_image_stats = {};
+	const auto& s = m_sampler_stats;
+	if (s.uses != 0u) {
+		std::printf("Bindless samplers (5 s): uses=%u default-only=%u mirrors=%u moves=%u recycled=%u "
+		            "full=%u unread gpu-dirty=%u read-failed=%u; slots %u used, next %u of %u, "
+		            "%zu free regions, %zu heaps\n",
+		            s.uses, s.default_draws, s.mirrors, s.moves, s.recycled, s.full, s.gpu_dirty,
+		            s.read_failed, m_sampler_regions.Used(), m_sampler_regions.Next(),
+		            m_samplers_per_array, m_sampler_regions.FreeRegions(), m_sampler_heaps.size());
+		std::fflush(stdout);
+	}
+	m_sampler_stats = {};
 }
 
 bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              heap,
@@ -172,41 +249,55 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 	}
 	uint32_t first = static_cast<uint32_t>(heap.records.size());
 	if (!same_prefix || records.size() > heap.capacity || heap.region == 0) {
-		const auto capacity = std::max<uint32_t>(64u, static_cast<uint32_t>(records.size()) * 2u);
-		if (m_samplers_per_array <= 1u || capacity > m_samplers_per_array - m_next_sampler_slot) {
+		// KYTY_BINDLESS_SAMPLER_RECYCLE=1 (live, research): the region a heap leaves is reused
+		// once the GPU is past it; otherwise every change of a record leaks a region until the
+		// array is full, after which heaps keep stale records or select the default sampler.
+		static auto& recycle  = Common::LiveSwitches::Get("KYTY_BINDLESS_SAMPLER_RECYCLE", 0);
+		const bool   reuse    = recycle.load(std::memory_order_relaxed) != 0;
+		const auto   capacity = std::max<uint32_t>(64u, static_cast<uint32_t>(records.size()) * 2u);
+		const auto   next_before = m_sampler_regions.Next();
+		const auto   region      = m_sampler_regions.Allocate(
+            capacity, true, [&](uint64_t tick) { return m_scheduler.IsFree(tick); });
+		if (region == 0u) {
+			m_sampler_stats.full++;
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1) < 8) {
-				LOGF("Bindless samplers: array full (%u of %u slots), heap 0x%016" PRIx64
-				     " keeps %zu records\n",
-				     m_next_sampler_slot, m_samplers_per_array, heap.base, heap.records.size());
+				std::printf("Bindless samplers: array full (%u of %u slots), heap 0x%016" PRIx64
+				            " keeps %zu records\n",
+				            m_sampler_regions.Next(), m_samplers_per_array, heap.base, heap.records.size());
+				std::fflush(stdout);
 			}
 			return false;
 		}
-		heap.region   = m_next_sampler_slot;
+		if (m_sampler_regions.Next() == next_before) {
+			m_sampler_stats.recycled++;
+		}
+		if (heap.region != 0u) {
+			m_sampler_stats.moves++;
+			if (reuse) {
+				m_sampler_regions.Release(heap.region, heap.capacity, m_scheduler.CurrentTick());
+			}
+		}
+		heap.region   = region;
 		heap.capacity = capacity;
-		m_next_sampler_slot += capacity;
 		first = 0;
 	}
+	m_sampler_stats.mirrors++;
 	std::vector<vk::DescriptorImageInfo> infos;
 	infos.reserve(records.size() - first);
 	// KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY=1 (environment): take only the address modes (CLAMP_X/Y/Z)
 	// from the game's records and keep the fallback sampler's filtering and LOD range. Run 65: the
 	// full records turned Wolverine's terrain into flat colours while the moon needs its record's
 	// clamp; this tells the fields apart from the key -> record mapping.
-	static const bool clamp_only = [] {
-		const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_CLAMP_ONLY");
-		return value != nullptr && value[0] == '1';
-	}();
+	// (Now the same as KYTY_BINDLESS_SAMPLER_FIELDS=1, which also keeps DISABLE_CUBE_WRAP.)
+	// KYTY_BINDLESS_SAMPLER_FIELDS=<mask> (live, PrepareBindlessSamplers): the field groups taken
+	// from the game's records; the rest come from the default sampler (bindlessSamplerRecords.h).
+	const uint32_t fields = (heap.flags >> SamplerFieldsShift) & BindlessSamplerRecords::FieldAll;
 	for (size_t key = first; key < records.size(); key++) {
 		ShaderSamplerResource descriptor;
-		std::copy(records[key].begin(), records[key].end(), descriptor.fields);
-		if (clamp_only) {
-			const auto& fallback = ShaderRecompiler::IR::BindlessDefaultSampler;
-			descriptor.fields[0] = (fallback[0] & ~0x1ffu) | (records[key][0] & 0x1ffu);
-			descriptor.fields[1] = fallback[1];
-			descriptor.fields[2] = fallback[2];
-			descriptor.fields[3] = fallback[3];
-		}
+		const auto            merged = BindlessSamplerRecords::Merge(
+            records[key], ShaderRecompiler::IR::BindlessDefaultSampler, fields);
+		std::copy(merged.begin(), merged.end(), descriptor.fields);
 		if ((heap.flags & SamplerDepthCompare) == 0u) {
 			descriptor.fields[0] &= ~(0x7u << 12u);
 		}
@@ -445,7 +536,7 @@ BindlessTable::~BindlessTable() {
 bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	// Headroom so a growing heap rarely moves; a move re-writes the keys resolved so far.
 	const auto capacity = std::max(entries, std::min<uint32_t>(entries * 2u, 1u << 16u));
-	if (capacity > ShaderRecompiler::IR::WatchdogReportBase - m_next_region) {
+	if (capacity > ShaderRecompiler::IR::BindlessTraceBase - m_next_region) {
 		return false;
 	}
 	const auto old_region  = heap.region;
@@ -502,6 +593,28 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	return &heap;
 }
 
+void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
+	if (binding >= ImageArrays || slot == 0) {
+		return;
+	}
+	auto& flags = m_slot_free[binding];
+	if (flags.size() <= slot) {
+		flags.resize(static_cast<size_t>(slot) + 1u, 0);
+	}
+	// A slot already waiting on the free list must not be queued twice: two keys would get it.
+	if (flags[slot] != 0) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Bindless: slot %u/%u freed twice; kept once\n", binding, slot);
+			std::fflush(stdout);
+		}
+		return;
+	}
+	flags[slot] = 1;
+	// Command buffers recorded so far may still sample the slot.
+	m_free_slots[binding].emplace_back(m_scheduler.CurrentTick(), slot);
+}
+
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	if (binding >= ImageArrays) {
 		return 0;
@@ -514,6 +627,7 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	    m_scheduler.IsFree(free.front().first)) {
 		const auto slot = free.front().second;
 		free.pop_front();
+		m_slot_free[binding][slot] = 0;
 		return slot;
 	}
 	if (m_next_slot[binding] >= m_images_per_array) {
@@ -681,6 +795,39 @@ void BindlessTable::DrainWatchdogReports(uint64_t frame) {
 		m_feedback->Invalidate(WatchdogReportBase * sizeof(uint32_t),
 		                       WatchdogReportWords * (WatchdogReportSlots + 1) * sizeof(uint32_t));
 	}
+	// KYTY_TRACE_BINDLESS: what the traced shader's last bindless read used, printed when it
+	// changes: key, raw translation, heap region and entry count, and the T# and image the key
+	// was settled to. The words are cleared each frame, so "none" = no read since the last frame.
+	if (static const bool trace = std::getenv("KYTY_TRACE_BINDLESS") != nullptr; trace) {
+		using ShaderRecompiler::IR::BindlessTraceBase;
+		if (!m_feedback->IsCoherent()) {
+			m_feedback->Invalidate(BindlessTraceBase * sizeof(uint32_t), 4 * sizeof(uint32_t));
+		}
+		static std::array<uint32_t, 4> last {~0u, ~0u, ~0u, ~0u};
+		std::array<uint32_t, 4>        now {};
+		std::copy_n(feedback + BindlessTraceBase, 4, now.begin());
+		if (now != last) {
+			last = now;
+			std::string info = "none";
+			if (now[3] != 0u || now[0] != 0u) {
+				info = fmt::format("key {} raw {} region {} count {}", now[0], now[1], now[2], now[3]);
+				for (const auto& heap: m_heaps) {
+					if (heap.region == now[2] && now[0] < heap.slots.size()) {
+						const auto& t = heap.descriptors[now[0]];
+						info += fmt::format(" | heap 0x{:x} binding {} slot {} image {} T# {:08x} {:08x} "
+						                    "{:08x} {:08x}",
+						                    heap.base, heap.binding, heap.slots[now[0]],
+						                    heap.images[now[0]].index, t[0], t[1], t[2], t[3]);
+					}
+				}
+			}
+			std::printf("BindlessTrace frame %" PRIu64 ": %s\n", frame, info.c_str());
+		}
+		std::fill_n(feedback + BindlessTraceBase, 4, 0u);
+		if (!m_feedback->IsCoherent()) {
+			m_feedback->Flush(BindlessTraceBase * sizeof(uint32_t), 4 * sizeof(uint32_t));
+		}
+	}
 	const auto count = feedback[WatchdogReportBase];
 	if (count == 0) {
 		return;
@@ -729,7 +876,7 @@ void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
 }
 
-bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
+bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key, bool free_slot) {
 	const auto id      = heap.images[key];
 	bool       no_refs = false;
 	if (id) {
@@ -749,9 +896,9 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 			}
 		}
 	}
-	if (heap.slots[key] != 0) {
+	if (heap.slots[key] != 0 && free_slot) {
 		// Command buffers recorded so far may still sample the slot.
-		m_free_slots[heap.binding].emplace_back(m_scheduler.CurrentTick(), heap.slots[key]);
+		FreeSlot(heap.binding, heap.slots[key]);
 	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
@@ -760,17 +907,22 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 	return no_refs;
 }
 
-void BindlessTable::OnImageUnregistered(ImageId id) {
+void BindlessTable::OnImageUnregistered(ImageId id, bool in_use) {
 	const auto found = m_image_refs.find(ImageKey(id));
 	if (found == m_image_refs.end()) {
 		return;
 	}
+	static auto& reresolve = Common::LiveSwitches::Get("KYTY_BINDLESS_RERESOLVE", 1);
+	const bool   queue     = in_use && reresolve.load(std::memory_order_relaxed) != 0;
 	for (const auto& [heap, key]: found->second) {
+		if (queue) {
+			m_reresolve.emplace_back(heap, key);
+		}
 		if (heap->slots[key] != 0) {
 			WriteSlot(heap->binding, heap->slots[key], m_placeholder_views[heap->binding],
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
 			// Command buffers recorded so far may still sample the slot.
-			m_free_slots[heap->binding].emplace_back(m_scheduler.CurrentTick(), heap->slots[key]);
+			FreeSlot(heap->binding, heap->slots[key]);
 		}
 		heap->images[key]  = {};
 		heap->slots[key]   = 0;
@@ -779,6 +931,68 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		std::erase(heap->resolved, id);
 	}
 	m_image_refs.erase(found);
+}
+
+uint32_t BindlessTable::DropStaleViews(std::span<const CachedImageView> views) {
+	uint32_t reset = 0;
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		auto&      slot_views = m_slot_views[binding];
+		const auto used       = std::min<size_t>(slot_views.size(), m_next_slot[binding]);
+		for (uint32_t slot = PlaceholderColors; slot < used; slot++) {
+			const auto view = slot_views[slot];
+			if (view == nullptr || view == m_placeholder_views[binding] ||
+			    std::none_of(views.begin(), views.end(),
+			                 [&](const CachedImageView& cached) { return cached.view == view; })) {
+				continue;
+			}
+			uint32_t keys = 0;
+			for (auto& heap: m_heaps) {
+				if (heap.binding != binding) {
+					continue;
+				}
+				for (uint32_t key = 0; key < heap.slots.size(); key++) {
+					if (heap.slots[key] != slot) {
+						continue;
+					}
+					if (const auto found = m_image_refs.find(ImageKey(heap.images[key]));
+					    heap.images[key] && found != m_image_refs.end()) {
+						std::erase(found->second, std::pair<Heap*, uint32_t> {&heap, key});
+						if (found->second.empty()) {
+							m_image_refs.erase(found);
+						}
+					}
+					if (heap.images[key]) {
+						std::erase(heap.resolved, heap.images[key]);
+						heap.checked_generation = 0;
+					}
+					heap.slots[key]   = 0;
+					heap.settled[key] = 0;
+					heap.images[key]  = {};
+					SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+					keys++;
+				}
+			}
+			WriteSlot(binding, slot, m_placeholder_views[binding],
+			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			// Only a slot this took from keys goes to the free list. A slot no key uses was freed
+			// already (ReleaseKey / OnImageUnregistered keep its view until reuse); freeing it again
+			// put it on the list twice, so two keys got the same slot and one of them sampled the
+			// other's texture (Wolverine 2026-10-09: pink leaves, rainbow AA gun, device losts).
+			if (keys != 0) {
+				// Command buffers recorded so far may still sample the slot.
+				FreeSlot(binding, slot);
+			}
+			reset++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::printf("Bindless: slot %u/%u still held a view of an image being dropped "
+				            "(%u keys); reset to the placeholder\n",
+				            binding, slot, keys);
+				std::fflush(stdout);
+			}
+		}
+	}
+	return reset;
 }
 
 } // namespace Libs::Graphics

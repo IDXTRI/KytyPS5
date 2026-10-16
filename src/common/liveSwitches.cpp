@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -106,8 +107,60 @@ void StartPolling() {
 
 } // namespace
 
+namespace {
+
+// KYTY_VRAM_SAVER=1|2 (environment): defaults for a group of memory switches, so one variable
+// selects a low-VRAM setup (an explicit variable or live-file line still wins).
+// 1 = settings that only change how the caches count, place and keep memory;
+// 2 = also smaller VMA blocks, eviction of unsampled bindless textures, and the retire safety net
+//     for deleted images and buffers: the large savings that the stale-read device loss
+//     (PLAN P3) has blocked so far. Experimental.
+struct Preset {
+	const char* name;
+	int64_t     value;
+	int         level;
+};
+constexpr Preset VramSaverPresets[] = {
+    {"KYTY_GC_HOST_SIZES", 1, 1},           {"KYTY_VMA_MIN_MEMORY", 1, 1},
+    {"KYTY_IMAGE_RECYCLE_MB", 64, 1},       {"KYTY_IMAGE_POOL_BUDGET", 1, 1},
+    {"KYTY_GC_DRIVER_MARGIN_MB", 768, 1},
+    {"KYTY_VMA_BLOCK_MB", 64, 2},           {"KYTY_BINDLESS_EVICT", 1, 2},
+    {"KYTY_BINDLESS_EVICT_TIGHT_AGE", 120, 2}, {"KYTY_IMAGE_RETIRE_FRAMES", 90, 2},
+    {"KYTY_BUFFER_RETIRE_FRAMES", 90, 2},  {"KYTY_BUFFER_POOLED_KB", 1024, 2},
+};
+
+int VramSaverLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_VRAM_SAVER");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	return level;
+}
+
+} // namespace
+
+int64_t PresetValue(const char* name, int64_t default_value, int level) {
+	if (level <= 0) {
+		return default_value;
+	}
+	for (const auto& preset: VramSaverPresets) {
+		if (preset.level <= level && std::strcmp(preset.name, name) == 0) {
+			return preset.value;
+		}
+	}
+	return default_value;
+}
+
+namespace {
+int64_t PresetDefault(const char* name, int64_t default_value) {
+	return PresetValue(name, default_value, VramSaverLevel());
+}
+} // namespace
+
 std::atomic<int64_t>& Get(const char* name, int64_t default_value) {
 	StartPolling();
+	const auto code_default = default_value;
+	default_value           = PresetDefault(name, default_value);
 	auto&           registry = GetRegistry();
 	std::lock_guard lock(registry.mutex);
 	auto&           slot = registry.switches[name];
@@ -121,7 +174,7 @@ std::atomic<int64_t>& Get(const char* name, int64_t default_value) {
 			value = found->second;
 		}
 		slot = std::make_unique<std::atomic<int64_t>>(value);
-		if (value != default_value) {
+		if (value != code_default) {
 			Announce(name, value);
 		}
 	}

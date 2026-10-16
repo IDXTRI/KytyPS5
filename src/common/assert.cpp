@@ -17,6 +17,64 @@
 
 namespace Common {
 
+#ifdef _WIN32
+static bool SymbolsInitialized() {
+	const auto process = GetCurrentProcess();
+	char       exe_path[MAX_PATH] {};
+	GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+	std::string search = exe_path;
+	if (const auto slash = search.find_last_of("\/"); slash != std::string::npos) {
+		search.resize(slash);
+		std::string parent = search;
+		if (const auto up = parent.find_last_of("\/"); up != std::string::npos) {
+			parent.resize(up);
+			search += ";" + parent;
+		}
+	}
+	SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+	return SymInitialize(process, search.c_str(), TRUE) != FALSE;
+}
+
+static std::mutex& SymbolMutex() {
+	static std::mutex symbol_mutex;
+	return symbol_mutex;
+}
+
+// Caller holds SymbolMutex().
+static std::string SymbolizeUnlocked(uint64_t address) {
+	static const bool initialized = SymbolsInitialized();
+	std::string       out         = fmt::format("0x{:016x}", address);
+	if (!initialized) {
+		return out;
+	}
+	const auto process = GetCurrentProcess();
+	alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512] {};
+	auto*                     symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+	symbol->SizeOfStruct             = sizeof(SYMBOL_INFO);
+	symbol->MaxNameLen               = 512;
+	DWORD64 displacement             = 0;
+	if (SymFromAddr(process, address, &displacement, symbol) != FALSE) {
+		out += fmt::format(" {}+0x{:x}", symbol->Name, displacement);
+	}
+	IMAGEHLP_LINE64 line {};
+	line.SizeOfStruct = sizeof(line);
+	DWORD line_displacement = 0;
+	if (SymGetLineFromAddr64(process, address, &line_displacement, &line) != FALSE) {
+		out += fmt::format(" [{}:{}]", line.FileName, line.LineNumber);
+	}
+	return out;
+}
+#endif
+
+std::string HostSymbolize(uint64_t address) {
+#ifdef _WIN32
+	std::scoped_lock symbol_lock(SymbolMutex());
+	return SymbolizeUnlocked(address);
+#else
+	return fmt::format("0x{:016x}", address);
+#endif
+}
+
 std::string HostBacktrace() {
 #ifdef _WIN32
 	static constexpr ULONG MaxFrames = 48;
@@ -26,44 +84,11 @@ std::string HostBacktrace() {
 		return {};
 	}
 
-	const auto process = GetCurrentProcess();
-	char       exe_path[MAX_PATH] {};
-	GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-	std::string search = exe_path;
-	if (const auto slash = search.find_last_of("\\/"); slash != std::string::npos) {
-		search.resize(slash);
-		std::string parent = search;
-		if (const auto up = parent.find_last_of("\\/"); up != std::string::npos) {
-			parent.resize(up);
-			search += ";" + parent;
-		}
-	}
-	static std::mutex symbol_mutex;
-	std::scoped_lock  symbol_lock(symbol_mutex);
-	SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
-	static const bool initialized = SymInitialize(process, search.c_str(), TRUE) != FALSE;
-
-	std::string out = "--- Host stack ---\n";
+	std::scoped_lock symbol_lock(SymbolMutex());
+	std::string      out = "--- Host stack ---\n";
 	for (ULONG i = 0; i < count; i++) {
-		const auto address = reinterpret_cast<DWORD64>(frames[i]);
-		out += fmt::format("  #{:<2} 0x{:016x}", i, address);
-		if (initialized) {
-			alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512] {};
-			auto*                     symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
-			symbol->SizeOfStruct             = sizeof(SYMBOL_INFO);
-			symbol->MaxNameLen               = 512;
-			DWORD64 displacement             = 0;
-			if (SymFromAddr(process, address, &displacement, symbol) != FALSE) {
-				out += fmt::format(" {}+0x{:x}", symbol->Name, displacement);
-			}
-			IMAGEHLP_LINE64 line {};
-			line.SizeOfStruct = sizeof(line);
-			DWORD line_displacement = 0;
-			if (SymGetLineFromAddr64(process, address, &line_displacement, &line) != FALSE) {
-				out += fmt::format(" [{}:{}]", line.FileName, line.LineNumber);
-			}
-		}
-		out += "\n";
+		out += fmt::format("  #{:<2} {}\n", i,
+		                   SymbolizeUnlocked(reinterpret_cast<uint64_t>(frames[i])));
 	}
 	return out;
 #else

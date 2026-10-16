@@ -485,10 +485,64 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
+	EraseBuffer(id);
+}
+
+// KYTY_BUFFER_RETIRE_FRAMES=N (live, research, default 0): a deleted buffer keeps its device
+// memory until the GPU is past the tick it was deleted at and N more frames were presented, at
+// most KYTY_BUFFER_RETIRE_MB (live, default 256) held. The buffer half of the stale-read test
+// (notes/cloud/T3_IMAGE_LIFETIME.md): runs 88/97/99 lost the device reading "a destroyed buffer's
+// VA + offset"; if that stops with this on, the reader holds a buffer address past the delete.
+void BufferCache::EraseBuffer(BufferId id, bool gpu_done) {
+	static auto& retire_frames = Common::LiveSwitches::Get("KYTY_BUFFER_RETIRE_FRAMES", 0);
+	const auto   frames        = retire_frames.load(std::memory_order_relaxed);
+	if (frames > 0 && m_scheduler.Active()) {
+		const auto bytes = m_slot_buffers[id].Size();
+		m_retiring_buffers.push_back(
+		    {id, m_scheduler.CurrentTick(),
+		     m_graphics.presented_frames.load(std::memory_order_relaxed) +
+		         static_cast<uint64_t>(frames),
+		     bytes});
+		m_retiring_bytes += bytes;
+		static auto& retire_mb = Common::LiveSwitches::Get("KYTY_BUFFER_RETIRE_MB", 256);
+		const auto   cap =
+		    static_cast<uint64_t>(std::max<int64_t>(0, retire_mb.load(std::memory_order_relaxed)))
+		    << 20u;
+		while (m_retiring_bytes > cap && m_retiring_buffers.size() > 1) {
+			const auto oldest = m_retiring_buffers.front();
+			m_retiring_buffers.pop_front();
+			m_retiring_bytes -= std::min(m_retiring_bytes, oldest.bytes);
+			m_scheduler.DeferOperation([this, oldest_id = oldest.id] { m_slot_buffers.erase(oldest_id); });
+		}
+		return;
+	}
+	if (m_scheduler.Active() && !gpu_done) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 	} else {
 		m_slot_buffers.erase(id);
+	}
+}
+
+void BufferCache::RetireBuffers() {
+	if (m_retiring_buffers.empty()) {
+		return;
+	}
+	static auto& retire_frames = Common::LiveSwitches::Get("KYTY_BUFFER_RETIRE_FRAMES", 0);
+	const bool   all   = retire_frames.load(std::memory_order_relaxed) <= 0;
+	const auto   frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	while (!m_retiring_buffers.empty()) {
+		const auto& front = m_retiring_buffers.front();
+		if (!all && (frame < front.frame || !m_scheduler.IsFree(front.tick))) {
+			break;
+		}
+		if (m_scheduler.Active() && !m_scheduler.IsFree(front.tick)) {
+			m_scheduler.DeferOperation([this, id = front.id] { m_slot_buffers.erase(id); });
+		} else {
+			// Free, or no scheduler to defer to (it drained when it went inactive).
+			m_slot_buffers.erase(front.id);
+		}
+		m_retiring_bytes -= std::min(m_retiring_bytes, front.bytes);
+		m_retiring_buffers.pop_front();
 	}
 }
 
@@ -1255,7 +1309,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
-	const auto& buffer = m_slot_buffers[id];
+	auto& buffer          = m_slot_buffers[id];
+	buffer.origin_shader  = s_diag_shader_hash;
+	buffer.origin_request = size;
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
@@ -1771,8 +1827,10 @@ void BufferCache::AuditBuffers() {
 	for (size_t i = 0; i < std::min<size_t>(ids.size(), 12); i++) {
 		const auto& buffer = m_slot_buffers[ids[i]];
 		const auto  idle   = clock - std::min(clock, m_lru_cache.TickOf(buffer.lru_id));
-		std::printf("  0x%011" PRIx64 " %7.1f MiB idle %4" PRIu64 " frames%s%s\n", buffer.CpuAddress(),
-		            static_cast<double>(buffer.Size()) / (1u << 20u), idle,
+		std::printf("  0x%011" PRIx64 " %7.1f MiB idle %4" PRIu64 " frames, created for %.1f MiB "
+		            "by shader 0x%016" PRIx64 "%s%s\n",
+		            buffer.CpuAddress(), static_cast<double>(buffer.Size()) / (1u << 20u), idle,
+		            static_cast<double>(buffer.origin_request) / (1u << 20u), buffer.origin_shader,
 		            m_texture_cache.HasImagesInRegion(buffer.CpuAddress(), buffer.Size())
 		                ? " shares memory with textures"
 		                : "",
@@ -1786,6 +1844,7 @@ void BufferCache::AuditBuffers() {
 void BufferCache::RunGarbageCollector() {
 	VerifyBdaPageTable();
 	AuditBuffers();
+	RetireBuffers();
 	m_gc_tick++;
 	const auto clock = LruClock();
 	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
@@ -1934,7 +1993,8 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
-		m_slot_buffers.erase(id);
+		// The GPU is past these buffers (waited above): freed at once unless retired.
+		EraseBuffer(id, true);
 	}
 }
 

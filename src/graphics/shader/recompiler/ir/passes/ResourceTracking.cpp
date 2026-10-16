@@ -2594,11 +2594,49 @@ private:
 		return true;
 	}
 
+	void LogBindlessSamplerPlan(const BindlessSamplerPlan& plan, uint32_t pc) const {
+		const char* form = "other";
+		const auto* def  = plan.key.Resolve().TryInstruction();
+		const auto  immediate = [](Value value, uint32_t expected) {
+			value = value.Resolve();
+			return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
+		};
+		if (plan.key.Resolve().IsImmediate()) {
+			form = "constant";
+		} else if (def != nullptr && def->NumArgs() == 2u) {
+			if (def->GetOpcode() == ValueOpcode::ShiftRightLogical32 && immediate(def->Arg(1), 16u)) {
+				form = "high16";
+			} else if (def->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+			           (immediate(def->Arg(1), 0x3fffu) || immediate(def->Arg(0), 0x3fffu))) {
+				form = "and14";
+			} else if (def->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+			           (immediate(def->Arg(1), 0xffffu) || immediate(def->Arg(0), 0xffffu))) {
+				form = "low16";
+			}
+		}
+		uint32_t exclusive = 0;
+		for (uint32_t i = 0; i < plan.exclusive.size(); i++) {
+			exclusive |= plan.exclusive[i] ? 1u << i : 0u;
+		}
+		const auto& source = m_sources[plan.source];
+		std::printf("Bindless sampler plan: hash=0x%016" PRIx64 " stage=%s pc=0x%08x key=%s (%s) "
+		            "record offset=0x%x exclusive reads=0x%x%s\n",
+		            m_program.shader_hash, StageName(m_program.stage), pc, form,
+		            def != nullptr ? ValueOpcodeName(def->GetOpcode()) : "-",
+		            source.bindless_sampler.has_value() ? source.bindless_sampler->table_offset : 0u,
+		            exclusive, exclusive != 0xfu ? " (S# words shared with data)" : "");
+		std::fflush(stdout);
+	}
+
 	void PlanBindlessSamplers() {
-		// Opt-in while a regression is investigated: with the game's own samplers the title's
-		// fog shows a bright arch (DEBUGGING.md, 2026-09-28). KYTY_BINDLESS_SAMPLERS=1 enables them.
-		static const bool enabled = std::getenv("KYTY_BINDLESS_SAMPLERS") != nullptr &&
-		                            std::getenv("KYTY_BINDLESS_SAMPLERS")[0] == '1';
+		// On by default since 2026-10-09 (as in Senaxx 269b12f7). The linear/wrap stand-in tiles
+		// textures the game samples with clamp (Wolverine's moon) and stretches light streaks.
+		// What kept them opt-in in Wolverine (suit, tree trunks and title logs vanishing) was the
+		// draws being skipped: the sampler heap's buffer, whose reads the plan strands, could not
+		// be materialized (ResourceMaterialization, KYTY_DEAD_BUFFER_EMPTY). KYTY_BINDLESS_SAMPLERS=0
+		// uses the stand-in.
+		static const bool enabled = std::getenv("KYTY_BINDLESS_SAMPLERS") == nullptr ||
+		                            std::getenv("KYTY_BINDLESS_SAMPLERS")[0] != '0';
 		if (!m_program.bindless_images || !enabled) {
 			return;
 		}
@@ -2619,6 +2657,20 @@ private:
 				return;
 			}
 		}
+		// KYTY_BINDLESS_SAMPLERS_SKIP=hash,hash,... (hex, environment, research): the programs
+		// listed keep the default sampler, once bisection has named the ones that break.
+		static const auto skipped = ParseHashList(std::getenv("KYTY_BINDLESS_SAMPLERS_SKIP"));
+		if (skipped.contains(m_program.shader_hash)) {
+			return;
+		}
+		// KYTY_BINDLESS_SAMPLER_PLAN_LOG=1 (environment, research): one line per bindless sampler
+		// a program gets: how its key is extracted from the material word, the heap record offset,
+		// and which of its four S# reads the shader also uses as data (those stay loads; a
+		// stranded read that is not exclusive would leave the data use without a value).
+		static const bool plan_log = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLER_PLAN_LOG");
+			return value != nullptr && value[0] == '1';
+		}();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
@@ -2642,6 +2694,9 @@ private:
 				}
 				BindlessSamplerPlan plan;
 				if (TryMakeBindlessSampler(*sampler, plan)) {
+					if (plan_log) {
+						LogBindlessSamplerPlan(plan, flags.pc);
+					}
 					m_bindless_samplers.push_back(plan);
 				}
 			}

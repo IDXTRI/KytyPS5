@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
@@ -135,6 +136,21 @@ void ShaderWriteHazardBarrier(const CommandRecorder& vk_buffer,
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	ShaderWriteBarrier(CommandRecorder(vk_buffer), source_stages);
+}
+
+int SerializeGpuMode() {
+	static auto& mode = Common::LiveSwitches::Get("KYTY_SERIALIZE_GPU", 0);
+	return mode.load(std::memory_order_relaxed);
+}
+
+void FullMemoryBarrier(const CommandRecorder& vk_buffer) {
+	EXIT_IF(vk_buffer == nullptr);
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
+	                          &barrier, 0, nullptr, 0, nullptr);
 }
 
 void ShaderWriteBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages) {

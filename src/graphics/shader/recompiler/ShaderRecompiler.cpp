@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -960,6 +961,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// Mask reads that fold can make select conditions and phis identical: fold until stable.
+	for (int round = 0; round < 4 && IR::FoldLaneMasks(ir) != 0; round++) {
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
 		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
 		     GetDumpLabel(options), options.shader_hash, folded);
@@ -1101,7 +1109,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			return sampler.source < ir.descriptor_sources.size() &&
 			       ir.descriptor_sources[sampler.source].bindless_sampler.has_value();
 		});
-		if (bindless_sampler) {
+		// KYTY_IR_DUMP_HASHES=hash,hash,... (hex, environment): also dump these programs whether
+		// or not they have a bindless sampler plan, so a shader can be compared with the game's
+		// samplers on and off (KYTY_BINDLESS_SAMPLERS / _SKIP).
+		static const auto listed = IR::ParseHashList(std::getenv("KYTY_IR_DUMP_HASHES"));
+		if (bindless_sampler || listed.contains(ir.shader_hash)) {
 			const auto text = MakeIrDump(translated.cfg_dump, ir);
 			const auto path = fmt::format("{}/{:016x}.txt", ir_dir, ir.shader_hash);
 			if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {

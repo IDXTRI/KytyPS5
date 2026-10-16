@@ -509,6 +509,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.sampler_filter_minmax_enabled = supported_features12.samplerFilterMinmax == VK_TRUE;
+	features12.samplerFilterMinmax         = supported_features12.samplerFilterMinmax;
+	LOGF("Vulkan sampler min/max reduction: %s\n",
+	     graphics.sampler_filter_minmax_enabled ? "true" : "false");
 	graphics.bindless_enabled =
 	    supported_features12.runtimeDescriptorArray == VK_TRUE &&
 	    supported_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
@@ -618,8 +622,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
-	    float_controls.shaderSignedZeroInfNanPreserveFloat64 &&
-	    float_controls.shaderRoundingModeRTEFloat32;
+	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
 	// if (device_features.shaderFloat64 && !float_controls.shaderDenormPreserveFloat64) {
 	// 	Log::WriteToConsoleAndLog(
 	// 	    "WARNING: Vulkan device does not guarantee FP64 denormal preservation; "

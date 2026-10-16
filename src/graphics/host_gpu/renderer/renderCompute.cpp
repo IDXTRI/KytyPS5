@@ -573,6 +573,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		if (SerializeGpuMode() == 1) {
+			FullMemoryBarrier(vk_buffer);
+		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
@@ -668,6 +671,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
 		        vk::PipelineStageFlagBits::eTransfer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		if (SerializeGpuMode() == 1) {
+			FullMemoryBarrier(vk_buffer);
+		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

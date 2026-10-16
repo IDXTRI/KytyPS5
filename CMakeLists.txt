@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.18...4.3)
+cmake_minimum_required(VERSION 3.19...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
-	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
+	set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
 
 get_property(KYTY_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -259,7 +259,7 @@ set(gpu_tiler_shader_names
 	depth
 	promote_d16
 	demote_d16
-	swap_bgra16
+	color_transform
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -451,6 +451,20 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+# Research helpers of the bindless sampler mirror (KYTY_BINDLESS_SAMPLER_FIELDS, region recycling).
+add_executable(bindless_sampler_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BindlessSamplerTests.cpp"
+)
+target_include_directories(bindless_sampler_tests PRIVATE ${inc_headers})
+
+# KYTY_PROGRAM_DISK_CACHE: permutation serialization and the cache file.
+add_executable(program_disk_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramDiskCacheTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+)
+target_link_libraries(program_disk_cache_tests xxhash fmt::fmt common)
+target_include_directories(program_disk_cache_tests PRIVATE ${inc_headers})
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -501,8 +515,9 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt common)
+target_link_libraries(resource_materialization_tests fmt::fmt common xxhash)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(srt_native_tests EXCLUDE_FROM_ALL
@@ -672,6 +687,8 @@ if(BUILD_TESTING)
 	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME bindless_sampler COMMAND $<TARGET_FILE:bindless_sampler_tests>)
+	add_test(NAME program_disk_cache COMMAND $<TARGET_FILE:program_disk_cache_tests>)
 	add_test(NAME live_switches COMMAND $<TARGET_FILE:live_switches_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -749,6 +766,8 @@ if(BUILD_TESTING)
 		archive_file_tests
 		avplayer_file_tests
 		bit_array_tests
+		bindless_sampler_tests
+		program_disk_cache_tests
 		lru_cache_tests
 		live_switches_tests
 		shader_vertex_metadata_tests
@@ -794,6 +813,15 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
+add_custom_target(kyty_trophy_sound
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_TROPHY_UNLOCK_SOUND}"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds/trophy-unlock.wav"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_trophy_sound)
+install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

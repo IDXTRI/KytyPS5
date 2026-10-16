@@ -1,14 +1,14 @@
 # Packaging the Marvel's Wolverine build
 
-Files used to build the Windows release (`Wolverine-KytyPS5-v1.zip`):
+Files used to build the Windows release (`Wolverine-KytyPS5-v<N>.zip`):
 
 | File | Purpose |
 |---|---|
 | `build-release.bat` | Release build through a `C:\kyty-src` junction to the checkout, in `_Build/release`, so the binaries embed `C:/kyty-src/...` source paths and not the builder's folders. Paths to Visual Studio, CMake and Qt are those of the machine that made v1; adjust them. |
-| `package/Play Wolverine.bat` | Starts the game with the recommended options: asks for the game folder once, adds `--amd-cpu` on AMD processors, skips Mac's six shaders, keeps saves, cache and logs in `userdata\`. |
+| `package/Play Wolverine.bat` | Starts the game with the recommended options: asks for the game folder once, no longer adds `--amd-cpu` (exact VRSQRTPS emulation; slow, not needed on AMD), skips Mac's six shaders and the two white-plane shaders, sets the tested switches, keeps saves, cache and logs in `userdata\`. |
 | `package/emulator/Kyty.ini` | Launcher preset read when `launcher.exe` starts from the `emulator` folder: Wolverine options on, debugging off, the skip list. |
 | `package/README.md` | The user guide shipped in the zip. |
-| `RELEASE_NOTES-v1.md` | Text of the GitHub release. |
+| `RELEASE_NOTES-v<N>.md` | Text of the GitHub release of each version. |
 
 ## Steps
 

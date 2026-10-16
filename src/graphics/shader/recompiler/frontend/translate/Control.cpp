@@ -252,13 +252,14 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
 	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(false_source)}));
-	if (IsExecOrVcc(inst.dst)) {
-		WriteMask(inst.dst, selected_mask, true);
-		return;
-	}
 	WriteU32Pair(inst.dst,
 	             {ir.Select(condition, lhs[0], rhs[0]), ir.Select(condition, lhs[1], rhs[1])});
-	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	// Scalar selects preserve the raw pair even when EXEC/VCC holds an address.
+	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
+		ir.SetExec(selected_mask);
+	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
+		ir.SetVcc(selected_mask);
+	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
 		ir.SetThreadBitScalarReg(dst, selected_mask);
 		ir.SetScalarMaskTag(dst, selected_mask_valid);

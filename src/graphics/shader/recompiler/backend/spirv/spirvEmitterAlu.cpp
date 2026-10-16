@@ -30,6 +30,28 @@ uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_va
 	return Unary(state, not_equal ? spv::OpAny : spv::OpAll, TypeBool(state), compare);
 }
 
+uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	const auto bits_type = TypeU64(state);
+	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
+	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
+	const auto ordered = Binary(state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
+	                            TypeBool(state), lhs, rhs);
+	auto result = Select(state, TypeF64(state), ordered, lhs, rhs);
+
+	// Equal values have identical bits except signed zero: min chooses -0, max chooses +0.
+	const auto equal = Binary(state, spv::OpFOrdEqual, TypeBool(state), lhs, rhs);
+	const auto equal_bits = Binary(state, max_value ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
+	                               bits_type, lhs_bits, rhs_bits);
+	result = Select(state, TypeF64(state), equal,
+	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
+
+	// Non-IEEE mode selects the other operand for NaN, including rhs when both are NaN.
+	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
+	                lhs, result);
+	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
+	              rhs, result);
+}
+
 uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
                           spv::Op high_compare, spv::Op low_compare) {
 	const auto lhs         = ExtractPair(state, lhs_value);
@@ -178,7 +200,7 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	} else {
 		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
 	}
-	const auto nan = EmitClassifyF32(state, src).nan;
+	const auto nan = EmitIsNanF32(state, src);
 	if (signed_value) {
 		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
 		                          ConstantF32(state, 0xcf000000u));
@@ -207,10 +229,10 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
 	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
 	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
+	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state), EmitIsNanF32(state, a),
+	                             EmitIsNanF32(state, b));
 	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitIsNanF32(state, c));
 	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 
@@ -466,6 +488,14 @@ uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, false);
+}
+
+uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, true);
 }
 
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {

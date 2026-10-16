@@ -28,6 +28,9 @@ public:
 	// Whether the page holding vaddr is read-protected for tracking. Unlocked: a hint that can
 	// be stale by the time the caller acts on it.
 	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
+	// The write and access watcher counts of the 4 KiB page holding vaddr (0 when untracked).
+	// Unlocked, like IsReadWatched: for fault triage.
+	void Watchers(uint64_t vaddr, uint32_t& write, uint32_t& access) const noexcept;
 
 private:
 	struct Impl;

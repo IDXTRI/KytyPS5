@@ -29,6 +29,8 @@ void DbgExit(int status);
 #endif
 
 std::string HostBacktrace();
+// "0x<address> Symbol+0xoff [file:line]" for a host code address (Windows; plain address elsewhere).
+std::string HostSymbolize(uint64_t address);
 
 } // namespace Common
 

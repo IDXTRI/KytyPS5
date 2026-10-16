@@ -483,10 +483,11 @@ void Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
 	WriteCompareResult(inst.dst, ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
 }
 
-void Translator::V_ALIGNBIT_B32(const Decoder::Instruction& inst) {
-	const auto hi      = ReadU32(inst.src0);
-	const auto lo      = ReadU32(inst.src1);
-	const auto shift   = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(31u)));
+void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset) {
+	const auto hi = ReadU32(inst.src0);
+	const auto lo = ReadU32(inst.src1);
+	auto shift    = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(byte_offset ? 3u : 31u)));
+	if (byte_offset) shift = ir.ShiftLeftLogical(shift, IR::U32(IR::Value(3u)));
 	const auto lo_part = ir.ShiftRightLogical(lo, shift);
 	const auto inverse =
 	    ir.BitwiseAnd(ir.ISub(IR::U32(IR::Value(32u)), shift), IR::U32(IR::Value(31u)));
@@ -494,21 +495,6 @@ void Translator::V_ALIGNBIT_B32(const Decoder::Instruction& inst) {
 	const auto hi_part =
 	    ir.Select(ir.INotEqual(shift, IR::U32(IR::Value(0u))), hi_part_raw, IR::U32(IR::Value(0u)));
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(lo_part, hi_part));
-}
-
-void Translator::V_ALIGNBYTE_B32(const Decoder::Instruction& inst) {
-	const auto hi           = ReadU32(inst.src0);
-	const auto lo           = ReadU32(inst.src1);
-	const auto byte_offset  = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(31u)));
-	const auto bit_offset   = ir.ShiftLeftLogical(byte_offset, IR::U32(IR::Value(3u)));
-	const auto concatenated = ir.ConstructU64(lo, hi);
-	const auto shifted =
-	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64,
-	                    {concatenated, ir.BitwiseAnd(bit_offset, IR::U32(IR::Value(63u)))}));
-	const auto in_range =
-	    IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {byte_offset, IR::Value(8u)}));
-	WriteOperand(DestinationOperand(inst),
-	             ir.Select(in_range, ExtractU64(shifted)[0], IR::U32(IR::Value(0u))));
 }
 
 void Translator::V_LSHL_ADD_U32(const Decoder::Instruction& inst) {

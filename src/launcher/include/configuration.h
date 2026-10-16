@@ -46,6 +46,30 @@ QString EnumToText(T value) {
 	                                                                     : key);
 }
 
+struct ControllerSettings {
+	QString color;
+	int     speaker_volume      = 50;
+	int     vibration_intensity = 100;
+
+	void WriteSettings(QSettings* s) const {
+		s->setValue("controller_color", color);
+		s->setValue("controller_speaker_volume", speaker_volume);
+		s->setValue("controller_vibration_intensity", vibration_intensity);
+	}
+
+	void ReadSettings(QSettings* s) {
+		const QColor saved_color(s->value("controller_color").toString());
+		color = saved_color.isValid() ? saved_color.name(QColor::HexRgb) : QString {};
+		const auto read_percent = [s](const char* key, int fallback) {
+			bool      ok    = false;
+			const int value = s->value(key, fallback).toInt(&ok);
+			return ok ? qBound(0, value, 100) : fallback;
+		};
+		speaker_volume      = read_percent("controller_speaker_volume", 50);
+		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+	}
+};
+
 class Configuration: public QObject {
 	Q_OBJECT
 
@@ -85,22 +109,27 @@ public:
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;
 
+	// Controller preferences always come from the global configuration.
+	ControllerSettings controller;
+
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
-	QString                controller_color;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   bindless_images_enabled     = false;
 	QString                skip_shader_hashes;
+	bool                   trophy_enabled              = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
-	bool                   shader_validation_enabled   = true;
+	// Off: SPIR-V validation of every new shader is a debugging aid and adds compile stutter.
+	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
@@ -123,14 +152,15 @@ public:
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
-		controller_color            = other.controller_color;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
 		bindless_images_enabled     = other.bindless_images_enabled;
 		skip_shader_hashes          = other.skip_shader_hashes;
+		trophy_enabled              = other.trophy_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -172,14 +202,15 @@ public:
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
 		KYTY_CFG_SET(audio_input_device);
-		KYTY_CFG_SET(controller_color);
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
+		KYTY_CFG_SET(hide_cursor_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(bindless_images_enabled);
 		KYTY_CFG_SET(skip_shader_hashes);
+		KYTY_CFG_SET(trophy_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -214,18 +245,18 @@ public:
 		                         ? saved_user_id
 		                         : Config::DEFAULT_USER_ID;
 		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
-		const QColor color(s->value("controller_color", controller_color).toString());
-		controller_color = color.isValid() ? color.name(QColor::HexRgb) : QString {};
 		KYTY_CFG_GET(present_mode);
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
 			present_mode = PresentMode::Mailbox;
 		}
 		KYTY_CFG_GET(fullscreen_enabled);
+		KYTY_CFG_GET(hide_cursor_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
 		KYTY_CFG_GET(bindless_images_enabled);
 		KYTY_CFG_GET(skip_shader_hashes);
+		trophy_enabled = s->value("trophy_enabled", trophy_enabled).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
